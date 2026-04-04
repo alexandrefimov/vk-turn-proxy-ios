@@ -23,34 +23,34 @@ import (
 
 // Config holds proxy configuration.
 type Config struct {
-	PeerAddr       string         // vk-turn-proxy server address (host:port)
-	TurnServer     string         // override TURN server host (optional)
-	TurnPort       string         // override TURN port (optional)
-	VKLink         string         // VK call invite link or link ID
-	UseDTLS        bool           // true = DTLS obfuscation (default mode)
-	UseUDP         bool           // true = UDP to TURN, false = TCP
-	NumConns       int            // number of concurrent connections (default 1)
-	CaptchaSolver  CaptchaSolver  // called when VK requires captcha (may be nil)
+	PeerAddr      string        // vk-turn-proxy server address (host:port)
+	TurnServer    string        // override TURN server host (optional)
+	TurnPort      string        // override TURN port (optional)
+	VKLink        string        // VK call invite link or link ID
+	UseDTLS       bool          // true = DTLS obfuscation (default mode)
+	UseUDP        bool          // true = UDP to TURN, false = TCP
+	NumConns      int           // number of concurrent connections (default 1)
+	CaptchaSolver CaptchaSolver // called when VK requires captcha (may be nil)
 }
 
 // Stats holds live tunnel statistics.
 type Stats struct {
-	TxBytes           int64   `json:"tx_bytes"`
-	RxBytes           int64   `json:"rx_bytes"`
-	ActiveConns       int32   `json:"active_conns"`
-	TotalConns        int32   `json:"total_conns"`
-	TurnRTTms         float64 `json:"turn_rtt_ms"`         // last TURN Allocate RTT
-	DTLSHandshakeMs   float64 `json:"dtls_handshake_ms"`   // last DTLS handshake time
-	LastHandshakeSec  int64   `json:"last_handshake_sec"`  // seconds since last WG handshake
-	Reconnects        int64   `json:"reconnects"`          // total TURN reconnects
-	CaptchaImageURL   string  `json:"captcha_image_url,omitempty"` // non-empty when captcha is pending
-	CaptchaSID        string  `json:"captcha_sid,omitempty"`       // captcha_sid for the pending captcha
+	TxBytes          int64   `json:"tx_bytes"`
+	RxBytes          int64   `json:"rx_bytes"`
+	ActiveConns      int32   `json:"active_conns"`
+	TotalConns       int32   `json:"total_conns"`
+	TurnRTTms        float64 `json:"turn_rtt_ms"`                 // last TURN Allocate RTT
+	DTLSHandshakeMs  float64 `json:"dtls_handshake_ms"`           // last DTLS handshake time
+	LastHandshakeSec int64   `json:"last_handshake_sec"`          // seconds since last WG handshake
+	Reconnects       int64   `json:"reconnects"`                  // total TURN reconnects
+	CaptchaImageURL  string  `json:"captcha_image_url,omitempty"` // non-empty when captcha is pending
+	CaptchaSID       string  `json:"captcha_sid,omitempty"`       // captcha_sid for the pending captcha
 }
 
 // Proxy manages the DTLS+TURN tunnel to the peer server.
 type Proxy struct {
 	config Config
-	ctx    context.Context    // global lifetime (wgTurnOn → wgTurnOff)
+	ctx    context.Context // global lifetime (wgTurnOn → wgTurnOff)
 	cancel context.CancelFunc
 
 	peer   *net.UDPAddr
@@ -74,8 +74,8 @@ type Proxy struct {
 
 	// Captcha handling: when VK requires captcha, the image URL is stored here
 	// and the solver blocks until an answer is provided via SolveCaptcha().
-	captchaImageURL  atomic.Value // stores string (empty = no captcha pending)
-	captchaCh        chan string  // buffered channel for captcha answers
+	captchaImageURL    atomic.Value // stores string (empty = no captcha pending)
+	captchaCh          chan string  // buffered channel for captcha answers
 	lastCaptchaSID     atomic.Value // stores string: captcha_sid from last CaptchaRequiredError
 	lastCaptchaKey     atomic.Value // stores string: success_token from captchaNotRobot.check
 	lastCaptchaTs      atomic.Value // stores float64: captcha_ts from error response
@@ -84,7 +84,8 @@ type Proxy struct {
 
 	// Cached TURN credentials: shared across all connections so only one
 	// GetVKCreds call is needed (avoids per-connection captcha).
-	cachedCredsMu   sync.Mutex
+	cachedCredsMu   sync.Mutex // protects read/write of cached creds
+	credsFetchMu    sync.Mutex // serializes GetVKCreds calls (may block on captcha)
 	cachedTURNAddr  string
 	cachedCreds     *TURNCreds
 	cachedCredsTime time.Time
@@ -94,13 +95,13 @@ type Proxy struct {
 	lastRecvTime atomic.Int64
 
 	// Stats
-	txBytes      atomic.Int64
-	rxBytes      atomic.Int64
-	activeConns  atomic.Int32
-	totalConns   atomic.Int32
-	turnRTTns    atomic.Int64  // nanoseconds
-	dtlsHSns    atomic.Int64  // nanoseconds
-	reconnects   atomic.Int64
+	txBytes     atomic.Int64
+	rxBytes     atomic.Int64
+	activeConns atomic.Int32
+	totalConns  atomic.Int32
+	turnRTTns   atomic.Int64 // nanoseconds
+	dtlsHSns    atomic.Int64 // nanoseconds
+	reconnects  atomic.Int64
 }
 
 // NewProxy creates a new proxy instance.
@@ -311,9 +312,9 @@ func (p *Proxy) ForceReconnect() {
 // dead sockets. The watchdog detects this by tracking the last received packet.
 //
 // Two conditions trigger a full reconnect:
-// 1. No packets for 2 min with active connections → dead tunnel
-// 2. Active connections < half of expected for 5+ min → partial recovery stuck
-//    (e.g., after Allocation Quota Reached, only 1-2 of 10 connections survive)
+//  1. No packets for 2 min with active connections → dead tunnel
+//  2. Active connections < half of expected for 5+ min → partial recovery stuck
+//     (e.g., after Allocation Quota Reached, only 1-2 of 10 connections survive)
 func (p *Proxy) runWatchdog() {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
@@ -399,15 +400,15 @@ func (p *Proxy) GetStats() Stats {
 		captchaSID = v.(string)
 	}
 	return Stats{
-		TxBytes:          p.txBytes.Load(),
-		RxBytes:          p.rxBytes.Load(),
-		ActiveConns:      p.activeConns.Load(),
-		TotalConns:       p.totalConns.Load(),
-		TurnRTTms:        float64(p.turnRTTns.Load()) / 1e6,
-		DTLSHandshakeMs:  float64(p.dtlsHSns.Load()) / 1e6,
-		Reconnects:       p.reconnects.Load(),
-		CaptchaImageURL:  captchaURL,
-		CaptchaSID:       captchaSID,
+		TxBytes:         p.txBytes.Load(),
+		RxBytes:         p.rxBytes.Load(),
+		ActiveConns:     p.activeConns.Load(),
+		TotalConns:      p.totalConns.Load(),
+		TurnRTTms:       float64(p.turnRTTns.Load()) / 1e6,
+		DTLSHandshakeMs: float64(p.dtlsHSns.Load()) / 1e6,
+		Reconnects:      p.reconnects.Load(),
+		CaptchaImageURL: captchaURL,
+		CaptchaSID:      captchaSID,
 	}
 }
 
@@ -537,12 +538,12 @@ func (p *Proxy) runConnection(sessCtx context.Context, linkID string, readyCh ch
 }
 
 // resolveTURNAddr fetches VK credentials and resolves the TURN server address.
-// Uses cached credentials if available (< 60s old) to avoid per-connection captcha.
-// Serializes VK API calls: if one goroutine is fetching creds, others wait for the result.
+// Uses cached credentials if available (< 5min old) to avoid per-connection captcha.
+// Serializes VK API calls via credsFetchMu so only one goroutine fetches at a time.
 // If allowCaptchaBlock is false, captcha returns an error instead of blocking.
 func (p *Proxy) resolveTURNAddr(linkID string, allowCaptchaBlock bool) (string, *TURNCreds, error) {
+	// Fast path: check cache (read lock)
 	p.cachedCredsMu.Lock()
-	// Check cache under lock — if fresh, return immediately
 	if p.cachedCreds != nil && time.Since(p.cachedCredsTime) < 5*time.Minute {
 		addr := p.cachedTURNAddr
 		creds := p.cachedCreds
@@ -550,9 +551,24 @@ func (p *Proxy) resolveTURNAddr(linkID string, allowCaptchaBlock bool) (string, 
 		log.Printf("proxy: using cached TURN creds (age %s)", time.Since(p.cachedCredsTime).Round(time.Second))
 		return addr, creds, nil
 	}
-	// Hold lock while fetching — other goroutines will block on cachedCredsMu.Lock()
-	// and then find the cache populated. This prevents 10 parallel GetVKCreds calls.
-	defer p.cachedCredsMu.Unlock()
+	p.cachedCredsMu.Unlock()
+
+	// Slow path: serialize credential fetching so only one goroutine calls GetVKCreds.
+	// cachedCredsMu is NOT held during fetch — this avoids blocking all goroutines
+	// when the solver waits for the user to solve captcha (which can take minutes).
+	p.credsFetchMu.Lock()
+	defer p.credsFetchMu.Unlock()
+
+	// Re-check cache — another goroutine may have populated it while we waited.
+	p.cachedCredsMu.Lock()
+	if p.cachedCreds != nil && time.Since(p.cachedCredsTime) < 5*time.Minute {
+		addr := p.cachedTURNAddr
+		creds := p.cachedCreds
+		p.cachedCredsMu.Unlock()
+		log.Printf("proxy: using cached TURN creds (age %s)", time.Since(p.cachedCredsTime).Round(time.Second))
+		return addr, creds, nil
+	}
+	p.cachedCredsMu.Unlock()
 
 	var solver CaptchaSolver
 	if allowCaptchaBlock {
@@ -605,9 +621,11 @@ func (p *Proxy) resolveTURNAddr(linkID string, allowCaptchaBlock bool) (string, 
 	addr := net.JoinHostPort(turnHost, turnPort)
 
 	// Cache the credentials for other connections to reuse
+	p.cachedCredsMu.Lock()
 	p.cachedTURNAddr = addr
 	p.cachedCreds = creds
 	p.cachedCredsTime = time.Now()
+	p.cachedCredsMu.Unlock()
 
 	return addr, creds, nil
 }
@@ -668,12 +686,16 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 
 	// Signal ready
 	if readyCh != nil && !*signaled {
-		*signaled = true
 		select {
 		case readyCh <- struct{}{}:
 		default:
 		}
 	}
+	// Mark as signaled for ALL connection slots (not just slot 0).
+	// This ensures that on reconnection, allowCaptchaBlock=true so the
+	// captcha solver can block and wait for the user to solve the captcha
+	// instead of immediately returning CaptchaRequiredError.
+	*signaled = true
 
 	log.Printf("proxy: DTLS+TURN session established")
 
