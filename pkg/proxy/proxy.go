@@ -98,6 +98,16 @@ type Proxy struct {
 	// Used to detect dead tunnels after iOS freeze/thaw.
 	lastRecvTime atomic.Int64
 
+	// Guard against multiple concurrent waitCaptchaAndRestart goroutines.
+	// Only one should be running at a time; extras just compete on captchaCh.
+	captchaWaiterActive atomic.Bool
+
+	// Last time RefreshCaptchaURL was called (= user is looking at captcha WebView).
+	// Used to suppress periodic probes while user is actively trying to solve captcha.
+	// Probes create new VK sessions that invalidate the current one, causing
+	// "Attempt limit reached" errors in the WebView.
+	lastRefreshCaptchaTime atomic.Int64 // unix seconds
+
 	// Stats
 	txBytes     atomic.Int64
 	rxBytes     atomic.Int64
@@ -206,7 +216,13 @@ func (p *Proxy) startConnections() error {
 			p.lastCaptchaTs.Store(captchaErr.CaptchaTs)
 			p.lastCaptchaAttempt.Store(captchaErr.CaptchaAttempt)
 			p.lastCaptchaToken1.Store(captchaErr.Token1)
-			go p.waitCaptchaAndRestart()
+			// Only spawn one waiter at a time — multiple goroutines
+			// competing on captchaCh cause missed answers and orphaned waiters.
+			if p.captchaWaiterActive.CompareAndSwap(false, true) {
+				go p.waitCaptchaAndRestart()
+			} else {
+				log.Printf("proxy: waitCaptchaAndRestart already running, not spawning another")
+			}
 			return nil // tunnel "starts" in captcha-pending mode
 		}
 		return fmt.Errorf("first connection failed: %w", err)
@@ -239,25 +255,63 @@ func (p *Proxy) startConnections() error {
 // (tied to the captcha_sid). We simply restart connections — VK should
 // accept the next request from this IP without another captcha.
 func (p *Proxy) waitCaptchaAndRestart() {
+	defer p.captchaWaiterActive.Store(false)
+
 	// Drain any stale answer
 	select {
 	case <-p.captchaCh:
 	default:
 	}
 
-	select {
-	case answer := <-p.captchaCh:
-		p.captchaImageURL.Store("")
-		if answer != "" {
-			p.lastCaptchaKey.Store(answer)
-			log.Printf("proxy: captcha answered (%d chars), restarting connections (will use stored captcha_sid + key)", len(answer))
-		} else {
-			log.Printf("proxy: VK no longer requires captcha, restarting connections normally")
+	for {
+		select {
+		case answer := <-p.captchaCh:
+			p.captchaImageURL.Store("")
+			if answer != "" {
+				p.lastCaptchaKey.Store(answer)
+				log.Printf("proxy: captcha answered (%d chars), restarting connections (will use stored captcha_sid + key)", len(answer))
+			} else {
+				log.Printf("proxy: VK no longer requires captcha, restarting connections normally")
+			}
+			p.Resume()
+			return
+		case <-time.After(2 * time.Minute):
+			// Periodic self-retry: check if VK cooled down while user was away.
+			// Suppress if user is actively viewing captcha WebView.
+			if lastRefresh := p.lastRefreshCaptchaTime.Load(); lastRefresh > 0 {
+				if time.Since(time.Unix(lastRefresh, 0)) < 10*time.Minute {
+					log.Printf("proxy: startup captcha wait timeout, but user is viewing WebView (last refresh %s ago), skipping probe",
+						time.Since(time.Unix(lastRefresh, 0)).Round(time.Second))
+					continue
+				}
+			}
+			log.Printf("proxy: startup captcha wait timeout, probing if VK still requires captcha...")
+			p.cachedCredsMu.Lock()
+			p.cachedCreds = nil
+			p.cachedCredsMu.Unlock()
+			_, _, probeErr := p.resolveTURNAddr(p.linkID, false)
+			if probeErr == nil {
+				log.Printf("proxy: VK no longer requires captcha (probe succeeded), resuming")
+				p.captchaImageURL.Store("")
+				p.Resume()
+				return
+			}
+			var probeCapErr *CaptchaRequiredError
+			if errors.As(probeErr, &probeCapErr) {
+				log.Printf("proxy: VK still requires captcha, updating URL and waiting another 2 min")
+				p.captchaImageURL.Store(probeCapErr.ImageURL)
+				p.lastCaptchaSID.Store(probeCapErr.SID)
+				p.lastCaptchaTs.Store(probeCapErr.CaptchaTs)
+				p.lastCaptchaAttempt.Store(probeCapErr.CaptchaAttempt)
+				p.lastCaptchaToken1.Store(probeCapErr.Token1)
+			} else {
+				log.Printf("proxy: probe failed (non-captcha): %v, waiting another 2 min", probeErr)
+			}
+		case <-p.ctx.Done():
+			p.captchaImageURL.Store("")
+			p.lastCaptchaSID.Store("")
+			return
 		}
-		p.Resume()
-	case <-p.ctx.Done():
-		p.captchaImageURL.Store("")
-		p.lastCaptchaSID.Store("")
 	}
 }
 
@@ -487,6 +541,10 @@ func (p *Proxy) SolveCaptcha(answer string) {
 // Returns the new redirect_uri or empty string on failure.
 func (p *Proxy) RefreshCaptchaURL() string {
 	log.Printf("proxy: refreshing captcha URL for WebView")
+	// Mark that user is actively viewing the captcha WebView.
+	// Periodic probes will be suppressed for 10 minutes to avoid
+	// creating new VK sessions that invalidate the current one.
+	p.lastRefreshCaptchaTime.Store(time.Now().Unix())
 
 	linkID := p.linkID
 	if linkID == "" {
@@ -527,15 +585,15 @@ func (p *Proxy) RefreshCaptchaURL() string {
 
 	sid, captchaURL, ts, attempt := extractCaptcha(step2Resp)
 	if sid == "" {
-		log.Printf("proxy: RefreshCaptchaURL: no captcha in response — VK cooled down, unblocking reconnect")
-		// VK no longer requires captcha. Clear captcha state and unblock
-		// any goroutine waiting on captchaCh so it can retry normally.
-		p.captchaImageURL.Store("")
-		p.lastCaptchaSID.Store("")
-		select {
-		case p.captchaCh <- "": // empty answer signals "just retry, no captcha needed"
-		default:
-		}
+		// Step2 returned no captcha, but this is NOT reliable — step2 is a simple
+		// anonymous API call, while the actual GetVKCreds flow includes PoW check
+		// which often triggers BOT+slider even when step2 didn't.
+		// Do NOT unblock the captchaCh goroutine here — that causes a rapid
+		// "cooled → retry → slider → freeze → cooled" ping-pong cycle with
+		// multiple broken WebViews flashing on screen.
+		// The goroutine has its own periodic retry (every 2 min) that will
+		// detect when VK truly cools down by attempting the full credential flow.
+		log.Printf("proxy: RefreshCaptchaURL: no captcha in step2 response (not reliable — goroutine will self-retry)")
 		return ""
 	}
 
@@ -902,32 +960,74 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 					// Instead of burning retries, freeze and wait for the user.
 					var captchaErr *CaptchaRequiredError
 					if errors.As(err, &captchaErr) {
-						log.Printf("proxy: TURN reconnect needs captcha (slider), freezing until user solves it")
+						log.Printf("proxy: TURN reconnect needs captcha (slider), waiting for user or periodic retry")
 						p.captchaImageURL.Store(captchaErr.ImageURL)
 						p.lastCaptchaSID.Store(captchaErr.SID)
 						p.lastCaptchaTs.Store(captchaErr.CaptchaTs)
 						p.lastCaptchaAttempt.Store(captchaErr.CaptchaAttempt)
 						p.lastCaptchaToken1.Store(captchaErr.Token1)
-						// Block until user solves captcha or context cancelled
-						select {
-						case answer := <-p.captchaCh:
-							p.captchaImageURL.Store("")
-							if answer != "" {
-								p.lastCaptchaKey.Store(answer)
-								log.Printf("proxy: captcha solved during TURN reconnect (%d chars), retrying", len(answer))
-							} else {
-								// Empty answer = VK cooled down, no captcha needed anymore
-								log.Printf("proxy: VK no longer requires captcha, retrying normally")
+						// Wait for user to solve captcha OR periodic self-retry.
+						// Self-retry every 2 min handles the case where VK cools down
+						// while the user is unavailable (overnight, meeting, etc.).
+						// RefreshCaptchaURL no longer auto-unblocks to avoid ping-pong.
+						captchaResolved := false
+						for !captchaResolved {
+							select {
+							case answer := <-p.captchaCh:
+								p.captchaImageURL.Store("")
+								if answer != "" {
+									p.lastCaptchaKey.Store(answer)
+									log.Printf("proxy: captcha solved during TURN reconnect (%d chars), retrying", len(answer))
+								} else {
+									log.Printf("proxy: VK no longer requires captcha, retrying normally")
+								}
+								captchaResolved = true
+							case <-time.After(2 * time.Minute):
+								// Periodic self-retry: try the full credential flow
+								// without captcha solver to see if VK cooled down.
+								// But suppress if user is actively viewing captcha WebView
+								// (RefreshCaptchaURL was called < 10 min ago). Probing would
+								// create new VK sessions that invalidate the current one,
+								// causing "Attempt limit reached" in the WebView.
+								if lastRefresh := p.lastRefreshCaptchaTime.Load(); lastRefresh > 0 {
+									if time.Since(time.Unix(lastRefresh, 0)) < 10*time.Minute {
+										log.Printf("proxy: captcha wait timeout, but user is viewing WebView (last refresh %s ago), skipping probe",
+											time.Since(time.Unix(lastRefresh, 0)).Round(time.Second))
+										continue
+									}
+								}
+								log.Printf("proxy: captcha wait timeout, probing if VK still requires captcha...")
+								p.cachedCredsMu.Lock()
+								p.cachedCreds = nil
+								p.cachedCredsMu.Unlock()
+								_, _, probeErr := p.resolveTURNAddr(linkID, false)
+								if probeErr == nil {
+									log.Printf("proxy: VK no longer requires captcha (probe succeeded), resuming")
+									p.captchaImageURL.Store("")
+									captchaResolved = true
+								} else {
+									var probeCapErr *CaptchaRequiredError
+									if errors.As(probeErr, &probeCapErr) {
+										log.Printf("proxy: VK still requires captcha, updating URL and waiting another 2 min")
+										p.captchaImageURL.Store(probeCapErr.ImageURL)
+										p.lastCaptchaSID.Store(probeCapErr.SID)
+										p.lastCaptchaTs.Store(probeCapErr.CaptchaTs)
+										p.lastCaptchaAttempt.Store(probeCapErr.CaptchaAttempt)
+										p.lastCaptchaToken1.Store(probeCapErr.Token1)
+									} else {
+										log.Printf("proxy: probe failed (non-captcha): %v, waiting another 2 min", probeErr)
+									}
+								}
+							case <-connCtx.Done():
+								p.captchaImageURL.Store("")
+								return
+							case <-p.ctx.Done():
+								p.captchaImageURL.Store("")
+								return
 							}
-							// Don't increment retries — this wasn't a real failure
-							continue
-						case <-connCtx.Done():
-							p.captchaImageURL.Store("")
-							return
-						case <-p.ctx.Done():
-							p.captchaImageURL.Store("")
-							return
 						}
+						// Don't increment retries — this wasn't a real failure
+						continue
 					}
 					retries++
 					log.Printf("proxy: TURN creds fetch failed (attempt %d/5): %s", retries, err)

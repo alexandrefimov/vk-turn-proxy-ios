@@ -51,6 +51,8 @@ class TunnelManager: ObservableObject {
     @Published var captchaImageURL: String?
     @Published var captchaSID: String?
     private var dnsSuspended = false  // true when routes removed for reconnect captcha
+    private var captchaEmptySince: Date?  // timestamp when captchaImageURL first became empty (for debounce)
+    private var lastCaptchaShowTime: Date?  // prevent rapid re-show
 
     init() {
         Task {
@@ -237,6 +239,12 @@ class TunnelManager: ObservableObject {
     private func stopStatsPolling() {
         statsTimer?.invalidate()
         statsTimer = nil
+        captchaPending = false
+        captchaImageURL = nil
+        captchaSID = nil
+        captchaEmptySince = nil
+        lastCaptchaShowTime = nil
+        dnsSuspended = false
         stats = TunnelStats()
         txRate = 0
         rxRate = 0
@@ -264,33 +272,58 @@ class TunnelManager: ObservableObject {
                         self.prevTime = now
                         self.stats = newStats
 
-                        // Detect captcha
+                        // Detect captcha with debounce to prevent rapid WebView flashing.
+                        // The Go side may briefly clear captchaImageURL during probe retries,
+                        // then set it again. Without debounce, this causes the WebView sheet
+                        // to dismiss and re-show rapidly (bad UX).
+                        //
+                        // Debounce is timestamp-based (checked every stats poll) instead of
+                        // Timer.scheduledTimer, which can fail to fire when created inside
+                        // Task { @MainActor in } from sendProviderMessage callback.
                         if let url = newStats.captchaImageURL, !url.isEmpty {
+                            // Captcha is (still) needed — reset the "empty since" timestamp
+                            self.captchaEmptySince = nil
+
                             if !self.captchaPending {
                                 self.captchaPending = true
                                 self.captchaImageURL = url
                                 self.captchaSID = newStats.captchaSID
-                                // If tunnel was already connected (reconnect captcha),
-                                // suspend routes so WebView can load captcha page directly.
-                                // Without this, DNS and HTTP go through the dead tunnel.
+                                self.lastCaptchaShowTime = Date()
                                 if self.status == .connected {
                                     self.suspendDNS()
                                     self.dnsSuspended = true
                                 }
+                            } else if self.captchaImageURL != url {
+                                // URL changed (e.g., periodic probe got a fresh captcha URL)
+                                // Update without toggling the sheet
+                                self.captchaImageURL = url
+                                self.captchaSID = newStats.captchaSID
+                                // Re-suspend DNS with fresh URL
+                                if self.status == .connected && self.dnsSuspended {
+                                    self.suspendDNS()
+                                }
                             }
                         } else {
+                            // captchaImageURL is empty — captcha may be resolved
                             if self.captchaPending {
-                                self.captchaPending = false
-                                self.captchaImageURL = nil
-                                self.captchaSID = nil
-                                if self.dnsSuspended {
-                                    // Captcha solved during reconnect — restore VPN DNS
-                                    self.restoreDNS()
-                                    self.dnsSuspended = false
-                                } else {
-                                    // Captcha solved during initial startup — apply deferred routes
-                                    self.applyDeferredRoutes()
+                                if self.captchaEmptySince == nil {
+                                    // First poll with empty URL — record timestamp
+                                    self.captchaEmptySince = Date()
+                                } else if Date().timeIntervalSince(self.captchaEmptySince!) >= 5.0 {
+                                    // 5+ seconds with empty captchaImageURL — dismiss captcha
+                                    self.captchaPending = false
+                                    self.captchaImageURL = nil
+                                    self.captchaSID = nil
+                                    self.captchaEmptySince = nil
+                                    self.lastCaptchaShowTime = nil
+                                    if self.dnsSuspended {
+                                        self.restoreDNS()
+                                        self.dnsSuspended = false
+                                    } else {
+                                        self.applyDeferredRoutes()
+                                    }
                                 }
+                                // else: still debouncing, wait for next poll
                             }
                         }
                     }

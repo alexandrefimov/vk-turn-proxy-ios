@@ -391,10 +391,13 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         }
     }
 
-    /// Temporarily remove VPN DNS settings so the system falls back to provider DNS
-    /// (cellular/WiFi DHCP). Called when captcha is needed during reconnection — the tunnel
-    /// is dead so DNS queries to 1.1.1.1 through TUN would fail, preventing WebView from
-    /// resolving VK hostnames. Routes stay intact (VK IPs are already excluded).
+    /// Temporarily remove VPN routes AND DNS so ALL traffic bypasses the dead tunnel.
+    /// Called when captcha is needed during reconnection — the tunnel is dead, so any
+    /// traffic routed through TUN will fail. The WebView needs to reach not just VK API
+    /// domains (which are in excludeHosts) but also CDN domains for JS, CSS, and captcha
+    /// images (st.vk.com, sun*.userapi.com, etc.) which are NOT in excludeHosts.
+    /// By removing the default route entirely, all traffic goes direct via cellular/WiFi.
+    /// The route is restored when the captcha is solved and connections are re-established.
     private func suspendDNSForCaptcha() {
         // If PHASE 2 is still deferred (startup captcha), there are no routes or DNS to suspend.
         // The TUN has no includedRoutes, so traffic goes direct — WebView works as-is.
@@ -403,8 +406,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             return
         }
 
-        guard let config = (protocolConfiguration as? NETunnelProviderProtocol)?.providerConfiguration,
-              let proxyConfigJSON = config["proxy_config"] as? String else {
+        guard let config = (protocolConfiguration as? NETunnelProviderProtocol)?.providerConfiguration else {
             logMsg("suspendDNSForCaptcha: no config available")
             return
         }
@@ -412,25 +414,24 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         let tunnelAddress = config["tunnel_address"] as? String ?? "192.168.102.3/24"
         let mtu = config["mtu"] as? String ?? "1280"
 
-        // Rebuild current route exclusions (keep routes intact)
-        var excludeHosts = buildCurrentExcludeHosts(proxyConfigJSON: proxyConfigJSON)
+        logMsg("suspendDNSForCaptcha: removing default route + DNS — all traffic goes direct")
 
-        logMsg("suspendDNSForCaptcha: keeping routes, excludeHosts=\(excludeHosts)")
-
-        // Create settings WITH routes but WITHOUT DNS — system falls back to provider DNS
+        // Remove BOTH routes and DNS. captureTraffic=false means no includedRoutes,
+        // so the TUN interface has no default route and all traffic bypasses it.
+        // The tunnel is dead anyway — nothing is lost by removing the route.
         let settings = createTunnelSettings(
             address: tunnelAddress,
             dns: "",  // empty = no VPN DNS override
             mtu: mtu,
-            captureTraffic: true,
-            excludeHosts: excludeHosts
+            captureTraffic: false,  // no default route — all traffic goes direct
+            excludeHosts: []        // not needed without default route
         )
 
         setTunnelNetworkSettings(settings) { [weak self] error in
             if let error = error {
                 self?.logMsg("suspendDNSForCaptcha ERROR: \(error)")
             } else {
-                self?.logMsg("suspendDNSForCaptcha: VPN DNS removed — system uses provider DNS")
+                self?.logMsg("suspendDNSForCaptcha: routes + DNS removed — all traffic direct")
             }
         }
     }
