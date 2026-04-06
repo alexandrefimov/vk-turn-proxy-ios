@@ -263,6 +263,8 @@ func (p *Proxy) waitCaptchaAndRestart() {
 	default:
 	}
 
+	probeInterval := 2 * time.Minute
+
 	for {
 		select {
 		case answer := <-p.captchaCh:
@@ -275,17 +277,17 @@ func (p *Proxy) waitCaptchaAndRestart() {
 			}
 			p.Resume()
 			return
-		case <-time.After(2 * time.Minute):
+		case <-time.After(probeInterval):
 			// Periodic self-retry: check if VK cooled down while user was away.
 			// Suppress if user is actively viewing captcha WebView.
 			if lastRefresh := p.lastRefreshCaptchaTime.Load(); lastRefresh > 0 {
 				if time.Since(time.Unix(lastRefresh, 0)) < 10*time.Minute {
-					log.Printf("proxy: startup captcha wait timeout, but user is viewing WebView (last refresh %s ago), skipping probe",
+					log.Printf("proxy: probe skipped — user is viewing WebView (last refresh %s ago)",
 						time.Since(time.Unix(lastRefresh, 0)).Round(time.Second))
 					continue
 				}
 			}
-			log.Printf("proxy: startup captcha wait timeout, probing if VK still requires captcha...")
+			log.Printf("proxy: probing if VK still requires captcha (interval was %s)...", probeInterval)
 			p.cachedCredsMu.Lock()
 			p.cachedCreds = nil
 			p.cachedCredsMu.Unlock()
@@ -298,14 +300,23 @@ func (p *Proxy) waitCaptchaAndRestart() {
 			}
 			var probeCapErr *CaptchaRequiredError
 			if errors.As(probeErr, &probeCapErr) {
-				log.Printf("proxy: VK still requires captcha, updating URL and waiting another 2 min")
+				if probeCapErr.IsRateLimit {
+					// VK returned ERROR_LIMIT — back off significantly.
+					// Frequent probes only prolong the rate limit.
+					probeInterval = 10 * time.Minute
+					log.Printf("proxy: VK rate-limited (ERROR_LIMIT), backing off to %s", probeInterval)
+				} else {
+					// Regular captcha (not rate-limited) — keep shorter interval
+					probeInterval = 2 * time.Minute
+					log.Printf("proxy: VK still requires captcha, waiting %s", probeInterval)
+				}
 				p.captchaImageURL.Store(probeCapErr.ImageURL)
 				p.lastCaptchaSID.Store(probeCapErr.SID)
 				p.lastCaptchaTs.Store(probeCapErr.CaptchaTs)
 				p.lastCaptchaAttempt.Store(probeCapErr.CaptchaAttempt)
 				p.lastCaptchaToken1.Store(probeCapErr.Token1)
 			} else {
-				log.Printf("proxy: probe failed (non-captcha): %v, waiting another 2 min", probeErr)
+				log.Printf("proxy: probe failed (non-captcha): %v, waiting %s", probeErr, probeInterval)
 			}
 		case <-p.ctx.Done():
 			p.captchaImageURL.Store("")
@@ -529,11 +540,29 @@ func (p *Proxy) waitForCaptchaAnswer(imageURL string) (string, error) {
 // SolveCaptcha provides the answer to a pending captcha challenge.
 // Called from the iOS UI via the bridge.
 func (p *Proxy) SolveCaptcha(answer string) {
+	if answer != "" {
+		p.lastCaptchaKey.Store(answer)
+	}
+	p.captchaImageURL.Store("")
+
 	select {
 	case p.captchaCh <- answer:
 	default:
 		log.Printf("proxy: SolveCaptcha called but no captcha pending")
 	}
+
+	// Schedule a forced Resume after a delay. This guarantees fresh connections
+	// are started regardless of which goroutine consumed the captchaCh answer.
+	// Without this, if the inline solver in getVKCreds wins the race (instead of
+	// waitCaptchaAndRestart), Resume() is never called and connections stay dead.
+	go func() {
+		time.Sleep(15 * time.Second)
+		// If no active connections after 15s, force reconnect
+		if p.activeConns.Load() == 0 {
+			log.Printf("proxy: SolveCaptcha — no active conns after 15s, forcing Resume()")
+			p.Resume()
+		}
+	}()
 }
 
 // RefreshCaptchaURL makes a fresh step2 VK API call to get a new captcha URL.
@@ -971,6 +1000,7 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 						// while the user is unavailable (overnight, meeting, etc.).
 						// RefreshCaptchaURL no longer auto-unblocks to avoid ping-pong.
 						captchaResolved := false
+						turnProbeInterval := 2 * time.Minute
 						for !captchaResolved {
 							select {
 							case answer := <-p.captchaCh:
@@ -982,7 +1012,7 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 									log.Printf("proxy: VK no longer requires captcha, retrying normally")
 								}
 								captchaResolved = true
-							case <-time.After(2 * time.Minute):
+							case <-time.After(turnProbeInterval):
 								// Periodic self-retry: try the full credential flow
 								// without captcha solver to see if VK cooled down.
 								// But suppress if user is actively viewing captcha WebView
@@ -996,7 +1026,7 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 										continue
 									}
 								}
-								log.Printf("proxy: captcha wait timeout, probing if VK still requires captcha...")
+								log.Printf("proxy: captcha wait timeout, probing (interval was %s)...", turnProbeInterval)
 								p.cachedCredsMu.Lock()
 								p.cachedCreds = nil
 								p.cachedCredsMu.Unlock()
@@ -1008,14 +1038,20 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 								} else {
 									var probeCapErr *CaptchaRequiredError
 									if errors.As(probeErr, &probeCapErr) {
-										log.Printf("proxy: VK still requires captcha, updating URL and waiting another 2 min")
+										if probeCapErr.IsRateLimit {
+											turnProbeInterval = 10 * time.Minute
+											log.Printf("proxy: VK rate-limited (ERROR_LIMIT), backing off to %s", turnProbeInterval)
+										} else {
+											turnProbeInterval = 2 * time.Minute
+											log.Printf("proxy: VK still requires captcha, waiting %s", turnProbeInterval)
+										}
 										p.captchaImageURL.Store(probeCapErr.ImageURL)
 										p.lastCaptchaSID.Store(probeCapErr.SID)
 										p.lastCaptchaTs.Store(probeCapErr.CaptchaTs)
 										p.lastCaptchaAttempt.Store(probeCapErr.CaptchaAttempt)
 										p.lastCaptchaToken1.Store(probeCapErr.Token1)
 									} else {
-										log.Printf("proxy: probe failed (non-captcha): %v, waiting another 2 min", probeErr)
+										log.Printf("proxy: probe failed (non-captcha): %v, waiting %s", probeErr, turnProbeInterval)
 									}
 								}
 							case <-connCtx.Done():

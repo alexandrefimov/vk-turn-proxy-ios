@@ -44,6 +44,7 @@ type CaptchaRequiredError struct {
 	CaptchaTs      float64
 	CaptchaAttempt float64
 	Token1         string // step1 access_token — must be reused when retrying with captcha
+	IsRateLimit    bool   // true when VK returned ERROR_LIMIT (PoW exhausted)
 }
 
 func (e *CaptchaRequiredError) Error() string {
@@ -195,12 +196,14 @@ func getVKCredsWithClientID(linkID string, vc vkCredentials, captchaSolver Captc
 			currentSID := captchaSID
 			currentTs := captchaTs
 			currentAttempt := captchaAttempt
+			var lastPowErr error
 
 			for powTry := 1; powTry <= maxPoWRetries; powTry++ {
 				log.Printf("vk: PoW attempt %d/%d", powTry, maxPoWRetries)
 				powCtx, powCancel := context.WithTimeout(context.Background(), 30*time.Second)
 				powToken, powErr := solveCaptchaPoW(powCtx, currentImg, currentSID, ua)
 				powCancel()
+				lastPowErr = powErr
 
 				if powErr == nil && powToken != "" {
 					log.Printf("vk: PoW auto-solve succeeded on attempt %d (%d chars), retrying step2", powTry, len(powToken))
@@ -243,10 +246,11 @@ func getVKCredsWithClientID(linkID string, vc vkCredentials, captchaSolver Captc
 			// Return CaptchaRequiredError so the app can show WebView.
 			// The app will request a FRESH captcha URL right before showing WebView
 			// (the current URL may be stale if the app was in background).
-			log.Printf("vk: all %d PoW attempts failed, falling back to WebView", maxPoWRetries)
+			isRateLimit := lastPowErr != nil && strings.Contains(lastPowErr.Error(), "ERROR_LIMIT")
+			log.Printf("vk: all %d PoW attempts failed, falling back to WebView (rateLimit=%v)", maxPoWRetries, isRateLimit)
 
 			if captchaSolver == nil {
-				return nil, &CaptchaRequiredError{ImageURL: currentImg, SID: currentSID, CaptchaTs: currentTs, CaptchaAttempt: currentAttempt, Token1: token1}
+				return nil, &CaptchaRequiredError{ImageURL: currentImg, SID: currentSID, CaptchaTs: currentTs, CaptchaAttempt: currentAttempt, Token1: token1, IsRateLimit: isRateLimit}
 			}
 			answer, err := captchaSolver(currentImg)
 			if err != nil {

@@ -12,6 +12,12 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     private var pendingMTU: String?
     private var pendingExcludeHosts: [String] = []
 
+    // Route restoration poller — runs in the extension after captcha is solved,
+    // waiting for activeConns > 0 before applying routes. This is the PRIMARY
+    // mechanism for route restoration. It does NOT depend on the app at all.
+    private var routeRestorationTimer: DispatchSourceTimer?
+    private var captchaSolvedAndWaitingForRoutes = false
+
     // VK domains that must bypass the tunnel (for captcha WebView & credential fetching).
     // These are resolved to IPs at startup and excluded from VPN routing.
     private static let vkCaptchaDomains = [
@@ -262,6 +268,11 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                     wgSolveCaptcha(tunnelHandle, UnsafeMutablePointer(mutating: ptr))
                 }
             }
+            // Start polling for connection establishment.
+            // When activeConns > 0, the extension itself will restore routes.
+            // This does NOT depend on the app — it works even if the app
+            // goes to background or the SwiftUI sheet resets captchaPending.
+            startRouteRestorationPoller()
             completionHandler?("ok".data(using: .utf8))
         } else if msg == "apply_routes" {
             logMsg("handleAppMessage: apply_routes — applying deferred PHASE 2")
@@ -289,6 +300,10 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             logMsg("handleAppMessage: restore_dns — restoring VPN DNS after captcha")
             restoreDNSAfterCaptcha()
             completionHandler?("ok".data(using: .utf8))
+        } else if msg.hasPrefix("debug_log:") {
+            let debugMsg = String(msg.dropFirst("debug_log:".count))
+            logMsg("[AppDebug] \(debugMsg)")
+            completionHandler?(nil)
         } else {
             completionHandler?(nil)
         }
@@ -442,7 +457,85 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         refreshRouteExclusions()
     }
 
+    // MARK: - Route Restoration Poller
+
+    /// Start polling for active connections after captcha is solved.
+    /// When activeConns > 0 and captchaImageURL is empty, apply routes.
+    /// Runs entirely within the extension — no app dependency.
+    private func startRouteRestorationPoller() {
+        // Cancel any existing poller
+        routeRestorationTimer?.cancel()
+        routeRestorationTimer = nil
+        captchaSolvedAndWaitingForRoutes = true
+
+        logMsg("routeRestorationPoller: started — waiting for activeConns > 0")
+
+        let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
+        timer.schedule(deadline: .now() + 2, repeating: 2.0)
+        var elapsed = 0
+
+        timer.setEventHandler { [weak self] in
+            guard let self = self, self.captchaSolvedAndWaitingForRoutes else {
+                return
+            }
+
+            elapsed += 2
+            if elapsed > 120 {
+                self.logMsg("routeRestorationPoller: timeout (120s) — giving up")
+                self.stopRouteRestorationPoller()
+                return
+            }
+
+            guard self.tunnelHandle >= 0,
+                  let statsPtr = wgGetStats(self.tunnelHandle) else {
+                return
+            }
+            let statsJSON = String(cString: statsPtr)
+            free(UnsafeMutableRawPointer(mutating: statsPtr))
+
+            guard let data = statsJSON.data(using: .utf8),
+                  let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                return
+            }
+
+            let activeConns = dict["active_conns"] as? Int ?? 0
+            let captchaURL = dict["captcha_image_url"] as? String ?? ""
+
+            if activeConns > 0 && captchaURL.isEmpty {
+                self.logMsg("routeRestorationPoller: activeConns=\(activeConns), captcha cleared — restoring routes")
+                self.captchaSolvedAndWaitingForRoutes = false
+
+                // Apply routes on main queue (setTunnelNetworkSettings requires it)
+                DispatchQueue.main.async {
+                    if self.pendingTunnelAddress != nil {
+                        // Startup captcha case — PHASE 2 was deferred
+                        self.applyDeferredRoutes { success in
+                            self.logMsg("routeRestorationPoller: applyDeferredRoutes \(success ? "OK" : "FAILED")")
+                        }
+                    } else {
+                        // Sleep/wake captcha case — routes were suspended
+                        self.restoreDNSAfterCaptcha()
+                        self.logMsg("routeRestorationPoller: restoreDNSAfterCaptcha called")
+                    }
+                }
+                self.stopRouteRestorationPoller()
+            } else {
+                self.logMsg("routeRestorationPoller: activeConns=\(activeConns) captcha=\(captchaURL.isEmpty ? "empty" : "pending") — waiting...")
+            }
+        }
+
+        timer.resume()
+        routeRestorationTimer = timer
+    }
+
+    private func stopRouteRestorationPoller() {
+        routeRestorationTimer?.cancel()
+        routeRestorationTimer = nil
+        captchaSolvedAndWaitingForRoutes = false
+    }
+
     override func stopTunnel(with reason: NEProviderStopReason, completionHandler: @escaping () -> Void) {
+        stopRouteRestorationPoller()
         if tunnelHandle >= 0 {
             wgTurnOff(tunnelHandle)
             tunnelHandle = -1

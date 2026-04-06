@@ -51,7 +51,6 @@ class TunnelManager: ObservableObject {
     @Published var captchaImageURL: String?
     @Published var captchaSID: String?
     private var dnsSuspended = false  // true when routes removed for reconnect captcha
-    private var captchaEmptySince: Date?  // timestamp when captchaImageURL first became empty (for debounce)
     private var lastCaptchaShowTime: Date?  // prevent rapid re-show
 
     init() {
@@ -147,6 +146,13 @@ class TunnelManager: ObservableObject {
         } catch {}
     }
 
+    /// Send debug log message to extension (appears in vpn.log).
+    private func debugLog(_ message: String) {
+        guard let session = manager?.connection as? NETunnelProviderSession,
+              let msg = "debug_log:\(message)".data(using: .utf8) else { return }
+        try? session.sendProviderMessage(msg) { _ in }
+    }
+
     /// Restore VPN DNS settings after captcha is solved.
     func restoreDNS() {
         guard let session = manager?.connection as? NETunnelProviderSession else { return }
@@ -205,11 +211,22 @@ class TunnelManager: ObservableObject {
         ) { [weak self] _ in
             Task { @MainActor in
                 guard let self = self else { return }
-                self.status = manager.connection.status
-                if manager.connection.status == .connected {
-                    self.startStatsPolling()
-                } else {
+                let newStatus = manager.connection.status
+                self.debugLog("NEVPNStatus changed: \(newStatus.rawValue) captchaPending=\(self.captchaPending) dnsSusp=\(self.dnsSuspended)")
+                self.status = newStatus
+                switch newStatus {
+                case .connected:
+                    // (Re)start polling, preserving captcha state across reconnects
+                    self.startStatsPolling(reset: false)
+                case .disconnected, .invalid:
+                    // Terminal states — full cleanup
                     self.stopStatsPolling()
+                    self.resetCaptchaState()
+                default:
+                    // Transient states (.connecting, .disconnecting, .reasserting)
+                    // Do NOT stop polling or clear captcha state — the tunnel
+                    // may recover momentarily (e.g., sleep/wake cycle).
+                    break
                 }
             }
         }
@@ -227,28 +244,38 @@ class TunnelManager: ObservableObject {
         prevTx = 0
         prevRx = 0
         prevTime = Date()
-        // Fetch immediately, then every 2 seconds
+        // Fetch immediately, then every 2 seconds.
+        // Add to .common RunLoop mode so the timer fires even during
+        // UI animations (e.g., SwiftUI sheet dismiss transitions).
         fetchStats()
-        statsTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+        let timer = Timer(timeInterval: 2.0, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 self?.fetchStats()
             }
         }
+        RunLoop.main.add(timer, forMode: .common)
+        statsTimer = timer
     }
 
     private func stopStatsPolling() {
         statsTimer?.invalidate()
         statsTimer = nil
-        captchaPending = false
-        captchaImageURL = nil
-        captchaSID = nil
-        captchaEmptySince = nil
-        lastCaptchaShowTime = nil
-        dnsSuspended = false
+        // Do NOT clear captcha state here — it must survive across
+        // transient status changes (sleep/wake, reasserting).
+        // Captcha state is cleared in resetCaptchaState() on terminal disconnect.
         stats = TunnelStats()
         txRate = 0
         rxRate = 0
         internetRTTms = 0
+    }
+
+    /// Clear all captcha-related state. Only called on terminal disconnect.
+    private func resetCaptchaState() {
+        captchaPending = false
+        captchaImageURL = nil
+        captchaSID = nil
+        lastCaptchaShowTime = nil
+        dnsSuspended = false
     }
 
     private var pingCounter: Int = 0
@@ -272,58 +299,55 @@ class TunnelManager: ObservableObject {
                         self.prevTime = now
                         self.stats = newStats
 
-                        // Detect captcha with debounce to prevent rapid WebView flashing.
-                        // The Go side may briefly clear captchaImageURL during probe retries,
-                        // then set it again. Without debounce, this causes the WebView sheet
-                        // to dismiss and re-show rapidly (bad UX).
+                        // Captcha detection and route restoration logic.
                         //
-                        // Debounce is timestamp-based (checked every stats poll) instead of
-                        // Timer.scheduledTimer, which can fail to fire when created inside
-                        // Task { @MainActor in } from sendProviderMessage callback.
-                        if let url = newStats.captchaImageURL, !url.isEmpty {
-                            // Captcha is (still) needed — reset the "empty since" timestamp
-                            self.captchaEmptySince = nil
+                        // Primary trigger: activeConns > 0 means the DTLS/TURN proxy
+                        // successfully connected — captcha is truly resolved.
+                        // This replaces the fragile 5-second time-based debounce which
+                        // failed because Timer.scheduledTimer uses .default RunLoop mode
+                        // and doesn't fire during SwiftUI sheet-dismiss animations.
+                        let captchaURL = newStats.captchaImageURL
+                        let hasCaptcha = captchaURL != nil && !captchaURL!.isEmpty
 
+                        // Debug: log every stats poll when captcha state is relevant
+                        if self.captchaPending || hasCaptcha {
+                            self.debugLog("stats: hasCaptcha=\(hasCaptcha) pending=\(self.captchaPending) dnsSusp=\(self.dnsSuspended) conns=\(newStats.activeConns)")
+                        }
+
+                        if hasCaptcha {
                             if !self.captchaPending {
                                 self.captchaPending = true
-                                self.captchaImageURL = url
+                                self.captchaImageURL = captchaURL
                                 self.captchaSID = newStats.captchaSID
                                 self.lastCaptchaShowTime = Date()
                                 if self.status == .connected {
                                     self.suspendDNS()
                                     self.dnsSuspended = true
                                 }
-                            } else if self.captchaImageURL != url {
+                                self.debugLog("captcha DETECTED, suspendDNS=\(self.status == .connected)")
+                            } else if self.captchaImageURL != captchaURL {
                                 // URL changed (e.g., periodic probe got a fresh captcha URL)
-                                // Update without toggling the sheet
-                                self.captchaImageURL = url
+                                self.captchaImageURL = captchaURL
                                 self.captchaSID = newStats.captchaSID
-                                // Re-suspend DNS with fresh URL
                                 if self.status == .connected && self.dnsSuspended {
                                     self.suspendDNS()
                                 }
+                                self.debugLog("captcha URL CHANGED")
                             }
-                        } else {
-                            // captchaImageURL is empty — captcha may be resolved
-                            if self.captchaPending {
-                                if self.captchaEmptySince == nil {
-                                    // First poll with empty URL — record timestamp
-                                    self.captchaEmptySince = Date()
-                                } else if Date().timeIntervalSince(self.captchaEmptySince!) >= 5.0 {
-                                    // 5+ seconds with empty captchaImageURL — dismiss captcha
-                                    self.captchaPending = false
-                                    self.captchaImageURL = nil
-                                    self.captchaSID = nil
-                                    self.captchaEmptySince = nil
-                                    self.lastCaptchaShowTime = nil
-                                    if self.dnsSuspended {
-                                        self.restoreDNS()
-                                        self.dnsSuspended = false
-                                    } else {
-                                        self.applyDeferredRoutes()
-                                    }
-                                }
-                                // else: still debouncing, wait for next poll
+                        } else if self.captchaPending && newStats.activeConns > 0 {
+                            // Captcha URL is empty AND we have active connections.
+                            // This is the reliable signal that captcha was resolved
+                            // and the proxy reconnected successfully.
+                            self.debugLog("captcha RESOLVED — activeConns=\(newStats.activeConns), restoring routes, dnsSusp=\(self.dnsSuspended)")
+                            self.captchaPending = false
+                            self.captchaImageURL = nil
+                            self.captchaSID = nil
+                            self.lastCaptchaShowTime = nil
+                            if self.dnsSuspended {
+                                self.restoreDNS()
+                                self.dnsSuspended = false
+                            } else {
+                                self.applyDeferredRoutes()
                             }
                         }
                     }
