@@ -17,6 +17,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -53,6 +54,13 @@ func newHTTPClient() *http.Client {
 		Transport: newChromeTransport(),
 	}
 }
+
+// checkboxBurnedForSession is set the first time a checkbox-style
+// captchaNotRobot.check returns a non-OK status. Once set, all subsequent
+// solveCaptchaPoW calls in the current global session (Proxy instance)
+// will skip the checkbox check entirely and jump straight to the slider.
+// Reset to false by NewProxy() at the start of every connect cycle.
+var checkboxBurnedForSession atomic.Bool
 
 // solveCaptchaPoW attempts to solve a VK "Not Robot" captcha automatically
 // using proof-of-work, without any user interaction.
@@ -295,87 +303,99 @@ func callCaptchaNotRobotAPI(ctx context.Context, client *http.Client, sessionTok
 		return "", fmt.Errorf("componentDone: %w", err)
 	}
 
-	// Longer pause before check (1950-3200ms) — matches reference HAR timing
-	checkDelay := time.Duration(1950+mathrand.Intn(1250)) * time.Millisecond
-	log.Printf("pow: waiting %s before check", checkDelay.Round(time.Millisecond))
-	select {
-	case <-time.After(checkDelay):
-	case <-ctx.Done():
-		return "", ctx.Err()
-	}
-
 	// 3/4: check (checkbox-style)
-	log.Printf("pow: 3/4 captchaNotRobot.check")
-
-	// Simplified sensor data — empty arrays for most sensors,
-	// minimal cursor path. Reference impl shows VK accepts this
-	// and overly-detailed fake data may trigger detection.
-	now := time.Now().UnixMilli()
-	cursorData := []map[string]interface{}{
-		{"x": 960, "y": 540, "t": now - 2000},
-		{"x": 965, "y": 538, "t": now - 1500},
-		{"x": 970, "y": 535, "t": now - 1000},
-		{"x": 972, "y": 533, "t": now - 500},
-		{"x": 975, "y": 530, "t": now},
-	}
-	cursorBytes, _ := json.Marshal(cursorData)
-
-	// Downlink: small array with realistic values
-	var downlink []float64
-	baseSpeed := 8.0 + mathrand.Float64()*4.0
-	for i := 0; i < 7; i++ {
-		downlink = append(downlink, baseSpeed+mathrand.Float64()*0.5-0.25)
-	}
-	downlinkBytes, _ := json.Marshal(downlink)
-
-	answer := base64.StdEncoding.EncodeToString([]byte("{}"))
-
-	// Fixed debug_info hash — a real browser sends consistent value
-	debugInfo := "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-
-	checkData := baseParams + fmt.Sprintf(
-		"&accelerometer=%s&gyroscope=%s&motion=%s&cursor=%s&taps=%s&connectionRtt=%s&connectionDownlink=%s"+
-			"&browser_fp=%s&hash=%s&answer=%s&debug_info=%s",
-		url.QueryEscape("[]"),
-		url.QueryEscape("[]"),
-		url.QueryEscape("[]"),
-		url.QueryEscape(string(cursorBytes)),
-		url.QueryEscape("[]"),
-		url.QueryEscape("[]"),
-		url.QueryEscape(string(downlinkBytes)),
-		browserFp,
-		hash,
-		answer,
-		debugInfo,
-	)
-
-	checkResp, err := vkReq("captchaNotRobot.check", checkData)
-	if err != nil {
-		return "", fmt.Errorf("check: %w", err)
-	}
-
-	respObj, ok := checkResp["response"].(map[string]interface{})
-	if !ok {
-		return "", fmt.Errorf("check: invalid response: %v", checkResp)
-	}
-	status, _ := respObj["status"].(string)
-	if status == "OK" {
-		successToken, ok := respObj["success_token"].(string)
-		if !ok || successToken == "" {
-			return "", fmt.Errorf("check: no success_token in response")
+	//
+	// Checkbox captcha is probed at most ONCE per global session (per Proxy
+	// instance). After the first time it fails, checkboxBurnedForSession is
+	// set and all subsequent solveCaptchaPoW calls in this session jump
+	// straight to the slider path, saving ~2-3 seconds of wait + HTTP per
+	// captcha.
+	if checkboxBurnedForSession.Load() {
+		log.Printf("pow: 3/4 skipping checkbox check (burned earlier this session), going straight to slider")
+	} else {
+		// Longer pause before check (1950-3200ms) — matches reference HAR timing
+		checkDelay := time.Duration(1950+mathrand.Intn(1250)) * time.Millisecond
+		log.Printf("pow: waiting %s before check", checkDelay.Round(time.Millisecond))
+		select {
+		case <-time.After(checkDelay):
+		case <-ctx.Done():
+			return "", ctx.Err()
 		}
-		time.Sleep(200 * time.Millisecond)
-		log.Printf("pow: 4/4 captchaNotRobot.endSession")
-		_, err = vkReq("captchaNotRobot.endSession", baseParams)
+
+		log.Printf("pow: 3/4 captchaNotRobot.check")
+
+		// Simplified sensor data — empty arrays for most sensors,
+		// minimal cursor path. Reference impl shows VK accepts this
+		// and overly-detailed fake data may trigger detection.
+		now := time.Now().UnixMilli()
+		cursorData := []map[string]interface{}{
+			{"x": 960, "y": 540, "t": now - 2000},
+			{"x": 965, "y": 538, "t": now - 1500},
+			{"x": 970, "y": 535, "t": now - 1000},
+			{"x": 972, "y": 533, "t": now - 500},
+			{"x": 975, "y": 530, "t": now},
+		}
+		cursorBytes, _ := json.Marshal(cursorData)
+
+		// Downlink: small array with realistic values
+		var downlink []float64
+		baseSpeed := 8.0 + mathrand.Float64()*4.0
+		for i := 0; i < 7; i++ {
+			downlink = append(downlink, baseSpeed+mathrand.Float64()*0.5-0.25)
+		}
+		downlinkBytes, _ := json.Marshal(downlink)
+
+		answer := base64.StdEncoding.EncodeToString([]byte("{}"))
+
+		// Fixed debug_info hash — a real browser sends consistent value
+		debugInfo := "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
+		checkData := baseParams + fmt.Sprintf(
+			"&accelerometer=%s&gyroscope=%s&motion=%s&cursor=%s&taps=%s&connectionRtt=%s&connectionDownlink=%s"+
+				"&browser_fp=%s&hash=%s&answer=%s&debug_info=%s",
+			url.QueryEscape("[]"),
+			url.QueryEscape("[]"),
+			url.QueryEscape("[]"),
+			url.QueryEscape(string(cursorBytes)),
+			url.QueryEscape("[]"),
+			url.QueryEscape("[]"),
+			url.QueryEscape(string(downlinkBytes)),
+			browserFp,
+			hash,
+			answer,
+			debugInfo,
+		)
+
+		checkResp, err := vkReq("captchaNotRobot.check", checkData)
 		if err != nil {
-			log.Printf("pow: endSession failed (non-fatal): %v", err)
+			return "", fmt.Errorf("check: %w", err)
 		}
-		return successToken, nil
-	}
 
-	// Checkbox check failed — try automatic slider solver if VK returned slider type
-	showCaptchaType, _ := respObj["show_captcha_type"].(string)
-	log.Printf("pow: checkbox check failed (status=%s, show_captcha_type=%s)", status, showCaptchaType)
+		respObj, ok := checkResp["response"].(map[string]interface{})
+		if !ok {
+			return "", fmt.Errorf("check: invalid response: %v", checkResp)
+		}
+		status, _ := respObj["status"].(string)
+		if status == "OK" {
+			successToken, ok := respObj["success_token"].(string)
+			if !ok || successToken == "" {
+				return "", fmt.Errorf("check: no success_token in response")
+			}
+			time.Sleep(200 * time.Millisecond)
+			log.Printf("pow: 4/4 captchaNotRobot.endSession")
+			_, err = vkReq("captchaNotRobot.endSession", baseParams)
+			if err != nil {
+				log.Printf("pow: endSession failed (non-fatal): %v", err)
+			}
+			return successToken, nil
+		}
+
+		// Checkbox check failed — burn it for the rest of this global session
+		// and fall through to the slider solver.
+		showCaptchaType, _ := respObj["show_captcha_type"].(string)
+		log.Printf("pow: checkbox check failed (status=%s, show_captcha_type=%s) — burning checkbox for the rest of this session", status, showCaptchaType)
+		checkboxBurnedForSession.Store(true)
+	}
 
 	// Try slider solver regardless of show_captcha_type — VK may not always
 	// include it in the check response, but getContent may still work
@@ -400,7 +420,10 @@ func callCaptchaNotRobotAPI(ctx context.Context, client *http.Client, sessionTok
 	}
 	log.Printf("pow: slider solver failed: %v", sliderErr)
 
-	return "", fmt.Errorf("check: status=%s response=%v (slider also failed: %v)", status, checkResp, sliderErr)
+	if checkboxBurnedForSession.Load() {
+		return "", fmt.Errorf("checkbox burned earlier this session, slider also failed: %v", sliderErr)
+	}
+	return "", fmt.Errorf("checkbox check failed and slider also failed: %v", sliderErr)
 }
 
 func min(a, b int) int {

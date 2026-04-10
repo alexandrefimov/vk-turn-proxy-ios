@@ -215,10 +215,12 @@ func getVKCredsWithClientID(linkID string, vc vkCredentials, captchaSolver Captc
 
 				log.Printf("vk: PoW attempt %d/%d failed: %v", powTry, maxPoWRetries, powErr)
 
-				// If VK returned plain "ERROR" (not BOT, not ERROR_LIMIT),
-				// PoW is likely disabled entirely — don't waste time retrying.
-				if powErr != nil && strings.Contains(powErr.Error(), "status=ERROR ") {
-					log.Printf("vk: PoW appears disabled (status=ERROR), skipping remaining attempts")
+				// If BOTH checkbox and slider failed in this attempt, there's
+				// little point hammering VK again — go straight to WebView fallback.
+				// The new solveCaptchaPoW returns errors starting with "checkbox ..."
+				// and mentioning "slider also failed" in exactly this case.
+				if powErr != nil && strings.Contains(powErr.Error(), "slider also failed") {
+					log.Printf("vk: checkbox + slider both failed, skipping remaining attempts")
 					break
 				}
 

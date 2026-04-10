@@ -123,6 +123,8 @@ func NewProxy(cfg Config) *Proxy {
 	if cfg.NumConns <= 0 {
 		cfg.NumConns = 1
 	}
+	// Fresh global session — checkbox captcha is allowed again until it fails once.
+	checkboxBurnedForSession.Store(false)
 	ctx, cancel := context.WithCancel(context.Background())
 	sessCtx, sessCancel := context.WithCancel(ctx)
 	p := &Proxy{
