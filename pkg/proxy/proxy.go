@@ -98,6 +98,17 @@ type Proxy struct {
 	// Used to detect dead tunnels after iOS freeze/thaw.
 	lastRecvTime atomic.Int64
 
+	// Pion silent-degradation detector. The pion TURN client logs Errorf when
+	// CreatePermission refresh fails and Warnf when ChannelBind refresh fails.
+	// Neither failure tears down the underlying allocation, so a partial loss
+	// (e.g. 8 of 10 clients lose permissions on the server side) is invisible
+	// at the application layer: stats keep showing conns 10/10, lastRecvTime
+	// stays fresh thanks to the surviving connections, throughput drops by 80%.
+	// We count these failures here and the watchdog forces a full reconnect
+	// once they accumulate past a threshold while persisting for some time.
+	pionTransientErrors atomic.Int64 // cumulative since last ForceReconnect
+	firstPionErrorTime  atomic.Int64 // unix seconds, 0 = no errors yet
+
 	// Guard against multiple concurrent waitCaptchaAndRestart goroutines.
 	// Only one should be running at a time; extras just compete on captchaCh.
 	captchaWaiterActive atomic.Bool
@@ -125,6 +136,9 @@ func NewProxy(cfg Config) *Proxy {
 	}
 	// Fresh global session — checkbox captcha is allowed again until it fails once.
 	checkboxBurnedForSession.Store(false)
+	// Fresh global session — clear any leftover pion-degradation counters.
+	// (atomic.Int64 zero values are fine for a brand-new struct, but explicit
+	//  for clarity in case Proxy is ever pooled in the future.)
 	ctx, cancel := context.WithCancel(context.Background())
 	sessCtx, sessCancel := context.WithCancel(ctx)
 	p := &Proxy{
@@ -396,6 +410,15 @@ func (p *Proxy) ForceReconnect() {
 	p.cachedCredsMu.Lock()
 	p.cachedCreds = nil
 	p.cachedCredsMu.Unlock()
+	// Clear the silent-degradation counters so the new session starts fresh.
+	p.pionTransientErrors.Store(0)
+	p.firstPionErrorTime.Store(0)
+	// Reset the lastRecvTime clock so the new session gets a fair 2-minute
+	// window before watchdog condition 1 can fire again. Otherwise, if the
+	// old lastRecvTime is stale (which is exactly why condition 1 triggered
+	// in the first place), the very next watchdog tick would see elapsed
+	// still > 2 minutes and ForceReconnect the not-yet-built new session.
+	p.lastRecvTime.Store(time.Now().Unix())
 	p.reconnects.Add(1)
 	log.Printf("proxy: ForceReconnect — watchdog triggered, starting fresh connections")
 	go p.startConnections()
@@ -406,10 +429,14 @@ func (p *Proxy) ForceReconnect() {
 // After unfreeze, all TURN allocations are expired but goroutines sit on
 // dead sockets. The watchdog detects this by tracking the last received packet.
 //
-// Two conditions trigger a full reconnect:
+// Three conditions trigger a full reconnect:
 //  1. No packets for 2 min with active connections → dead tunnel
 //  2. Active connections < half of expected for 5+ min → partial recovery stuck
 //     (e.g., after Allocation Quota Reached, only 1-2 of 10 connections survive)
+//  3. Pion permission/binding refresh failures persist past a threshold →
+//     silent partial degradation (some clients still alive, but server-side
+//     permissions are gone for the others; UI shows 10/10 with 0 reconnects
+//     while throughput collapses to 1/N)
 func (p *Proxy) runWatchdog() {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
@@ -442,6 +469,22 @@ func (p *Proxy) runWatchdog() {
 					p.ForceReconnect()
 					continue
 				}
+			}
+
+			// Condition 3: Silent partial degradation — pion is logging
+			// permission or channel-binding refresh failures but the surviving
+			// clients keep lastRecvTime fresh, so condition 1 never trips.
+			// Trigger if we've accumulated enough errors AND they have been
+			// persisting for at least 90 seconds (avoids reacting to a single
+			// flaky cycle).
+			pionErrs := p.pionTransientErrors.Load()
+			firstErr := p.firstPionErrorTime.Load()
+			if pionErrs >= 10 && firstErr > 0 && time.Since(time.Unix(firstErr, 0)) > 90*time.Second {
+				log.Printf("proxy: watchdog — %d pion permission/binding errors over %s, tunnel silently degraded, forcing reconnect",
+					pionErrs, time.Since(time.Unix(firstErr, 0)).Round(time.Second))
+				lowConnSince = time.Time{} // reset
+				p.ForceReconnect()
+				continue
 			}
 
 			// Condition 2: Too few active connections for too long.
@@ -1346,7 +1389,7 @@ func (p *Proxy) runTURN(ctx context.Context, turnAddr string, creds *TURNCreds, 
 		Username:               creds.Username,
 		Password:               creds.Password,
 		RequestedAddressFamily: addrFamily,
-		LoggerFactory:          &turnLoggerFactory{},
+		LoggerFactory:          &turnLoggerFactory{proxy: p},
 	}
 
 	client, err := turn.NewClient(cfg)
@@ -1367,7 +1410,13 @@ func (p *Proxy) runTURN(ctx context.Context, turnAddr string, creds *TURNCreds, 
 	defer relayConn.Close()
 	p.turnRTTns.Store(int64(time.Since(allocStart)))
 
-	log.Printf("proxy: [conn %d] TURN relay allocated: %s (RTT %dms)", connIdx, relayConn.LocalAddr(), time.Since(allocStart).Milliseconds())
+	// Log turnConn.LocalAddr() too — this is the source address the OS kernel
+	// picked for our outbound UDP socket. On iOS it tells us which interface
+	// the Network Extension is using (cellular CGNAT like 10.x.x.x vs WiFi
+	// local range like 192.168.x.x), which is otherwise invisible and
+	// critically affects which source IP VK TURN sees.
+	log.Printf("proxy: [conn %d] TURN relay allocated: %s (RTT %dms, local=%s)",
+		connIdx, relayConn.LocalAddr(), time.Since(allocStart).Milliseconds(), turnConn.LocalAddr())
 
 	// Bidirectional forwarding: conn2 ↔ relayConn
 	var wg sync.WaitGroup
@@ -1476,14 +1525,21 @@ func (c *connectedUDPConn) WriteTo(p []byte, _ net.Addr) (int, error) {
 
 // turnLoggerFactory logs pion/turn refresh and error messages to help debug
 // TURN allocation lifetime issues. Only Warn/Error and refresh-related Debug
-// messages are logged; everything else is suppressed.
-type turnLoggerFactory struct{}
-
-func (f *turnLoggerFactory) NewLogger(scope string) logging.LeveledLogger {
-	return &turnLogger{scope: scope}
+// messages are logged; everything else is suppressed. The factory holds a
+// reference to the owning Proxy so loggers can bump the silent-degradation
+// counter when permission/binding refreshes start failing.
+type turnLoggerFactory struct {
+	proxy *Proxy
 }
 
-type turnLogger struct{ scope string }
+func (f *turnLoggerFactory) NewLogger(scope string) logging.LeveledLogger {
+	return &turnLogger{scope: scope, proxy: f.proxy}
+}
+
+type turnLogger struct {
+	scope string
+	proxy *Proxy
+}
 
 func (l *turnLogger) Trace(msg string)                          {}
 func (l *turnLogger) Tracef(format string, args ...interface{}) {}
@@ -1500,12 +1556,69 @@ func (l *turnLogger) Debugf(format string, args ...interface{}) {
 		log.Printf("pion/%s: %s", l.scope, msg)
 	}
 }
-func (l *turnLogger) Info(msg string)                           {}
-func (l *turnLogger) Infof(format string, args ...interface{})  {}
-func (l *turnLogger) Warn(msg string)                           { log.Printf("pion/%s: WARN: %s", l.scope, sanitizeLog(msg)) }
-func (l *turnLogger) Warnf(format string, args ...interface{})  { log.Printf("pion/%s: WARN: %s", l.scope, sanitizeLog(fmt.Sprintf(format, args...))) }
-func (l *turnLogger) Error(msg string)                          { log.Printf("pion/%s: ERROR: %s", l.scope, sanitizeLog(msg)) }
-func (l *turnLogger) Errorf(format string, args ...interface{}) { log.Printf("pion/%s: ERROR: %s", l.scope, sanitizeLog(fmt.Sprintf(format, args...))) }
+func (l *turnLogger) Info(msg string)                          {}
+func (l *turnLogger) Infof(format string, args ...interface{}) {}
+func (l *turnLogger) Warn(msg string) {
+	log.Printf("pion/%s: WARN: %s", l.scope, sanitizeLog(msg))
+	l.maybeCountTransientError(msg)
+}
+func (l *turnLogger) Warnf(format string, args ...interface{}) {
+	msg := fmt.Sprintf(format, args...)
+	log.Printf("pion/%s: WARN: %s", l.scope, sanitizeLog(msg))
+	l.maybeCountTransientError(msg)
+}
+func (l *turnLogger) Error(msg string) {
+	log.Printf("pion/%s: ERROR: %s", l.scope, sanitizeLog(msg))
+	l.maybeCountTransientError(msg)
+}
+func (l *turnLogger) Errorf(format string, args ...interface{}) {
+	msg := fmt.Sprintf(format, args...)
+	log.Printf("pion/%s: ERROR: %s", l.scope, sanitizeLog(msg))
+	l.maybeCountTransientError(msg)
+}
+
+// maybeCountTransientError bumps the per-Proxy silent-degradation counter when
+// the pion client logs a permission or channel-binding refresh failure that
+// indicates the VK TURN server is actively rejecting our requests. Both
+// failure modes leave the allocation outwardly healthy (conns/lastRecvTime
+// stay fresh) while throughput collapses, so the watchdog needs an explicit
+// signal to detect the situation.
+//
+// Server-rejection errors from pion contain the substring "error response"
+// because that's how the stun.MessageType for the error class stringifies
+// (e.g. "CreatePermission error response (error 400: Bad Request)" or
+// "unexpected response type ChannelBind error response"). Any other kind of
+// failure is NOT a server rejection and must be excluded:
+//
+//   - "transaction closed" — pion cancelled in-flight transactions during
+//     our own ForceReconnect (client.Close() path). No server rejection.
+//   - "all retransmissions failed" — STUN transaction never got a reply,
+//     network-layer drop (WiFi handoff, captive portal, iOS freezing the
+//     UDP socket). Already covered by watchdog condition 1.
+//   - "use of closed network connection" — pion tried to write to a UDP
+//     socket we'd already closed during teardown.
+//
+// Rather than blacklisting each failure mode, we whitelist on the "error
+// response" marker — if the server actually responded with an error, it's
+// a real degradation signal; otherwise it's local-side noise we ignore.
+// This is safe because "No transaction for Refresh error response" is
+// logged by pion at Debugf level, not Warnf/Errorf, so it never reaches
+// this function.
+func (l *turnLogger) maybeCountTransientError(msg string) {
+	if l.proxy == nil {
+		return
+	}
+	if !strings.Contains(msg, "error response") {
+		return
+	}
+	if !strings.Contains(msg, "Fail to refresh permissions") && !strings.Contains(msg, "Failed to bind channel") {
+		return
+	}
+	l.proxy.pionTransientErrors.Add(1)
+	if l.proxy.firstPionErrorTime.Load() == 0 {
+		l.proxy.firstPionErrorTime.Store(time.Now().Unix())
+	}
+}
 
 // sanitizeLog removes null bytes from log messages (VK TURN server
 // includes trailing \0 in STUN error reason phrases).
