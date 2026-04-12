@@ -1452,6 +1452,37 @@ func (p *Proxy) runTURN(ctx context.Context, turnAddr string, creds *TURNCreds, 
 	log.Printf("proxy: [conn %d] TURN relay allocated: %s (RTT %dms, local=%s)",
 		connIdx, relayConn.LocalAddr(), time.Since(allocStart).Milliseconds(), turnConn.LocalAddr())
 
+	// NAT keepalive — send a STUN Binding request every 25 seconds on the
+	// underlying TURN socket. This prevents WiFi router NAT mapping expiry
+	// during iOS sleep.
+	//
+	// When the phone is awake, WireGuard keepalives (every 25s) flow through
+	// the TURN socket and refresh the NAT mapping as a side effect. But when
+	// iOS sleeps, WG keepalives stop (TUN device is frozen), and the TURN
+	// socket goes silent. Home routers typically expire UDP NAT mappings
+	// after 30-120 seconds of inactivity (e.g. pf udp.multiple = 60s).
+	// After expiry, the router assigns a new external port for the next
+	// outgoing packet, causing a 5-tuple mismatch on the TURN server which
+	// rejects further requests with 400 Bad Request.
+	//
+	// STUN Binding request is ~28 bytes, VK responds with a Binding response.
+	// The round-trip refreshes the NAT mapping. During iOS freeze the Go
+	// ticker doesn't fire, but on each brief thaw (iOS thaws the process
+	// every 10-15 seconds during sleep) the ticker catches up and fires
+	// immediately, keeping the mapping alive.
+	go func() {
+		ticker := time.NewTicker(25 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				_, _ = client.SendBindingRequest()
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
 	// Bidirectional forwarding: conn2 ↔ relayConn
 	var wg sync.WaitGroup
 	wg.Add(2)
