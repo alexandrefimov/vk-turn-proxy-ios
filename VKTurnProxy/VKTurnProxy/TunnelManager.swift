@@ -50,6 +50,23 @@ class TunnelManager: ObservableObject {
     @Published var captchaPending = false
     @Published var captchaImageURL: String?
     @Published var captchaSID: String?
+    // Set true when JS detector in the WebView reports the loaded page is
+    // "Attempt limit reached" (no interactive element, error text visible).
+    // UI renders an overlay with a progress indicator while this is true.
+    // Cleared when the WebView reloads to a working captcha (JS posts
+    // state:ready) or when the sheet is dismissed / captcha resolves.
+    @Published var captchaLimitReached = false
+    // Incremented on each auto-refresh attempt. Shown in the overlay UI.
+    @Published var captchaRefreshAttempt = 0
+    // Max consecutive auto-refresh attempts before we stop and surface an
+    // error. 6 × 10s interval = up to 60s of auto-retries.
+    let maxCaptchaRefreshAttempts = 6
+    // Interval between auto-refresh attempts (seconds).
+    private let captchaRefreshInterval: TimeInterval = 10
+    // Timer driving the periodic auto-refresh while captchaLimitReached=true.
+    // Created by onCaptchaLimitDetected, invalidated by onCaptchaReady /
+    // onCaptchaSheetDismissed / captcha-resolved / max-attempts.
+    private var captchaAutoRefreshTimer: Timer?
     private var dnsSuspended = false  // true when routes removed for reconnect captcha
     private var lastCaptchaShowTime: Date?  // prevent rapid re-show
 
@@ -67,6 +84,19 @@ class TunnelManager: ObservableObject {
                 guard let self = self else { return }
                 if self.status == .connected {
                     self.startStatsPolling(reset: false)
+                }
+                // If the auto-refresh overlay was up when the app went to
+                // background, the scheduled Timer stopped firing (iOS
+                // suspends timers in background apps). When we come back
+                // the overlay is still visible but no refresh is happening.
+                // Re-trigger the auto-refresh from scratch so the timer
+                // resumes ticking and immediately fires an initial refresh.
+                if self.captchaLimitReached {
+                    self.debugLog("captcha auto-refresh: app returned to foreground while overlay still visible — re-triggering auto-refresh (previous attempt=\(self.captchaRefreshAttempt))")
+                    self.captchaAutoRefreshTimer?.invalidate()
+                    self.captchaAutoRefreshTimer = nil
+                    self.captchaLimitReached = false  // reset so onCaptchaLimitDetected doesn't early-return
+                    self.onCaptchaLimitDetected()
                 }
             }
         }
@@ -157,6 +187,15 @@ class TunnelManager: ObservableObject {
         try? session.sendProviderMessage(msg) { _ in }
     }
 
+    /// Route captcha-WebView log messages into the same vpn.log stream used
+    /// by the extension. The WKWebView lives in the main-app process and has
+    /// no direct access to the shared App Group log file, so we tunnel the
+    /// string through the provider-session IPC — same mechanism debugLog
+    /// uses for TunnelManager's own events.
+    func logFromCaptchaView(_ message: String) {
+        debugLog("[captcha-view] \(message)")
+    }
+
     /// Restore VPN DNS settings after captcha is solved.
     func restoreDNS() {
         guard let session = manager?.connection as? NETunnelProviderSession else { return }
@@ -164,6 +203,86 @@ class TunnelManager: ObservableObject {
         do {
             try session.sendProviderMessage(msg) { _ in }
         } catch {}
+    }
+
+    // MARK: - Captcha auto-refresh ("Attempt limit reached" recovery)
+    //
+    // When VK responds to our captcha fetch with the "Attempt limit reached"
+    // error page (non-interactive, shows only Done), sitting still does
+    // nothing — VK expects us to come back with a fresh client_id / session.
+    // The JS detector inside CaptchaWKWebView posts `state:limit` to Swift
+    // after 2.5s of page load; that triggers `onCaptchaLimitDetected()` here.
+    // We then start a Timer that periodically calls `suspendDNS()` — which
+    // under the hood asks the extension for a fresh captcha URL. The fresh
+    // URL flows back through `captchaImageURL` → SwiftUI rebind →
+    // `CaptchaWKWebView.updateUIView` reloads the same WKWebView → JS fires
+    // again → either `state:limit` (still bad, timer keeps going) or
+    // `state:ready` (working captcha, we stop the timer and hide the overlay).
+
+    /// Called from WebView JS detector when the loaded page is in
+    /// limit-reached state. Idempotent — multiple calls while a timer is
+    /// already running are no-ops.
+    func onCaptchaLimitDetected() {
+        if captchaAutoRefreshTimer != nil {
+            debugLog("captcha auto-refresh: limit_detected arrived while timer already running, ignoring duplicate")
+            return
+        }
+        debugLog("captcha auto-refresh: limit_detected, starting (interval=\(Int(captchaRefreshInterval))s, max=\(maxCaptchaRefreshAttempts) attempts)")
+        captchaLimitReached = true
+        captchaRefreshAttempt = 0
+        // Kick off the first refresh immediately — no reason to wait 10s on
+        // the first one.
+        triggerCaptchaRefresh(reason: "initial")
+        captchaAutoRefreshTimer = Timer.scheduledTimer(withTimeInterval: captchaRefreshInterval, repeats: true) { [weak self] _ in
+            self?.triggerCaptchaRefresh(reason: "timer")
+        }
+    }
+
+    /// Called from WebView JS detector when the loaded page has a visible
+    /// interactive captcha element. Cancels any running auto-refresh timer
+    /// and clears the limit-reached UI state.
+    func onCaptchaReady() {
+        if captchaAutoRefreshTimer == nil && !captchaLimitReached {
+            return  // nothing to stop, no log noise
+        }
+        debugLog("captcha auto-refresh: captcha_ready, stopping timer (attempt was \(captchaRefreshAttempt))")
+        stopCaptchaAutoRefresh()
+    }
+
+    /// Called from the sheet's onDismiss closure (user pressed Done / X).
+    /// Ensures the timer doesn't keep firing after the WebView is gone.
+    func onCaptchaSheetDismissed() {
+        if captchaAutoRefreshTimer != nil {
+            debugLog("captcha auto-refresh: sheet dismissed by user, stopping timer (attempt was \(captchaRefreshAttempt))")
+            stopCaptchaAutoRefresh()
+        }
+    }
+
+    private func stopCaptchaAutoRefresh() {
+        captchaAutoRefreshTimer?.invalidate()
+        captchaAutoRefreshTimer = nil
+        captchaLimitReached = false
+        // captchaRefreshAttempt intentionally not reset — makes it easier to
+        // see the final attempt count in logs / debugger. Zeroed on next
+        // onCaptchaLimitDetected() call.
+    }
+
+    private func triggerCaptchaRefresh(reason: String) {
+        captchaRefreshAttempt += 1
+        if captchaRefreshAttempt > maxCaptchaRefreshAttempts {
+            debugLog("captcha auto-refresh: exhausted (\(maxCaptchaRefreshAttempts) attempts), giving up")
+            stopCaptchaAutoRefresh()
+            errorMessage = "VK временно ограничивает запросы. Подождите минуту и попробуйте снова."
+            return
+        }
+        debugLog("captcha auto-refresh: attempt \(captchaRefreshAttempt)/\(maxCaptchaRefreshAttempts) (reason: \(reason)) — requesting fresh URL")
+        // suspendDNS() sends "refresh_captcha_and_suspend_dns" to the
+        // extension; the extension calls wgRefreshCaptchaURL and returns the
+        // fresh URL, which populates captchaImageURL. SwiftUI then rebinds
+        // the sheet content, our updateUIView sees the URL change and reloads
+        // the WKWebView. This is the same mechanism used by the first-open
+        // path — we just call it again on our schedule.
+        suspendDNS()
     }
 
     func solveCaptcha(answer: String) {
@@ -356,6 +475,14 @@ class TunnelManager: ObservableObject {
                             self.captchaImageURL = nil
                             self.captchaSID = nil
                             self.lastCaptchaShowTime = nil
+                            // If the auto-refresh timer is still ticking (e.g. a
+                            // token was captured while overlay was visible),
+                            // tear it down explicitly so it can't fire after
+                            // the sheet has dismissed.
+                            if self.captchaAutoRefreshTimer != nil {
+                                self.debugLog("captcha auto-refresh: captcha RESOLVED, stopping timer")
+                                self.stopCaptchaAutoRefresh()
+                            }
                             if self.dnsSuspended {
                                 self.restoreDNS()
                                 self.dnsSuspended = false

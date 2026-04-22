@@ -108,9 +108,14 @@ struct ContentView: View {
                             // Don't send fake answer — just dismiss the sheet.
                             // The captcha will re-appear on next poll if not actually solved.
                             NSLog("[Captcha] Sheet dismissed without token")
+                            tunnel.onCaptchaSheetDismissed()
                             tunnel.captchaPending = false
                             tunnel.captchaImageURL = nil
-                        }
+                        },
+                        onLimitDetected: { tunnel.onCaptchaLimitDetected() },
+                        onCaptchaReady: { tunnel.onCaptchaReady() },
+                        onLog: { tunnel.logFromCaptchaView($0) },
+                        tunnel: tunnel
                     )
                 }
             }
@@ -287,6 +292,10 @@ struct CaptchaWebView: View {
     let captchaSID: String
     let onSolved: (String) -> Void
     let onDismiss: () -> Void
+    let onLimitDetected: () -> Void
+    let onCaptchaReady: () -> Void
+    let onLog: (String) -> Void
+    @ObservedObject var tunnel: TunnelManager
 
     var body: some View {
         VStack(spacing: 0) {
@@ -299,7 +308,35 @@ struct CaptchaWebView: View {
             }
             .padding()
 
-            CaptchaWKWebView(url: url, onTokenCaptured: onSolved)
+            ZStack {
+                CaptchaWKWebView(
+                    url: url,
+                    onTokenCaptured: onSolved,
+                    onLimitDetected: onLimitDetected,
+                    onCaptchaReady: onCaptchaReady,
+                    onLog: onLog
+                )
+
+                // Overlay shown ONLY while auto-refresh is hunting for a fresh
+                // captcha after JS detected "Attempt limit reached". Goes away
+                // as soon as the WebView reloads to a working captcha (JS
+                // posts state:ready → tunnel.onCaptchaReady → captchaLimitReached=false).
+                if tunnel.captchaLimitReached {
+                    VStack(spacing: 16) {
+                        ProgressView().scaleEffect(1.3)
+                        Text("VK временно не отдаёт капчу")
+                            .font(.headline)
+                        Text("Ищем рабочую — попытка \(tunnel.captchaRefreshAttempt) из \(tunnel.maxCaptchaRefreshAttempts)")
+                            .font(.subheadline)
+                            .foregroundColor(.secondary)
+                            .multilineTextAlignment(.center)
+                    }
+                    .padding(32)
+                    .background(Color(.systemBackground).opacity(0.97))
+                    .cornerRadius(16)
+                    .shadow(radius: 12)
+                }
+            }
         }
     }
 }
@@ -307,9 +344,26 @@ struct CaptchaWebView: View {
 struct CaptchaWKWebView: UIViewRepresentable {
     let url: URL
     let onTokenCaptured: (String) -> Void
+    // Called when JS detector concludes the loaded page is in "Attempt limit
+    // reached" state (no interactive element + error text). TunnelManager
+    // uses this to start the auto-refresh timer.
+    let onLimitDetected: () -> Void
+    // Called when JS detector sees a normal interactive captcha. TunnelManager
+    // uses this to stop any running auto-refresh timer.
+    let onCaptchaReady: () -> Void
+    // Routes log lines from the WKWebView coordinator (which lives in the
+    // main-app process) into vpn.log — so raw JS bridge messages and
+    // state-transition diagnostics land in the same log file as the
+    // extension's output instead of only in os_log / Console.app.
+    let onLog: (String) -> Void
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(onTokenCaptured: onTokenCaptured)
+        Coordinator(
+            onTokenCaptured: onTokenCaptured,
+            onLimitDetected: onLimitDetected,
+            onCaptchaReady: onCaptchaReady,
+            onLog: onLog
+        )
     }
 
     func makeUIView(context: Context) -> WKWebView {
@@ -350,6 +404,13 @@ struct CaptchaWKWebView: UIViewRepresentable {
                         h.postMessage('check:' + JSON.stringify(data).substring(0, 1000));
                         if (data.response && data.response.success_token) {
                             h.postMessage('token:' + data.response.success_token);
+                        } else if (data.response && data.response.status === 'ERROR_LIMIT') {
+                            // VK explicitly said "rate limited". Trigger auto-refresh
+                            // immediately — don't wait for the 2.5s DOM heuristic
+                            // (which would miss the limit state that only appears
+                            // AFTER the user clicks the checkbox and the page
+                            // dynamically switches to the error screen).
+                            h.postMessage('state:limit:api_error_limit');
                         }
                     }).catch(function(e) {
                         h.postMessage('check-err:' + e.message);
@@ -374,6 +435,11 @@ struct CaptchaWKWebView: UIViewRepresentable {
                             h.postMessage('xhr-check:' + JSON.stringify(data).substring(0, 1000));
                             if (data.response && data.response.success_token) {
                                 h.postMessage('token:' + data.response.success_token);
+                            } else if (data.response && data.response.status === 'ERROR_LIMIT') {
+                                // Same as fetch path: VK hard-rate-limited us,
+                                // trigger auto-refresh without waiting for the
+                                // DOM heuristic.
+                                h.postMessage('state:limit:api_error_limit');
                             }
                         } catch(e) {}
                     });
@@ -382,6 +448,41 @@ struct CaptchaWKWebView: UIViewRepresentable {
             };
 
             h.postMessage('init:hooks installed');
+
+            // Page-state detector: 2.5s after first render, look at whether
+            // VK showed us an interactive captcha or an "Attempt limit reached"
+            // (or equivalent) error. Post state:limit / state:ready to Swift —
+            // TunnelManager runs the auto-refresh timer only on state:limit.
+            function checkCaptchaState(source) {
+                try {
+                    var text = (document.body && document.body.innerText) || '';
+                    var hasLimitText = /limit.*reached|лимит.*исчерп|превышен|try\\s*again\\s*later|attempt\\s*limit/i.test(text);
+                    var hasInteractive = !!document.querySelector(
+                        '[role="checkbox"], input[type="checkbox"], .VkIdNotRobotButton, [data-test-id*="captcha"], .vkuiCheckbox'
+                    );
+                    var state;
+                    if (hasLimitText) {
+                        state = 'limit';
+                    } else if (hasInteractive) {
+                        state = 'ready';
+                    } else {
+                        state = 'unknown';
+                    }
+                    h.postMessage('state:' + state + ':' + source);
+                } catch (e) {
+                    h.postMessage('state-err:' + e.message);
+                }
+            }
+
+            // Run initial detection once DOM is ready + a 2.5s settle.
+            function scheduleInitialDetection() {
+                setTimeout(function() { checkCaptchaState('initial'); }, 2500);
+            }
+            if (document.readyState === 'complete' || document.readyState === 'interactive') {
+                scheduleInitialDetection();
+            } else {
+                window.addEventListener('DOMContentLoaded', scheduleInitialDetection);
+            }
         })();
         """
         let userScript = WKUserScript(source: js, injectionTime: .atDocumentStart, forMainFrameOnly: false)
@@ -418,6 +519,9 @@ struct CaptchaWKWebView: UIViewRepresentable {
 
     class Coordinator: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
         let onTokenCaptured: (String) -> Void
+        let onLimitDetected: () -> Void
+        let onCaptchaReady: () -> Void
+        let onLog: (String) -> Void
         private var solved = false
         weak var webView: WKWebView?
         // Tracks which URL we last handed to `webView.load(...)`. Used by
@@ -425,13 +529,26 @@ struct CaptchaWKWebView: UIViewRepresentable {
         // the same state — avoids redundant reloads.
         var lastLoadedURL: String?
 
-        init(onTokenCaptured: @escaping (String) -> Void) {
+        init(
+            onTokenCaptured: @escaping (String) -> Void,
+            onLimitDetected: @escaping () -> Void,
+            onCaptchaReady: @escaping () -> Void,
+            onLog: @escaping (String) -> Void
+        ) {
             self.onTokenCaptured = onTokenCaptured
+            self.onLimitDetected = onLimitDetected
+            self.onCaptchaReady = onCaptchaReady
+            self.onLog = onLog
         }
 
         func log(_ msg: String) {
+            // os_log / NSLog visible in Console.app when device is connected
+            // to a Mac (useful for live debugging). onLog tunnels the same
+            // message through TunnelManager → extension → vpn.log so
+            // post-mortem analysis from a vpn.log dump is possible too.
             os_log("%{public}s", log: captchaLog, type: .default, msg)
             NSLog("[Captcha] %@", msg)
+            onLog(msg)
         }
 
         // Called by updateUIView when the captcha URL changes mid-flight
@@ -451,6 +568,30 @@ struct CaptchaWKWebView: UIViewRepresentable {
                 let token = String(body.dropFirst(6))
                 log("SUCCESS_TOKEN (\(token.count) chars)")
                 captureToken(token)
+                return
+            }
+
+            // State detector posts `state:<kind>:<source>` — e.g.
+            // "state:limit:initial" or "state:ready:initial". We react to
+            // `limit` and `ready` kinds; `unknown` is logged for diagnostics
+            // but no action taken (auto-refresh doesn't start on unknown to
+            // avoid refresh loops on unrecognised layouts).
+            if body.hasPrefix("state:") {
+                let parts = body.split(separator: ":", maxSplits: 2).map(String.init)
+                let kind = parts.count >= 2 ? parts[1] : ""
+                switch kind {
+                case "limit":
+                    log("state=limit — delegating to auto-refresh handler")
+                    DispatchQueue.main.async { self.onLimitDetected() }
+                case "ready":
+                    log("state=ready — delegating to stop-auto-refresh handler")
+                    DispatchQueue.main.async { self.onCaptchaReady() }
+                case "unknown":
+                    log("state=unknown — no action (no interactive element and no known limit text)")
+                default:
+                    log("state=<unrecognised kind \(kind)>")
+                }
+                return
             }
         }
 
