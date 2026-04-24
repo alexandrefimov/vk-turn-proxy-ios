@@ -134,10 +134,10 @@ class TunnelManager: ObservableObject {
             let serverAddress: String
             if !savedTurnIP.isEmpty {
                 serverAddress = savedTurnIP
-                NSLog("[TunnelManager] using cached TURN IP %@ as serverAddress", savedTurnIP)
+                SharedLogger.shared.log("[AppDebug] TunnelManager.connect: using cached TURN IP \(savedTurnIP) as serverAddress")
             } else {
                 serverAddress = config.peerAddress
-                NSLog("[TunnelManager] no cached TURN IP, using peerAddress %@ as serverAddress", config.peerAddress)
+                SharedLogger.shared.log("[AppDebug] TunnelManager.connect: no cached TURN IP, using peerAddress \(config.peerAddress) as serverAddress")
             }
 
             // Set provider configuration
