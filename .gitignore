@@ -21,3 +21,7 @@ vendor/
 
 # App Store Connect API credentials (Issuer ID / Key ID / p8 path)
 AppStoreConnect.env
+
+# Private local-only notes (design docs for in-progress refactors etc.).
+# Anything placed in this directory is intentionally kept off GitHub.
+.private-notes/

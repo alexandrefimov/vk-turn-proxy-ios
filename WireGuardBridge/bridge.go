@@ -76,7 +76,7 @@ type ProxyConfig struct {
 // in one synchronous step. Retained so existing callers keep working while
 // PacketTunnelProvider is migrated to the split flow (wgStartVKBootstrap +
 // wgWaitBootstrapReady + wgAttachWireGuard), after which this export can be
-// deleted. See docs/apns-fulltunnel-refactor.md.
+// deleted.
 func wgTurnOnWithTURN(settings *C.char, tunFd C.int32_t, proxyConfigJSON *C.char) C.int32_t {
 	goSettings := C.GoString(settings)
 	goProxyJSON := C.GoString(proxyConfigJSON)
