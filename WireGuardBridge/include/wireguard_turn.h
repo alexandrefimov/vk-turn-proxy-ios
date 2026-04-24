@@ -3,7 +3,10 @@
 
 #include <stdint.h>
 
-/// Start a WireGuard tunnel with TURN proxy.
+/// Start a WireGuard tunnel with TURN proxy (legacy single-call flow).
+/// Retained for backward compatibility; new callers should use the split
+/// flow (wgStartVKBootstrap + wgWaitBootstrapReady + wgAttachWireGuard) so
+/// Swift can defer setTunnelNetworkSettings until VK bootstrap is ready.
 /// @param settings UAPI configuration string (key=value\n format)
 /// @param tunFd File descriptor of the TUN device
 /// @param proxyConfigJSON JSON string with proxy configuration
@@ -14,8 +17,43 @@
 ///   -4: failed to bring up device
 int32_t wgTurnOnWithTURN(const char *settings, int32_t tunFd, const char *proxyConfigJSON);
 
-/// Stop a tunnel.
-/// @param tunnelHandle Handle returned by wgTurnOnWithTURN
+/// Start VK bootstrap (API call, TURN allocation, DTLS handshake) in a
+/// background goroutine. Does NOT create a TUN device yet. Returns a tunnel
+/// handle that can be passed to wgWaitBootstrapReady / wgGetTURNServerIP /
+/// wgAttachWireGuard.
+/// @param proxyConfigJSON JSON string with proxy configuration
+/// @return Tunnel handle (>0), or -1 on invalid config JSON
+int32_t wgStartVKBootstrap(const char *proxyConfigJSON);
+
+/// Wait for VK bootstrap to report ready (first conn has a live DTLS+TURN
+/// session). Blocks up to timeoutMs. Safe to call multiple times on the
+/// same handle; the internal signal is replayed so subsequent callers see
+/// the same outcome.
+/// @param tunnelHandle Handle from wgStartVKBootstrap
+/// @param timeoutMs Deadline for readiness in milliseconds (e.g. 120000)
+/// @return  1 on ready, 0 on timeout, -1 on fatal error / unknown handle
+int32_t wgWaitBootstrapReady(int32_t tunnelHandle, int32_t timeoutMs);
+
+/// Attach a WireGuard device to a tunnel whose proxy is already running.
+/// Creates the TUN from tunFd, wires it via TURNBind to the proxy, applies
+/// the UAPI config, and brings the device up. Call this AFTER
+/// setTunnelNetworkSettings has returned and you have the real tunFd.
+/// @param tunnelHandle Handle from wgStartVKBootstrap
+/// @param wgConfigSettings UAPI configuration string
+/// @param tunFd File descriptor of the TUN device
+/// @return  1 on success, negative on error:
+///   -1: unknown handle
+///   -2: device already attached
+///   -3: failed to duplicate tunFd
+///   -4: failed to create TUN device
+///   -5: failed to apply WireGuard config
+///   -6: failed to bring up device
+int32_t wgAttachWireGuard(int32_t tunnelHandle, const char *wgConfigSettings, int32_t tunFd);
+
+/// Stop a tunnel. Accepts handles from either wgTurnOnWithTURN or
+/// wgStartVKBootstrap; it tears down a WG device if one was attached and
+/// stops the underlying proxy in either case.
+/// @param tunnelHandle Handle returned by wgTurnOnWithTURN or wgStartVKBootstrap
 void wgTurnOff(int32_t tunnelHandle);
 
 /// Update WireGuard configuration.

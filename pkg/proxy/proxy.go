@@ -127,6 +127,16 @@ type Proxy struct {
 	turnRTTns   atomic.Int64 // nanoseconds
 	dtlsHSns    atomic.Int64 // nanoseconds
 	reconnects  atomic.Int64
+
+	// Bootstrap-ready signaling. Fires exactly once per proxy lifetime, when
+	// either (a) the first conn establishes a live DTLS+TURN session (signaled
+	// with nil from runConnection), or (b) Start() hits a fatal non-captcha
+	// error before any conn comes up. Captcha-pending does NOT signal — the
+	// caller waits up to timeout for the user to solve and the first conn to
+	// come up after Resume(). Used by bridge's wgWaitBootstrapReady so Swift
+	// can defer setTunnelNetworkSettings until VK bootstrap is actually done.
+	bootstrapDoneCh   chan error
+	bootstrapDoneOnce sync.Once
 }
 
 // NewProxy creates a new proxy instance.
@@ -142,14 +152,15 @@ func NewProxy(cfg Config) *Proxy {
 	ctx, cancel := context.WithCancel(context.Background())
 	sessCtx, sessCancel := context.WithCancel(ctx)
 	p := &Proxy{
-		config:     cfg,
-		ctx:        ctx,
-		cancel:     cancel,
-		sendCh:     make(chan []byte, 256),
-		recvCh:     make(chan []byte, 256),
-		sessCtx:    sessCtx,
-		sessCancel: sessCancel,
-		captchaCh:  make(chan string, 1),
+		config:          cfg,
+		ctx:             ctx,
+		cancel:          cancel,
+		sendCh:          make(chan []byte, 256),
+		recvCh:          make(chan []byte, 256),
+		sessCtx:         sessCtx,
+		sessCancel:      sessCancel,
+		captchaCh:       make(chan string, 1),
+		bootstrapDoneCh: make(chan error, 1),
 	}
 	// If no external solver provided, use the built-in channel-based solver
 	// that waits for SolveCaptcha() to be called (e.g. from iOS UI).
@@ -159,11 +170,46 @@ func NewProxy(cfg Config) *Proxy {
 	return p
 }
 
+// signalBootstrapDone fires the bootstrap-ready channel exactly once per
+// proxy lifetime. Safe to call from any goroutine, any number of times —
+// only the first call is observable. err=nil means "first conn has a live
+// DTLS+TURN session and is ready to carry traffic". Non-nil err is a fatal
+// failure before any conn came up. Captcha-pending should NOT signal (the
+// user may still solve it and a conn will come up via Resume()).
+func (p *Proxy) signalBootstrapDone(err error) {
+	p.bootstrapDoneOnce.Do(func() {
+		p.bootstrapDoneCh <- err
+	})
+}
+
+// WaitBootstrap blocks until bootstrap is ready, a fatal error occurred,
+// the proxy was stopped, or the timeout expired. Multiple callers share the
+// same signal — the channel value is replayed back so later waiters get it
+// too. Returns nil on ready, an error otherwise.
+func (p *Proxy) WaitBootstrap(timeout time.Duration) error {
+	select {
+	case err := <-p.bootstrapDoneCh:
+		// Replay the signal so any future waiter also observes it.
+		select {
+		case p.bootstrapDoneCh <- err:
+		default:
+		}
+		return err
+	case <-time.After(timeout):
+		return fmt.Errorf("bootstrap timeout after %s", timeout)
+	case <-p.ctx.Done():
+		return p.ctx.Err()
+	}
+}
+
 // Start establishes the DTLS+TURN connection chain.
 // It blocks until the first connection is established or an error occurs.
+// Idempotent: subsequent calls after a successful start return nil without
+// re-initializing. This lets turnbind.Open() safely call Start() even when
+// the caller has already started the proxy via wgStartVKBootstrap.
 func (p *Proxy) Start() error {
 	if p.started.Swap(true) {
-		return fmt.Errorf("proxy already started")
+		return nil
 	}
 
 	// Limit Go scheduler threads to reduce CPU wakeups on iOS.
@@ -186,7 +232,9 @@ func (p *Proxy) Start() error {
 	// Resolve peer address
 	peer, err := net.ResolveUDPAddr("udp", p.config.PeerAddr)
 	if err != nil {
-		return fmt.Errorf("resolve peer: %w", err)
+		wrapped := fmt.Errorf("resolve peer: %w", err)
+		p.signalBootstrapDone(wrapped)
+		return wrapped
 	}
 	p.peer = peer
 
@@ -195,7 +243,16 @@ func (p *Proxy) Start() error {
 	// calling sleep()/wake() which is unreliable.
 	go p.runWatchdog()
 
-	return p.startConnections()
+	err = p.startConnections()
+	if err != nil {
+		// Fatal failure before any conn came up — wake any bootstrap waiters
+		// so they don't sit on the channel until timeout.
+		p.signalBootstrapDone(err)
+	}
+	// Success (first conn ready) is signaled from runConnection itself, so
+	// WaitBootstrap reflects reality even in the captcha-retry path where
+	// startConnections returns nil while the first conn is still coming up.
+	return err
 }
 
 // startConnections launches all connection goroutines using the current session context.
@@ -1012,6 +1069,10 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 	// instead of immediately returning CaptchaRequiredError.
 	*signaled = true
 
+	// Signal proxy-lifetime bootstrap ready exactly once. Safe to call on
+	// every successful reconnect — sync.Once drops all calls after the first.
+	p.signalBootstrapDone(nil)
+
 	log.Printf("proxy: [conn %d] DTLS+TURN session established", connIdx)
 
 	// TURN reconnection loop in background.
@@ -1283,6 +1344,8 @@ func (p *Proxy) runDirectSession(sessCtx context.Context, linkID string, readyCh
 		default:
 		}
 	}
+	// Signal proxy-lifetime bootstrap ready (sync.Once, idempotent).
+	p.signalBootstrapDone(nil)
 
 	// TURN reconnection loop (same as DTLS version but without DTLS)
 	go func() {

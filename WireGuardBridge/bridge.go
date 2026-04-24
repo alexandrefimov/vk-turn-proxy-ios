@@ -71,6 +71,12 @@ type ProxyConfig struct {
 }
 
 //export wgTurnOnWithTURN
+//
+// Legacy single-call entry point: starts VK bootstrap AND attaches WireGuard
+// in one synchronous step. Retained so existing callers keep working while
+// PacketTunnelProvider is migrated to the split flow (wgStartVKBootstrap +
+// wgWaitBootstrapReady + wgAttachWireGuard), after which this export can be
+// deleted. See docs/apns-fulltunnel-refactor.md.
 func wgTurnOnWithTURN(settings *C.char, tunFd C.int32_t, proxyConfigJSON *C.char) C.int32_t {
 	goSettings := C.GoString(settings)
 	goProxyJSON := C.GoString(proxyConfigJSON)
@@ -143,6 +149,193 @@ func wgTurnOnWithTURN(settings *C.char, tunFd C.int32_t, proxyConfigJSON *C.char
 	return C.int32_t(id)
 }
 
+// --- APNs-through-tunnel refactor: split entry points ---
+//
+// The three exports below replace the single synchronous wgTurnOnWithTURN
+// with a phased startup so Swift can defer setTunnelNetworkSettings until
+// after VK bootstrap is done:
+//
+//   1. wgStartVKBootstrap   — kicks off VK API + TURN alloc + DTLS in a
+//                             goroutine; returns a handle immediately, no
+//                             TUN touched yet.
+//   2. wgWaitBootstrapReady — blocks up to timeoutMs for the first conn
+//                             to have a live DTLS+TURN session.
+//   3. wgAttachWireGuard    — attaches a WireGuard device to the already-
+//                             working proxy, taking over the provided tunFd.
+//
+// wgGetTURNServerIP remains unchanged; call it between steps 2 and 3 to get
+// the TURN server IP before updating NEVPNProtocol.serverAddress.
+// wgTurnOff / wgPause / wgResume / wgSetConfig / wgGetStats work on handles
+// from either the legacy or split flow — they just look up tunnelEntry.
+
+//export wgStartVKBootstrap
+//
+// Starts VK bootstrap (API call, TURN allocation, DTLS handshake) in a
+// background goroutine. Does NOT create a TUN device. Returns a tunnel
+// handle immediately, or -1 on immediate config-parse failure.
+//
+// Observable bootstrap progress via wgWaitBootstrapReady: ready=1 once the
+// first conn reports a live DTLS+TURN session, timeout=0 if the deadline
+// expires, error=-1 on fatal failure before any conn came up. Captcha
+// flows remain internal to Proxy — the bootstrap stays "not ready" until
+// captcha is solved AND the first conn completes.
+func wgStartVKBootstrap(proxyConfigJSON *C.char) C.int32_t {
+	goProxyJSON := C.GoString(proxyConfigJSON)
+
+	var pcfg ProxyConfig
+	if err := json.Unmarshal([]byte(goProxyJSON), &pcfg); err != nil {
+		log.Printf("wgStartVKBootstrap: invalid proxy config: %s", err)
+		return -1
+	}
+	if pcfg.NumConns <= 0 {
+		pcfg.NumConns = 1
+	}
+
+	p := proxy.NewProxy(proxy.Config{
+		PeerAddr:   pcfg.PeerAddr,
+		TurnServer: pcfg.TurnServer,
+		TurnPort:   pcfg.TurnPort,
+		VKLink:     pcfg.VKLink,
+		UseDTLS:    pcfg.UseDTLS,
+		UseUDP:     pcfg.UseUDP,
+		NumConns:   pcfg.NumConns,
+	})
+
+	// Proxy.Start blocks until the first conn is ready or a fatal error
+	// occurs; run it in a goroutine so this export returns immediately.
+	// Start() already signals bootstrapDoneCh with the outcome.
+	go func() {
+		if err := p.Start(); err != nil {
+			log.Printf("wgStartVKBootstrap: proxy.Start failed: %v", err)
+			// Proxy.Start already called signalBootstrapDone(err), so
+			// wgWaitBootstrapReady will wake up with the error.
+		}
+	}()
+
+	tunnelsMu.Lock()
+	id := nextID
+	nextID++
+	tunnels[id] = &tunnelEntry{
+		proxy: p,
+		// device and bind stay nil until wgAttachWireGuard.
+	}
+	tunnelsMu.Unlock()
+
+	log.Printf("wgStartVKBootstrap: tunnel %d bootstrap goroutine launched", id)
+	return C.int32_t(id)
+}
+
+//export wgWaitBootstrapReady
+//
+// Blocks up to timeoutMs waiting for VK bootstrap to report ready. Returns:
+//   1  → first conn established a live DTLS+TURN session
+//   0  → timeout (bootstrap still in progress; try again or give up)
+//  -1  → fatal error before any conn came up, or tunnel handle not found
+//
+// Safe to call multiple times; the internal signal is replayed so later
+// callers see the same outcome.
+func wgWaitBootstrapReady(tunnelHandle C.int32_t, timeoutMs C.int32_t) C.int32_t {
+	id := int32(tunnelHandle)
+	tunnelsMu.Lock()
+	entry, ok := tunnels[id]
+	tunnelsMu.Unlock()
+
+	if !ok {
+		log.Printf("wgWaitBootstrapReady: tunnel %d not found", id)
+		return -1
+	}
+
+	timeout := time.Duration(int64(timeoutMs)) * time.Millisecond
+	err := entry.proxy.WaitBootstrap(timeout)
+	if err == nil {
+		log.Printf("wgWaitBootstrapReady: tunnel %d ready", id)
+		return 1
+	}
+
+	// Differentiate timeout from fatal error — callers (Swift) may want to
+	// retry on timeout but fail-fast on error.
+	if strings.Contains(err.Error(), "bootstrap timeout") {
+		log.Printf("wgWaitBootstrapReady: tunnel %d timeout after %s", id, timeout)
+		return 0
+	}
+	log.Printf("wgWaitBootstrapReady: tunnel %d failed: %v", id, err)
+	return -1
+}
+
+//export wgAttachWireGuard
+//
+// Attaches a WireGuard device to an already-bootstrapped proxy. The caller
+// is expected to have observed wgWaitBootstrapReady return 1 first (so the
+// first TURN conn is live). Creates the TUN from tunFd, wires it to a
+// TURNBind over the proxy, applies the UAPI config, and brings the device up.
+//
+// Returns 1 on success, -1 if tunnel handle not found, -2 if a device is
+// already attached, or a negative code in -3..-6 for each setup step.
+func wgAttachWireGuard(tunnelHandle C.int32_t, wgConfigSettings *C.char, tunFd C.int32_t) C.int32_t {
+	id := int32(tunnelHandle)
+	tunnelsMu.Lock()
+	entry, ok := tunnels[id]
+	tunnelsMu.Unlock()
+
+	if !ok {
+		log.Printf("wgAttachWireGuard: tunnel %d not found", id)
+		return -1
+	}
+	if entry.device != nil {
+		log.Printf("wgAttachWireGuard: tunnel %d already has a WG device attached", id)
+		return -2
+	}
+
+	goSettings := C.GoString(wgConfigSettings)
+
+	// TURNBind pumps WG packets into/out of the already-started proxy.
+	// Proxy.Start() is idempotent, so when WireGuard calls TURNBind.Open()
+	// inside dev.Up() below, the second Start() is a no-op.
+	bind := turnbind.NewTURNBind(entry.proxy)
+
+	dupFd, err := dupFD(int(tunFd))
+	if err != nil {
+		log.Printf("wgAttachWireGuard: dup fd failed: %s", err)
+		return -3
+	}
+	tunFile := os.NewFile(uintptr(dupFd), "/dev/tun")
+	tunDev, err := tun.CreateTUNFromFile(tunFile, 0)
+	if err != nil {
+		tunFile.Close()
+		log.Printf("wgAttachWireGuard: CreateTUNFromFile failed: %s", err)
+		return -4
+	}
+
+	logger := device.NewLogger(device.LogLevelVerbose, "(wireguard-turn) ")
+	dev := device.NewDevice(tunDev, bind, logger)
+
+	if err := dev.IpcSet(goSettings); err != nil {
+		log.Printf("wgAttachWireGuard: IpcSet: %s", err)
+		dev.Close()
+		return -5
+	}
+	if err := dev.Up(); err != nil {
+		log.Printf("wgAttachWireGuard: Up: %s", err)
+		dev.Close()
+		return -6
+	}
+
+	tunnelsMu.Lock()
+	// Re-check under lock in case two attaches raced.
+	if entry.device != nil {
+		tunnelsMu.Unlock()
+		log.Printf("wgAttachWireGuard: tunnel %d raced — tearing down our device", id)
+		dev.Close()
+		return -2
+	}
+	entry.device = dev
+	entry.bind = bind
+	tunnelsMu.Unlock()
+
+	log.Printf("wgAttachWireGuard: tunnel %d WireGuard attached", id)
+	return 1
+}
+
 //export wgTurnOff
 func wgTurnOff(tunnelHandle C.int32_t) {
 	id := int32(tunnelHandle)
@@ -155,7 +348,15 @@ func wgTurnOff(tunnelHandle C.int32_t) {
 		return
 	}
 
-	entry.device.Close()
+	// device may be nil if the tunnel was started via wgStartVKBootstrap
+	// but wgAttachWireGuard was never called (e.g. bootstrap timed out).
+	// In that case we still have to stop the proxy goroutine to release
+	// its TURN allocation and background goroutines.
+	if entry.device != nil {
+		entry.device.Close()
+	} else if entry.proxy != nil {
+		entry.proxy.Stop()
+	}
 	log.Printf("wgTurnOff: tunnel %d stopped", id)
 }
 
@@ -168,6 +369,10 @@ func wgSetConfig(tunnelHandle C.int32_t, settings *C.char) C.int64_t {
 
 	if !ok {
 		return -1
+	}
+	if entry.device == nil {
+		log.Printf("wgSetConfig: tunnel %d has no WG device yet (call wgAttachWireGuard first)", id)
+		return -3
 	}
 
 	goSettings := C.GoString(settings)
@@ -186,6 +391,9 @@ func wgGetConfig(tunnelHandle C.int32_t) *C.char {
 	tunnelsMu.Unlock()
 
 	if !ok {
+		return C.CString("")
+	}
+	if entry.device == nil {
 		return C.CString("")
 	}
 
