@@ -36,6 +36,33 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         SharedLogger.shared.log("[Tunnel] \(msg)")
     }
 
+    // Shared-state key for the TURN server IP the Go proxy is currently
+    // running on. Written by this extension whenever it queries the IP via
+    // wgGetTURNServerIP, read by TunnelManager on each connect() to set
+    // NEVPNProtocol.serverAddress. Making serverAddress match the actual
+    // TURN relay IP puts that address on Apple's always-excluded list,
+    // which is the only documented way to keep TURN UDP outside the
+    // tunnel when includeAllNetworks=true (Step 4 switches to that mode).
+    //
+    // Before Step 4 this is belt-and-suspenders: the excludedRoutes
+    // machinery still carries TURN IP, so current builds behave the same
+    // whether serverAddress matches or not. After Step 4, excludedRoutes
+    // is ignored and serverAddress becomes the only mechanism.
+    private static let sharedDefaultsSuiteName = "group.com.vkturnproxy.app"
+    private static let turnServerIPKey = "lastTurnServerIP"
+
+    private func persistTurnServerIP(_ ip: String) {
+        guard !ip.isEmpty else { return }
+        guard let shared = UserDefaults(suiteName: Self.sharedDefaultsSuiteName) else {
+            logMsg("persistTurnServerIP: UserDefaults(suiteName:) returned nil — AppGroup misconfigured?")
+            return
+        }
+        if shared.string(forKey: Self.turnServerIPKey) != ip {
+            shared.set(ip, forKey: Self.turnServerIPKey)
+            logMsg("persistTurnServerIP: saved \(ip) to AppGroup for next connect()'s serverAddress")
+        }
+    }
+
     /// Resolve VK captcha/auth domains to IP addresses for route exclusion.
     /// This ensures the captcha WebView and VK credential requests bypass the tunnel.
     private func resolveVKHosts() -> [String] {
@@ -191,6 +218,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                 if !turnIP.isEmpty {
                     excludeHosts.append(turnIP)
                     self.logMsg("TURN server IP=\(turnIP)")
+                    self.persistTurnServerIP(turnIP)
                 } else {
                     self.logMsg("WARNING: TURN server IP is empty")
                 }
@@ -366,6 +394,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             if !turnIP.isEmpty && !excludeHosts.contains(turnIP) {
                 excludeHosts.append(turnIP)
             }
+            persistTurnServerIP(turnIP)
         }
 
         // VK captcha/auth domain IPs
@@ -578,6 +607,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                 excludeHosts.append(turnIP)
                 logMsg("applyDeferredRoutes: added TURN IP=\(turnIP)")
             }
+            persistTurnServerIP(turnIP)
         }
 
         // Re-resolve VK captcha/auth domain IPs (may have changed since startup)

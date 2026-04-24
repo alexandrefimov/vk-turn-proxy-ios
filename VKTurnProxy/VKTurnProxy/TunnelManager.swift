@@ -120,10 +120,30 @@ class TunnelManager: ObservableObject {
             // Build proxy config JSON
             let proxyConfig = buildProxyConfig(config: config)
 
+            // Pick serverAddress. Prefer the TURN relay IP cached from a
+            // previous session by the extension (via AppGroup UserDefaults):
+            // this is what iOS exempts from the tunnel per Apple's documented
+            // serverAddress-always-excluded rule, so our TURN UDP doesn't
+            // loop back through the tunnel once includeAllNetworks=true ships
+            // in Step 4. Falls back to the VPS peerAddress on first launch
+            // when the extension hasn't recorded a TURN IP yet — bootstrap
+            // still works because excludedRoutes (current mode) still covers
+            // the TURN relay.
+            let shared = UserDefaults(suiteName: "group.com.vkturnproxy.app")
+            let savedTurnIP = shared?.string(forKey: "lastTurnServerIP") ?? ""
+            let serverAddress: String
+            if !savedTurnIP.isEmpty {
+                serverAddress = savedTurnIP
+                NSLog("[TunnelManager] using cached TURN IP %@ as serverAddress", savedTurnIP)
+            } else {
+                serverAddress = config.peerAddress
+                NSLog("[TunnelManager] no cached TURN IP, using peerAddress %@ as serverAddress", config.peerAddress)
+            }
+
             // Set provider configuration
             let proto = NETunnelProviderProtocol()
             proto.providerBundleIdentifier = "com.vkturnproxy.app.tunnel"
-            proto.serverAddress = config.peerAddress
+            proto.serverAddress = serverAddress
             proto.providerConfiguration = [
                 "wg_config": wgConfig,
                 "proxy_config": proxyConfig,
