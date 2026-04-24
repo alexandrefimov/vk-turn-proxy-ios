@@ -1,8 +1,14 @@
 # Build artifacts
 WireGuardBridge/build/
+# Archive + export output (script-generated).
+build_output/
+# Bare-name Go binary produced by `go build .` without -o.
+/WireGuardBridge/WireGuardBridge
 
 # Xcode
 *.xcuserdata
+# Per-user Xcode dir inside .xcodeproj / .xcworkspace (dir, not file).
+xcuserdata/
 *.xcworkspace
 DerivedData/
 build/
