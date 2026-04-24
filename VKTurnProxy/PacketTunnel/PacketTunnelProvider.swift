@@ -6,30 +6,6 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     private var tunnelHandle: Int32 = -1
     private let log = OSLog(subsystem: "com.vkturnproxy.tunnel", category: "PacketTunnel")
 
-    // Saved for deferred PHASE 2 (when captcha is pending at startup)
-    private var pendingTunnelAddress: String?
-    private var pendingDNS: String?
-    private var pendingMTU: String?
-    private var pendingExcludeHosts: [String] = []
-
-    // Route restoration poller — runs in the extension after captcha is solved,
-    // waiting for activeConns > 0 before applying routes. This is the PRIMARY
-    // mechanism for route restoration. It does NOT depend on the app at all.
-    private var routeRestorationTimer: DispatchSourceTimer?
-    private var captchaSolvedAndWaitingForRoutes = false
-
-    // VK domains that must bypass the tunnel (for captcha WebView & credential fetching).
-    // These are resolved to IPs at startup and excluded from VPN routing.
-    private static let vkCaptchaDomains = [
-        "id.vk.ru",
-        "api.vk.ru",
-        "vk.ru",
-        "login.vk.ru",
-        "api.vk.com",
-        "login.vk.com",
-        "calls.okcdn.ru"
-    ]
-
     private func logMsg(_ msg: String) {
         os_log("%{public}s", log: log, type: .default, msg)
         NSLog("[PacketTunnel] %@", msg)
@@ -61,32 +37,6 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             shared.set(ip, forKey: Self.turnServerIPKey)
             logMsg("persistTurnServerIP: saved \(ip) to AppGroup for next connect()'s serverAddress")
         }
-    }
-
-    /// Resolve VK captcha/auth domains to IP addresses for route exclusion.
-    /// This ensures the captcha WebView and VK credential requests bypass the tunnel.
-    private func resolveVKHosts() -> [String] {
-        var ips = Set<String>()
-        for domain in Self.vkCaptchaDomains {
-            let host = CFHostCreateWithName(nil, domain as CFString).takeRetainedValue()
-            var resolved = DarwinBoolean(false)
-            CFHostStartInfoResolution(host, .addresses, nil)
-            if let addresses = CFHostGetAddressing(host, &resolved)?.takeUnretainedValue() as? [Data] {
-                for addrData in addresses {
-                    addrData.withUnsafeBytes { ptr in
-                        let sa = ptr.assumingMemoryBound(to: sockaddr.self).baseAddress!
-                        if sa.pointee.sa_family == AF_INET {
-                            let addr = sa.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee }
-                            if let ipStr = String(cString: inet_ntoa(addr.sin_addr), encoding: .ascii) {
-                                ips.insert(ipStr)
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        logMsg("resolveVKHosts: resolved \(ips.count) unique IPs from \(Self.vkCaptchaDomains.count) domains: \(ips.sorted())")
-        return Array(ips)
     }
 
     // MARK: - Tunnel Lifecycle
@@ -127,145 +77,134 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         logMsg("tunnelAddress=\(tunnelAddress) dns=\(dnsServers) mtu=\(mtu)")
         logMsg("proxyConfig=\(proxyConfigJSON)")
 
-        // Parse proxy config to extract peer address for route exclusion
-        var peerHost: String?
-        if let proxyData = proxyConfigJSON.data(using: .utf8),
-           let proxyDict = try? JSONSerialization.jsonObject(with: proxyData) as? [String: Any],
-           let peerAddr = proxyDict["peer_addr"] as? String {
-            let host = peerAddr.split(separator: ":").first.map(String.init)
-            peerHost = host
-            logMsg("peerHost=\(host ?? "nil")")
-        } else {
-            logMsg("WARNING: could not parse peer_addr from proxy config")
+        // ------------------------------------------------------------------
+        // Deferred-setTunnelNetworkSettings bootstrap flow (Step 4 of the
+        // APNs-through-tunnel refactor). Unlike the legacy Phase 1 / Phase 2
+        // split, we do NOT call setTunnelNetworkSettings before Go knows the
+        // TURN server IP and has a live DTLS+TURN session. Sequence:
+        //
+        //   1. wgStartVKBootstrap      — launches the Go proxy in a goroutine
+        //                                (VK API + TURN alloc + DTLS). No TUN.
+        //   2. wgWaitBootstrapReady    — blocks up to 120s for the first conn
+        //                                to report ready. This is the window
+        //                                during which the main app shows the
+        //                                captcha WebView if needed; since TUN
+        //                                is not yet up, iOS has no way to
+        //                                capture the WebView's VK traffic, so
+        //                                it reaches VK via the physical
+        //                                interface naturally.
+        //   3. setTunnelNetworkSettings — applied ONCE with the full routes.
+        //                                Only now does iOS honor
+        //                                includeAllNetworks=true (set on the
+        //                                NEVPNProtocol in the main app).
+        //   4. wgAttachWireGuard       — opens the TUN fd and hands it to
+        //                                WireGuard, which starts forwarding
+        //                                packets through the already-live
+        //                                TURN session.
+        // ------------------------------------------------------------------
+        logMsg("wgStartVKBootstrap: launching VK bootstrap goroutine...")
+        let handle = proxyConfigJSON.withCString { proxyPtr in
+            wgStartVKBootstrap(UnsafeMutablePointer(mutating: proxyPtr))
         }
+        if handle < 0 {
+            logMsg("ERROR: wgStartVKBootstrap returned \(handle)")
+            completionHandler(VPNError.backendFailed(code: handle))
+            return
+        }
+        self.tunnelHandle = handle
+        logMsg("wgStartVKBootstrap OK, handle=\(handle)")
 
-        // PHASE 1: Set initial network settings WITHOUT capturing all traffic.
-        // This creates the TUN interface so we can get its file descriptor.
-        let initialSettings = createTunnelSettings(
-            address: tunnelAddress,
-            dns: dnsServers,
-            mtu: mtu,
-            captureTraffic: false,
-            excludeHosts: []
-        )
-
-        logMsg("PHASE 1: setting initial tunnel settings (no routes)")
-        setTunnelNetworkSettings(initialSettings) { [weak self] error in
+        // Wait for bootstrap in the background so completionHandler isn't
+        // held for the entire (possibly captcha-solving) duration from the
+        // main thread. 120s matches turnbridge's budget and comfortably
+        // covers a manual captcha solve in the WebView.
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else { return }
 
-            if let error = error {
-                self.logMsg("PHASE 1 ERROR: \(error)")
-                completionHandler(error)
+            let ready = wgWaitBootstrapReady(handle, 120_000)
+            switch ready {
+            case 1:
+                self.logMsg("wgWaitBootstrapReady: ready")
+            case 0:
+                self.logMsg("wgWaitBootstrapReady: timeout after 120s — aborting")
+                wgTurnOff(handle)
+                self.tunnelHandle = -1
+                completionHandler(VPNError.bootstrapTimeout)
                 return
-            }
-            self.logMsg("PHASE 1: settings applied OK")
-
-            guard let tunFd = self.findTunFileDescriptor() else {
-                self.logMsg("ERROR: could not find TUN fd")
-                completionHandler(VPNError.noTunDevice)
-                return
-            }
-            self.logMsg("TUN fd=\(tunFd)")
-
-            // Start WireGuard + TURN proxy
-            self.logMsg("calling wgTurnOnWithTURN...")
-            let handle = wgConfig.withCString { settingsPtr in
-                proxyConfigJSON.withCString { proxyPtr in
-                    wgTurnOnWithTURN(
-                        UnsafeMutablePointer(mutating: settingsPtr),
-                        tunFd,
-                        UnsafeMutablePointer(mutating: proxyPtr)
-                    )
-                }
-            }
-
-            if handle < 0 {
-                self.logMsg("ERROR: wgTurnOnWithTURN returned \(handle)")
-                completionHandler(VPNError.backendFailed(code: handle))
+            default:
+                self.logMsg("wgWaitBootstrapReady: failed with code \(ready) — aborting")
+                wgTurnOff(handle)
+                self.tunnelHandle = -1
+                completionHandler(VPNError.backendFailed(code: ready))
                 return
             }
 
-            self.tunnelHandle = handle
-            self.logMsg("wgTurnOnWithTURN OK, handle=\(handle)")
-
-            // Check if captcha is pending — if so, skip PHASE 2 so the WebView
-            // can load the captcha page over the normal network (not through the
-            // non-functional VPN tunnel).
-            var captchaPending = false
-            if let statsPtr = wgGetStats(handle) {
-                let statsJSON = String(cString: statsPtr)
-                free(UnsafeMutableRawPointer(mutating: statsPtr))
-                if let data = statsJSON.data(using: .utf8),
-                   let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                   let captchaURL = dict["captcha_image_url"] as? String,
-                   !captchaURL.isEmpty {
-                    captchaPending = true
-                    self.logMsg("Captcha pending — deferring PHASE 2 (no routes until captcha solved)")
-                }
-            }
-
-            // PHASE 2: Set final settings with default route and excluded routes
-            // for TURN server, peer server, and VK captcha/auth domain IPs
-            // (so their traffic bypasses the tunnel).
-            var excludeHosts: [String] = []
-            if let peer = peerHost {
-                excludeHosts.append(peer)
-            }
-
+            // Read the TURN server IP that Go picked during bootstrap and
+            // persist it to the AppGroup so TunnelManager.connect() can use
+            // it as NEVPNProtocol.serverAddress on the NEXT connect (Step 3).
+            var turnIP = ""
             if let turnIPPtr = wgGetTURNServerIP(handle) {
-                let turnIP = String(cString: turnIPPtr)
+                turnIP = String(cString: turnIPPtr)
                 free(UnsafeMutableRawPointer(mutating: turnIPPtr))
-                if !turnIP.isEmpty {
-                    excludeHosts.append(turnIP)
-                    self.logMsg("TURN server IP=\(turnIP)")
-                    self.persistTurnServerIP(turnIP)
-                } else {
-                    self.logMsg("WARNING: TURN server IP is empty")
-                }
+            }
+            if turnIP.isEmpty {
+                self.logMsg("WARNING: bootstrap ready but TURN IP empty — using placeholder for tunnelRemoteAddress")
             } else {
-                self.logMsg("WARNING: wgGetTURNServerIP returned nil")
+                self.logMsg("TURN server IP=\(turnIP)")
+                self.persistTurnServerIP(turnIP)
             }
 
-            // Resolve VK captcha/auth domains and exclude their IPs.
-            // This ensures the captcha WebView can load even when the tunnel is dead
-            // (e.g., after phone sleep/lock or cell handoff).
-            let vkIPs = self.resolveVKHosts()
-            for ip in vkIPs {
-                if !excludeHosts.contains(ip) {
-                    excludeHosts.append(ip)
-                }
-            }
-
-            if captchaPending {
-                // Save settings for later when captcha is solved
-                self.pendingTunnelAddress = tunnelAddress
-                self.pendingDNS = dnsServers
-                self.pendingMTU = mtu
-                self.pendingExcludeHosts = excludeHosts
-                self.logMsg("PHASE 2 deferred — tunnel started without routes")
-                completionHandler(nil)
-                return
-            }
-
-            self.logMsg("PHASE 2: excludeHosts=\(excludeHosts)")
-
+            // Apply the full tunnel settings ONCE. With
+            // includeAllNetworks=true on the NEVPNProtocol, excludedRoutes
+            // are ignored by iOS; the only traffic that stays on the
+            // physical interface is what Apple always-excludes (DHCP,
+            // captive networks, traffic to serverAddress, and — on
+            // iOS 16.4+ with our flags — APNs/CellularServices as
+            // configured on the main-app side).
             let finalSettings = self.createTunnelSettings(
                 address: tunnelAddress,
                 dns: dnsServers,
                 mtu: mtu,
-                captureTraffic: true,
-                excludeHosts: excludeHosts
+                tunnelRemoteAddress: turnIP.isEmpty ? "10.0.0.1" : turnIP
             )
 
-            self.logMsg("PHASE 2: applying final settings with default route")
-            self.setTunnelNetworkSettings(finalSettings) { error in
-                if let error = error {
-                    self.logMsg("PHASE 2 ERROR: \(error)")
-                    completionHandler(error)
-                    return
+            DispatchQueue.main.async {
+                self.logMsg("setTunnelNetworkSettings: applying full routes (single shot)")
+                self.setTunnelNetworkSettings(finalSettings) { error in
+                    if let error = error {
+                        self.logMsg("setTunnelNetworkSettings ERROR: \(error)")
+                        wgTurnOff(handle)
+                        self.tunnelHandle = -1
+                        completionHandler(error)
+                        return
+                    }
+                    self.logMsg("setTunnelNetworkSettings OK — TUN interface live")
+
+                    // TUN fd becomes discoverable only after
+                    // setTunnelNetworkSettings returns. Hand it to Go so
+                    // WireGuard can attach to the already-running proxy.
+                    guard let tunFd = self.findTunFileDescriptor() else {
+                        self.logMsg("ERROR: could not find TUN fd after setTunnelNetworkSettings")
+                        wgTurnOff(handle)
+                        self.tunnelHandle = -1
+                        completionHandler(VPNError.noTunDevice)
+                        return
+                    }
+                    self.logMsg("TUN fd=\(tunFd), calling wgAttachWireGuard...")
+
+                    let rc = wgConfig.withCString { cfgPtr in
+                        wgAttachWireGuard(handle, UnsafeMutablePointer(mutating: cfgPtr), tunFd)
+                    }
+                    if rc < 0 {
+                        self.logMsg("ERROR: wgAttachWireGuard returned \(rc)")
+                        wgTurnOff(handle)
+                        self.tunnelHandle = -1
+                        completionHandler(VPNError.backendFailed(code: rc))
+                        return
+                    }
+                    self.logMsg("wgAttachWireGuard OK — tunnel fully up")
+                    completionHandler(nil)
                 }
-                self.logMsg("PHASE 2: settings applied OK - tunnel ready")
-                completionHandler(nil)
             }
         }
     }
@@ -296,25 +235,14 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                     wgSolveCaptcha(tunnelHandle, UnsafeMutablePointer(mutating: ptr))
                 }
             }
-            // Start polling for connection establishment.
-            // When activeConns > 0, the extension itself will restore routes.
-            // This does NOT depend on the app — it works even if the app
-            // goes to background or the SwiftUI sheet resets captchaPending.
-            startRouteRestorationPoller()
             completionHandler?("ok".data(using: .utf8))
-        } else if msg == "apply_routes" {
-            logMsg("handleAppMessage: apply_routes — applying deferred PHASE 2")
-            applyDeferredRoutes { success in
-                completionHandler?(success ? "ok".data(using: .utf8) : nil)
-            }
-        } else if msg == "suspend_dns" {
-            logMsg("handleAppMessage: suspend_dns — removing VPN DNS so system uses provider DNS")
-            suspendDNSForCaptcha()
-            completionHandler?("ok".data(using: .utf8))
-        } else if msg == "refresh_captcha_and_suspend_dns" {
-            logMsg("handleAppMessage: refresh_captcha_and_suspend_dns — refreshing captcha URL and suspending DNS")
-            suspendDNSForCaptcha()
-            // Call wgRefreshCaptchaURL to get a fresh captcha URL from VK
+        } else if msg == "refresh_captcha_url" {
+            // Main app asks the extension to hit the VK API again and
+            // return a fresh captcha redirect_uri. Used by the
+            // "Attempt limit reached" auto-refresh loop in the main-app
+            // UI to rotate the captcha session without tearing the
+            // WebView down.
+            logMsg("handleAppMessage: refresh_captcha_url")
             var freshURL = ""
             if tunnelHandle >= 0 {
                 if let ptr = wgRefreshCaptchaURL(tunnelHandle) {
@@ -324,10 +252,6 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                 }
             }
             completionHandler?(freshURL.data(using: .utf8))
-        } else if msg == "restore_dns" {
-            logMsg("handleAppMessage: restore_dns — restoring VPN DNS after captcha")
-            restoreDNSAfterCaptcha()
-            completionHandler?("ok".data(using: .utf8))
         } else if msg.hasPrefix("debug_log:") {
             let debugMsg = String(msg.dropFirst("debug_log:".count))
             logMsg("[AppDebug] \(debugMsg)")
@@ -362,281 +286,24 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         // permission/binding errors accumulated while we were asleep, we'd
         // rather force an immediate reconnect now (~5 seconds) than let
         // the user tap Safari and hit a broken tunnel.
+        //
+        // In full-tunnel mode (includeAllNetworks=true) there is no
+        // excludedRoutes list to refresh on network path changes — Apple
+        // ignores excludedRoutes with this flag set, so a cell/Wi-Fi
+        // handoff doesn't require re-applying tunnel settings. The Go
+        // watchdog handles post-wake reconnect if any TURN session
+        // actually died during freeze.
         if tunnelHandle >= 0 {
             wgWakeHealthCheck(tunnelHandle)
         }
-
-        // After wake, the network path may have changed (cell handoff, Wi-Fi switch).
-        // Re-resolve VK domain IPs and refresh route exclusions so the captcha WebView
-        // and credential fetching still work over the new network path.
-        if pendingTunnelAddress == nil {
-            // Only refresh if PHASE 2 was already applied (not deferred)
-            refreshRouteExclusions()
-        }
-    }
-
-    /// Build the current list of IPs that should bypass the tunnel.
-    private func buildCurrentExcludeHosts(proxyConfigJSON: String) -> [String] {
-        var excludeHosts: [String] = []
-
-        // Peer host
-        if let proxyData = proxyConfigJSON.data(using: .utf8),
-           let proxyDict = try? JSONSerialization.jsonObject(with: proxyData) as? [String: Any],
-           let peerAddr = proxyDict["peer_addr"] as? String,
-           let host = peerAddr.split(separator: ":").first.map(String.init) {
-            excludeHosts.append(host)
-        }
-
-        // TURN server IP
-        if tunnelHandle >= 0, let turnIPPtr = wgGetTURNServerIP(tunnelHandle) {
-            let turnIP = String(cString: turnIPPtr)
-            free(UnsafeMutableRawPointer(mutating: turnIPPtr))
-            if !turnIP.isEmpty && !excludeHosts.contains(turnIP) {
-                excludeHosts.append(turnIP)
-            }
-            persistTurnServerIP(turnIP)
-        }
-
-        // VK captcha/auth domain IPs
-        let vkIPs = resolveVKHosts()
-        for ip in vkIPs {
-            if !excludeHosts.contains(ip) {
-                excludeHosts.append(ip)
-            }
-        }
-
-        return excludeHosts
-    }
-
-    /// Re-apply network settings with freshly resolved VK domain IPs.
-    /// Called after wake to handle network path changes (cell handoff, Wi-Fi switch).
-    private func refreshRouteExclusions() {
-        guard tunnelHandle >= 0 else { return }
-
-        // Get current tunnel settings from the saved config
-        guard let config = (protocolConfiguration as? NETunnelProviderProtocol)?.providerConfiguration,
-              let proxyConfigJSON = config["proxy_config"] as? String else {
-            logMsg("refreshRouteExclusions: no config available")
-            return
-        }
-
-        let tunnelAddress = config["tunnel_address"] as? String ?? "192.168.102.3/24"
-        let dnsServers = config["dns_servers"] as? String ?? "1.1.1.1"
-        let mtu = config["mtu"] as? String ?? "1280"
-
-        let excludeHosts = buildCurrentExcludeHosts(proxyConfigJSON: proxyConfigJSON)
-
-        logMsg("refreshRouteExclusions: excludeHosts=\(excludeHosts)")
-
-        let settings = createTunnelSettings(
-            address: tunnelAddress,
-            dns: dnsServers,
-            mtu: mtu,
-            captureTraffic: true,
-            excludeHosts: excludeHosts
-        )
-
-        setTunnelNetworkSettings(settings) { [weak self] error in
-            if let error = error {
-                self?.logMsg("refreshRouteExclusions ERROR: \(error)")
-            } else {
-                self?.logMsg("refreshRouteExclusions: routes refreshed OK")
-                // Mark PHASE 2 as complete — routes + DNS are now active.
-                // This is important: if PHASE 2 was deferred (startup captcha) and
-                // restoreDNS called refreshRouteExclusions, we must clear pending state
-                // so future suspendDNSForCaptcha calls (reconnect captcha) actually work.
-                self?.pendingTunnelAddress = nil
-            }
-        }
-    }
-
-    /// Temporarily remove VPN routes AND DNS so ALL traffic bypasses the dead tunnel.
-    /// Called when captcha is needed during reconnection — the tunnel is dead, so any
-    /// traffic routed through TUN will fail. The WebView needs to reach not just VK API
-    /// domains (which are in excludeHosts) but also CDN domains for JS, CSS, and captcha
-    /// images (st.vk.com, sun*.userapi.com, etc.) which are NOT in excludeHosts.
-    /// By removing the default route entirely, all traffic goes direct via cellular/WiFi.
-    /// The route is restored when the captcha is solved and connections are re-established.
-    private func suspendDNSForCaptcha() {
-        // If PHASE 2 is still deferred (startup captcha), there are no routes or DNS to suspend.
-        // The TUN has no includedRoutes, so traffic goes direct — WebView works as-is.
-        if pendingTunnelAddress != nil {
-            logMsg("suspendDNSForCaptcha: PHASE 2 deferred — no routes/DNS to suspend, skipping")
-            return
-        }
-
-        guard let config = (protocolConfiguration as? NETunnelProviderProtocol)?.providerConfiguration else {
-            logMsg("suspendDNSForCaptcha: no config available")
-            return
-        }
-
-        let tunnelAddress = config["tunnel_address"] as? String ?? "192.168.102.3/24"
-        let mtu = config["mtu"] as? String ?? "1280"
-
-        logMsg("suspendDNSForCaptcha: removing default route + DNS — all traffic goes direct")
-
-        // Remove BOTH routes and DNS. captureTraffic=false means no includedRoutes,
-        // so the TUN interface has no default route and all traffic bypasses it.
-        // The tunnel is dead anyway — nothing is lost by removing the route.
-        let settings = createTunnelSettings(
-            address: tunnelAddress,
-            dns: "",  // empty = no VPN DNS override
-            mtu: mtu,
-            captureTraffic: false,  // no default route — all traffic goes direct
-            excludeHosts: []        // not needed without default route
-        )
-
-        setTunnelNetworkSettings(settings) { [weak self] error in
-            if let error = error {
-                self?.logMsg("suspendDNSForCaptcha ERROR: \(error)")
-            } else {
-                self?.logMsg("suspendDNSForCaptcha: routes + DNS removed — all traffic direct")
-            }
-        }
-    }
-
-    /// Restore VPN DNS settings after captcha is solved. Also refreshes route exclusions.
-    private func restoreDNSAfterCaptcha() {
-        // Just re-apply full settings with DNS — same as refreshRouteExclusions
-        refreshRouteExclusions()
-    }
-
-    // MARK: - Route Restoration Poller
-
-    /// Start polling for active connections after captcha is solved.
-    /// When activeConns > 0 and captchaImageURL is empty, apply routes.
-    /// Runs entirely within the extension — no app dependency.
-    private func startRouteRestorationPoller() {
-        // Cancel any existing poller
-        routeRestorationTimer?.cancel()
-        routeRestorationTimer = nil
-        captchaSolvedAndWaitingForRoutes = true
-
-        logMsg("routeRestorationPoller: started — waiting for activeConns > 0")
-
-        let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
-        timer.schedule(deadline: .now() + 2, repeating: 2.0)
-        var elapsed = 0
-
-        timer.setEventHandler { [weak self] in
-            guard let self = self, self.captchaSolvedAndWaitingForRoutes else {
-                return
-            }
-
-            elapsed += 2
-            if elapsed > 120 {
-                self.logMsg("routeRestorationPoller: timeout (120s) — giving up")
-                self.stopRouteRestorationPoller()
-                return
-            }
-
-            guard self.tunnelHandle >= 0,
-                  let statsPtr = wgGetStats(self.tunnelHandle) else {
-                return
-            }
-            let statsJSON = String(cString: statsPtr)
-            free(UnsafeMutableRawPointer(mutating: statsPtr))
-
-            guard let data = statsJSON.data(using: .utf8),
-                  let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-                return
-            }
-
-            let activeConns = dict["active_conns"] as? Int ?? 0
-            let captchaURL = dict["captcha_image_url"] as? String ?? ""
-
-            if activeConns > 0 && captchaURL.isEmpty {
-                self.logMsg("routeRestorationPoller: activeConns=\(activeConns), captcha cleared — restoring routes")
-                self.captchaSolvedAndWaitingForRoutes = false
-
-                // Apply routes on main queue (setTunnelNetworkSettings requires it)
-                DispatchQueue.main.async {
-                    if self.pendingTunnelAddress != nil {
-                        // Startup captcha case — PHASE 2 was deferred
-                        self.applyDeferredRoutes { success in
-                            self.logMsg("routeRestorationPoller: applyDeferredRoutes \(success ? "OK" : "FAILED")")
-                        }
-                    } else {
-                        // Sleep/wake captcha case — routes were suspended
-                        self.restoreDNSAfterCaptcha()
-                        self.logMsg("routeRestorationPoller: restoreDNSAfterCaptcha called")
-                    }
-                }
-                self.stopRouteRestorationPoller()
-            } else {
-                self.logMsg("routeRestorationPoller: activeConns=\(activeConns) captcha=\(captchaURL.isEmpty ? "empty" : "pending") — waiting...")
-            }
-        }
-
-        timer.resume()
-        routeRestorationTimer = timer
-    }
-
-    private func stopRouteRestorationPoller() {
-        routeRestorationTimer?.cancel()
-        routeRestorationTimer = nil
-        captchaSolvedAndWaitingForRoutes = false
     }
 
     override func stopTunnel(with reason: NEProviderStopReason, completionHandler: @escaping () -> Void) {
-        stopRouteRestorationPoller()
         if tunnelHandle >= 0 {
             wgTurnOff(tunnelHandle)
             tunnelHandle = -1
         }
         completionHandler()
-    }
-
-    // MARK: - Deferred Route Application
-
-    private func applyDeferredRoutes(completion: @escaping (Bool) -> Void) {
-        guard let address = pendingTunnelAddress,
-              let dns = pendingDNS,
-              let mtu = pendingMTU else {
-            logMsg("applyDeferredRoutes: no pending settings")
-            completion(false)
-            return
-        }
-
-        // Re-check TURN server IP (may have been resolved after captcha)
-        var excludeHosts = pendingExcludeHosts
-        if let turnIPPtr = wgGetTURNServerIP(tunnelHandle) {
-            let turnIP = String(cString: turnIPPtr)
-            free(UnsafeMutableRawPointer(mutating: turnIPPtr))
-            if !turnIP.isEmpty && !excludeHosts.contains(turnIP) {
-                excludeHosts.append(turnIP)
-                logMsg("applyDeferredRoutes: added TURN IP=\(turnIP)")
-            }
-            persistTurnServerIP(turnIP)
-        }
-
-        // Re-resolve VK captcha/auth domain IPs (may have changed since startup)
-        let vkIPs = resolveVKHosts()
-        for ip in vkIPs {
-            if !excludeHosts.contains(ip) {
-                excludeHosts.append(ip)
-            }
-        }
-
-        let finalSettings = createTunnelSettings(
-            address: address,
-            dns: dns,
-            mtu: mtu,
-            captureTraffic: true,
-            excludeHosts: excludeHosts
-        )
-
-        logMsg("applyDeferredRoutes: excludeHosts=\(excludeHosts)")
-        setTunnelNetworkSettings(finalSettings) { [weak self] error in
-            if let error = error {
-                self?.logMsg("applyDeferredRoutes ERROR: \(error)")
-                completion(false)
-            } else {
-                self?.logMsg("applyDeferredRoutes: routes applied OK — tunnel fully active")
-                self?.pendingTunnelAddress = nil
-                completion(true)
-            }
-        }
     }
 
     // MARK: - Network Settings
@@ -645,31 +312,31 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         address: String,
         dns: String,
         mtu: String,
-        captureTraffic: Bool,
-        excludeHosts: [String]
+        tunnelRemoteAddress: String
     ) -> NEPacketTunnelNetworkSettings {
         let parts = address.split(separator: "/")
         let ip = String(parts[0])
         let prefix = parts.count > 1 ? Int(parts[1]) ?? 24 : 24
 
-        let settings = NEPacketTunnelNetworkSettings(tunnelRemoteAddress: "10.0.0.1")
+        // tunnelRemoteAddress is a cosmetic label per NEPacketTunnelNetworkSettings
+        // docs — the actual always-excluded address for iOS full-tunnel mode is
+        // NEVPNProtocol.serverAddress (set in the main app, see Step 3 / the
+        // AppGroup-cached TURN IP). We still pass the TURN IP here for
+        // consistency and so Settings > VPN shows a sensible value.
+        let settings = NEPacketTunnelNetworkSettings(tunnelRemoteAddress: tunnelRemoteAddress)
 
         let ipv4 = NEIPv4Settings(addresses: [ip], subnetMasks: [prefixToSubnet(prefix)])
-
-        if captureTraffic {
-            ipv4.includedRoutes = [NEIPv4Route.default()]
-            ipv4.excludedRoutes = excludeHosts.map {
-                NEIPv4Route(destinationAddress: $0, subnetMask: "255.255.255.255")
-            }
-        }
-
+        ipv4.includedRoutes = [NEIPv4Route.default()]
+        // No excludedRoutes: with includeAllNetworks=true on the VPN profile,
+        // iOS ignores excludedRoutes entirely (Apple docs). The only
+        // always-excluded destination is the serverAddress (see above), plus
+        // Apple's built-in list (DHCP, captive networks, cellular services
+        // when flagged). Removing excludedRoutes here keeps the intent
+        // explicit.
+        ipv4.excludedRoutes = []
         settings.ipv4Settings = ipv4
 
-        // Only set DNS in Phase 2 (captureTraffic=true) and when dns is non-empty.
-        // Setting DNS in Phase 1 can cause Go HTTP requests to hang
-        // because the TUN interface isn't routing traffic yet.
-        // Empty dns string = no VPN DNS override (system uses provider DNS).
-        if captureTraffic && !dns.isEmpty {
+        if !dns.isEmpty {
             let dnsAddresses = dns.split(separator: ",").map { String($0).trimmingCharacters(in: .whitespaces) }
             settings.dnsSettings = NEDNSSettings(servers: dnsAddresses)
         }
@@ -713,6 +380,7 @@ enum VPNError: Error, LocalizedError {
     case invalidConfiguration
     case noTunDevice
     case backendFailed(code: Int32)
+    case bootstrapTimeout
 
     var errorDescription: String? {
         switch self {
@@ -720,6 +388,7 @@ enum VPNError: Error, LocalizedError {
         case .invalidConfiguration: return "Invalid or missing configuration fields"
         case .noTunDevice: return "Could not find TUN file descriptor"
         case .backendFailed(let code): return "WireGuard backend failed with code \(code)"
+        case .bootstrapTimeout: return "VK bootstrap did not complete within 120s (captcha may be required)"
         }
     }
 }

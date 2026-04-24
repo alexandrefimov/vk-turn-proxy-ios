@@ -67,7 +67,6 @@ class TunnelManager: ObservableObject {
     // Created by onCaptchaLimitDetected, invalidated by onCaptchaReady /
     // onCaptchaSheetDismissed / captcha-resolved / max-attempts.
     private var captchaAutoRefreshTimer: Timer?
-    private var dnsSuspended = false  // true when routes removed for reconnect captcha
     private var lastCaptchaShowTime: Date?  // prevent rapid re-show
 
     init() {
@@ -152,6 +151,38 @@ class TunnelManager: ObservableObject {
                 "mtu": config.mtu
             ]
 
+            // Full-tunnel mode (Step 4 of the APNs-through-tunnel refactor).
+            // includeAllNetworks=true is the ONLY documented mechanism that
+            // pulls APNs (Apple Push Notification Service) traffic into the
+            // VPN on iOS — which is the goal of this whole refactor: pushes
+            // keep arriving when the device is on Wi-Fi going through the
+            // tunnel.
+            //
+            // Trade-offs we accept:
+            //  - excludedRoutes become inert (Apple ignores them). So the
+            //    only always-excluded destinations are: serverAddress
+            //    (set to the TURN relay IP above, see Step 3), Apple's
+            //    built-in always-excluded list (DHCP, captive networks,
+            //    cellular-services-direct…), and — iOS 16.4+ — whatever
+            //    we gate with the flags below.
+            //  - excludeLocalNetworks=true keeps LAN reachable even with
+            //    the full tunnel up (printers, AirPlay, etc.).
+            //  - excludeAPNs=false / excludeCellularServices=false
+            //    (both iOS 16.4+) override Apple's default where these
+            //    system-service categories bypass the tunnel — we want
+            //    them IN the tunnel so the user on Wi-Fi keeps receiving
+            //    pushes via our VPS.
+            //
+            // Saving a profile whose includeAllNetworks changed re-prompts
+            // iOS for VPN permission on the next connect. This is a
+            // one-time UX cost for existing users.
+            proto.includeAllNetworks = true
+            proto.excludeLocalNetworks = true
+            if #available(iOS 16.4, *) {
+                proto.excludeAPNs = false
+                proto.excludeCellularServices = false
+            }
+
             manager.protocolConfiguration = proto
             manager.localizedDescription = "VK TURN Proxy"
             manager.isEnabled = true
@@ -169,24 +200,23 @@ class TunnelManager: ObservableObject {
         manager?.connection.stopVPNTunnel()
     }
 
-    func applyDeferredRoutes() {
+    /// Ask the extension to hit the VK API again and return a fresh
+    /// captcha redirect_uri. Used by the "Attempt limit reached" auto-
+    /// refresh loop to rotate the captcha session and by the initial
+    /// captcha-detected path to avoid showing a stale URL after the app
+    /// spent time in the background.
+    ///
+    /// Previously this also asked the extension to "suspend DNS" —
+    /// remove the tunnel default route so the WebView could reach VK via
+    /// the physical interface. In full-tunnel mode (includeAllNetworks=
+    /// true, Step 4), excludedRoutes are ignored and there is no default
+    /// route to remove: the WebView traffic either goes through the
+    /// tunnel (when it's alive — poolCreds keeps at least one conn up)
+    /// or is dropped (all conns dead — recoverable only via
+    /// Disconnect+Connect). So we just refresh the URL.
+    func refreshCaptchaURL() {
         guard let session = manager?.connection as? NETunnelProviderSession else { return }
-        guard let msg = "apply_routes".data(using: .utf8) else { return }
-        do {
-            try session.sendProviderMessage(msg) { _ in }
-        } catch {
-            // Extension might not be running
-        }
-    }
-
-    /// Temporarily remove VPN DNS settings so system uses provider DNS (cellular/WiFi).
-    /// Called when captcha is needed during reconnection (tunnel is dead, DNS to 1.1.1.1
-    /// through TUN would fail, preventing WebView from resolving VK hostnames).
-    func suspendDNS() {
-        guard let session = manager?.connection as? NETunnelProviderSession else { return }
-        // Ask extension to refresh captcha URL (fresh VK API call) AND suspend DNS.
-        // The extension returns the fresh URL in the response data.
-        guard let msg = "refresh_captcha_and_suspend_dns".data(using: .utf8) else { return }
+        guard let msg = "refresh_captcha_url".data(using: .utf8) else { return }
         do {
             try session.sendProviderMessage(msg) { [weak self] responseData in
                 guard let self = self,
@@ -216,15 +246,6 @@ class TunnelManager: ObservableObject {
         debugLog("[captcha-view] \(message)")
     }
 
-    /// Restore VPN DNS settings after captcha is solved.
-    func restoreDNS() {
-        guard let session = manager?.connection as? NETunnelProviderSession else { return }
-        guard let msg = "restore_dns".data(using: .utf8) else { return }
-        do {
-            try session.sendProviderMessage(msg) { _ in }
-        } catch {}
-    }
-
     // MARK: - Captcha auto-refresh ("Attempt limit reached" recovery)
     //
     // When VK responds to our captcha fetch with the "Attempt limit reached"
@@ -232,12 +253,13 @@ class TunnelManager: ObservableObject {
     // nothing — VK expects us to come back with a fresh client_id / session.
     // The JS detector inside CaptchaWKWebView posts `state:limit` to Swift
     // after 2.5s of page load; that triggers `onCaptchaLimitDetected()` here.
-    // We then start a Timer that periodically calls `suspendDNS()` — which
-    // under the hood asks the extension for a fresh captcha URL. The fresh
-    // URL flows back through `captchaImageURL` → SwiftUI rebind →
-    // `CaptchaWKWebView.updateUIView` reloads the same WKWebView → JS fires
-    // again → either `state:limit` (still bad, timer keeps going) or
-    // `state:ready` (working captcha, we stop the timer and hide the overlay).
+    // We then start a Timer that periodically calls `refreshCaptchaURL()` —
+    // which asks the extension for a fresh captcha URL via
+    // wgRefreshCaptchaURL. The fresh URL flows back through `captchaImageURL`
+    // → SwiftUI rebind → `CaptchaWKWebView.updateUIView` reloads the same
+    // WKWebView → JS fires again → either `state:limit` (still bad, timer
+    // keeps going) or `state:ready` (working captcha, we stop the timer
+    // and hide the overlay).
 
     /// Called from WebView JS detector when the loaded page is in
     /// limit-reached state. Idempotent — multiple calls while a timer is
@@ -307,13 +329,13 @@ class TunnelManager: ObservableObject {
             return
         }
         debugLog("captcha auto-refresh: attempt \(captchaRefreshAttempt)/\(maxCaptchaRefreshAttempts) (reason: \(reason)) — requesting fresh URL")
-        // suspendDNS() sends "refresh_captcha_and_suspend_dns" to the
-        // extension; the extension calls wgRefreshCaptchaURL and returns the
-        // fresh URL, which populates captchaImageURL. SwiftUI then rebinds
-        // the sheet content, our updateUIView sees the URL change and reloads
-        // the WKWebView. This is the same mechanism used by the first-open
-        // path — we just call it again on our schedule.
-        suspendDNS()
+        // refreshCaptchaURL() asks the extension to call wgRefreshCaptchaURL
+        // and returns the fresh URL via the IPC response, which populates
+        // captchaImageURL. SwiftUI then rebinds the sheet content, our
+        // updateUIView sees the URL change and reloads the WKWebView.
+        // Same mechanism the first-open path uses; we just call it on a
+        // schedule while VK is giving us ERROR_LIMIT pages.
+        refreshCaptchaURL()
     }
 
     func solveCaptcha(answer: String) {
@@ -322,8 +344,10 @@ class TunnelManager: ObservableObject {
         do {
             try session.sendProviderMessage(msg) { _ in
                 // Don't clear captchaPending here — let the stats polling
-                // detect the transition (captcha_image_url becomes empty)
-                // and trigger applyDeferredRoutes().
+                // detect the transition (captcha_image_url becomes empty
+                // + activeConns > 0) and clear the UI state. In full-tunnel
+                // mode there's nothing else to do after captcha: tunnel
+                // settings were already applied during bootstrap.
             }
         } catch {
             // Extension might not be running
@@ -366,7 +390,7 @@ class TunnelManager: ObservableObject {
             Task { @MainActor in
                 guard let self = self else { return }
                 let newStatus = manager.connection.status
-                self.debugLog("NEVPNStatus changed: \(newStatus.rawValue) captchaPending=\(self.captchaPending) dnsSusp=\(self.dnsSuspended)")
+                self.debugLog("NEVPNStatus changed: \(newStatus.rawValue) captchaPending=\(self.captchaPending)")
                 self.status = newStatus
                 switch newStatus {
                 case .connected:
@@ -435,7 +459,6 @@ class TunnelManager: ObservableObject {
         captchaImageURL = nil
         captchaSID = nil
         lastCaptchaShowTime = nil
-        dnsSuspended = false
     }
 
     private var pingCounter: Int = 0
@@ -471,7 +494,7 @@ class TunnelManager: ObservableObject {
 
                         // Debug: log every stats poll when captcha state is relevant
                         if self.captchaPending || hasCaptcha {
-                            self.debugLog("stats: hasCaptcha=\(hasCaptcha) pending=\(self.captchaPending) dnsSusp=\(self.dnsSuspended) conns=\(newStats.activeConns)")
+                            self.debugLog("stats: hasCaptcha=\(hasCaptcha) pending=\(self.captchaPending) conns=\(newStats.activeConns)")
                         }
 
                         if hasCaptcha {
@@ -484,30 +507,31 @@ class TunnelManager: ObservableObject {
                                 if newStats.activeConns > 0 {
                                     self.debugLog("captcha DETECTED but activeConns=\(newStats.activeConns), ignoring (connections alive)")
                                 } else {
-                                self.captchaPending = true
-                                self.captchaImageURL = captchaURL
-                                self.captchaSID = newStats.captchaSID
-                                self.lastCaptchaShowTime = Date()
-                                if self.status == .connected {
-                                    self.suspendDNS()
-                                    self.dnsSuspended = true
-                                }
-                                self.debugLog("captcha DETECTED, activeConns=0, suspendDNS=\(self.status == .connected)")
+                                    self.captchaPending = true
+                                    self.captchaImageURL = captchaURL
+                                    self.captchaSID = newStats.captchaSID
+                                    self.lastCaptchaShowTime = Date()
+                                    // Ask the extension for a fresh URL just in case
+                                    // this stats URL is stale (e.g., app spent time in
+                                    // background between Go publishing the URL and us
+                                    // rendering the WebView). Does not block.
+                                    self.refreshCaptchaURL()
+                                    self.debugLog("captcha DETECTED, activeConns=0, refreshed URL")
                                 }
                             } else if self.captchaImageURL != captchaURL {
                                 // URL changed (e.g., periodic probe got a fresh captcha URL)
                                 self.captchaImageURL = captchaURL
                                 self.captchaSID = newStats.captchaSID
-                                if self.status == .connected && self.dnsSuspended {
-                                    self.suspendDNS()
-                                }
                                 self.debugLog("captcha URL CHANGED")
                             }
                         } else if self.captchaPending && newStats.activeConns > 0 {
                             // Captcha URL is empty AND we have active connections.
                             // This is the reliable signal that captcha was resolved
-                            // and the proxy reconnected successfully.
-                            self.debugLog("captcha RESOLVED — activeConns=\(newStats.activeConns), restoring routes, dnsSusp=\(self.dnsSuspended)")
+                            // and the proxy reconnected successfully. In full-tunnel
+                            // mode there are no deferred routes to restore — tunnel
+                            // settings were applied once in the extension's
+                            // setTunnelNetworkSettings call after bootstrap-ready.
+                            self.debugLog("captcha RESOLVED — activeConns=\(newStats.activeConns)")
                             self.captchaPending = false
                             self.captchaImageURL = nil
                             self.captchaSID = nil
@@ -519,12 +543,6 @@ class TunnelManager: ObservableObject {
                             if self.captchaAutoRefreshTimer != nil {
                                 self.debugLog("captcha auto-refresh: captcha RESOLVED, stopping timer")
                                 self.stopCaptchaAutoRefresh()
-                            }
-                            if self.dnsSuspended {
-                                self.restoreDNS()
-                                self.dnsSuspended = false
-                            } else {
-                                self.applyDeferredRoutes()
                             }
                         }
                     }
