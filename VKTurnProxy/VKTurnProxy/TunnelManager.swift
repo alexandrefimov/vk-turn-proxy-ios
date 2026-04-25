@@ -50,6 +50,19 @@ class TunnelManager: ObservableObject {
     @Published var captchaPending = false
     @Published var captchaImageURL: String?
     @Published var captchaSID: String?
+
+    // Pre-bootstrap captcha resolver — set when connect() is awaiting a
+    // captcha solution from the WebView before calling startVPNTunnel.
+    // Reuses the same captchaPending sheet but routes solveCaptcha into
+    // the continuation instead of the extension IPC path.
+    private var preBootstrapResolver: CheckedContinuation<String, Never>?
+
+    // True from the moment connect() starts the pre-bootstrap probe loop
+    // until either startVPNTunnel is called (NEVPNStatus takes over) or
+    // probe fails. The UI checks this OR status==.connecting to render
+    // the "Connecting" state — without it, the user sees no visual
+    // change for the ~5-15 seconds the probe takes.
+    @Published var preBootstrapInProgress = false
     // Set true when JS detector in the WebView reports the loaded page is
     // "Attempt limit reached" (no interactive element, error text visible).
     // UI renders an overlay with a progress indicator while this is true.
@@ -105,6 +118,8 @@ class TunnelManager: ObservableObject {
 
     func connect(config: TunnelConfig) async {
         errorMessage = nil
+        preBootstrapInProgress = true
+        defer { preBootstrapInProgress = false }
 
         do {
             let manager = try await getOrCreateManager()
@@ -126,18 +141,104 @@ class TunnelManager: ObservableObject {
             }.value
             if !vkHostIPs.isEmpty {
                 SharedLogger.shared.log("[AppDebug] TunnelManager.connect: pre-resolved VK hosts: \(vkHostIPs)")
-                // Diagnostic: probe whether main app can actually reach
-                // these IPs over TCP/443. If main app fails too — the IPs
-                // are genuinely unreachable (network/ISP/whitelist). If
-                // main app succeeds and extension still fails — it's an
-                // extension-process routing issue.
-                diagnoseIPReachability(vkHostIPs)
             } else {
                 SharedLogger.shared.log("[AppDebug] TunnelManager.connect: WARNING — pre-resolved VK hosts list is empty")
             }
 
-            // Build proxy config JSON
-            let proxyConfig = buildProxyConfig(config: config, vkHostIPs: vkHostIPs)
+            // ----------------------------------------------------------------
+            // Pre-bootstrap captcha probe.
+            //
+            // We solve VK captcha here, in the main-app process, BEFORE
+            // calling startVPNTunnel. Two reasons:
+            //
+            //  1. Step 4 architecture (deferred-setTunnelNetworkSettings +
+            //     includeAllNetworks=true) takes the main app's network
+            //     stack down at kernel level the moment startVPNTunnel runs
+            //     and brings it back only after the tunnel reaches
+            //     .connected. The WebView captcha flow needs network in the
+            //     main app process — which it has now (status .disconnected,
+            //     full physical interface) and won't have during .connecting.
+            //
+            //  2. The PoW + slider auto-solvers in Go work in 90%+ of cases.
+            //     When they don't, we need a human in the loop, and that
+            //     loop is only viable here.
+            //
+            // Loop: probe → if captcha → WebView → user solves → loop with
+            // the saved {sid, key, ts, attempt, token1, client_id} state.
+            // On success the probe returns TURN credentials we hand to the
+            // extension to seed credPool slot 0, so the first conn comes up
+            // immediately without another VK round-trip.
+            // ----------------------------------------------------------------
+            let linkID = URL(string: config.vkLink)?.lastPathComponent ?? ""
+            let hostIPsJSONStr: String = {
+                if !vkHostIPs.isEmpty,
+                   let data = try? JSONSerialization.data(withJSONObject: vkHostIPs),
+                   let str = String(data: data, encoding: .utf8) {
+                    return str
+                }
+                return ""
+            }()
+
+            var savedSID = ""
+            var savedKey = ""
+            var savedToken1 = ""
+            var savedClientID = ""
+            var savedTs: Double = 0
+            var savedAttempt: Double = 0
+            var seededTURN: (address: String, username: String, password: String)? = nil
+
+            probeLoop: for attempt in 1...5 {
+                SharedLogger.shared.log("[AppDebug] pre-bootstrap probe attempt \(attempt)/5")
+                let result = await probeVKCreds(
+                    linkID: linkID,
+                    vkHostIPsJSON: hostIPsJSONStr,
+                    savedSID: savedSID,
+                    savedKey: savedKey,
+                    savedToken1: savedToken1,
+                    savedClientID: savedClientID,
+                    savedTs: savedTs,
+                    savedAttempt: savedAttempt
+                )
+                switch result {
+                case .ok(let addr, let user, let pass):
+                    seededTURN = (addr, user, pass)
+                    SharedLogger.shared.log("[AppDebug] pre-bootstrap: TURN creds acquired (addr=\(addr))")
+                    break probeLoop
+                case .captcha(let url, let sid, let ts, let captchaAttempt, let token1, let clientID, let isRateLimit):
+                    if isRateLimit {
+                        errorMessage = "VK временно ограничивает запросы, попробуйте через минуту"
+                        SharedLogger.shared.log("[AppDebug] pre-bootstrap: rate limit — aborting")
+                        return
+                    }
+                    SharedLogger.shared.log("[AppDebug] pre-bootstrap: captcha required (sid=\(sid), client_id=\(clientID)), showing WebView")
+                    let solvedKey = await awaitPreBootstrapCaptcha(url: url)
+                    if solvedKey.isEmpty {
+                        SharedLogger.shared.log("[AppDebug] pre-bootstrap: user dismissed captcha — aborting")
+                        return
+                    }
+                    SharedLogger.shared.log("[AppDebug] pre-bootstrap: user solved captcha (\(solvedKey.count) chars), retrying probe")
+                    savedSID = sid
+                    savedKey = solvedKey
+                    savedToken1 = token1
+                    savedClientID = clientID
+                    savedTs = ts
+                    savedAttempt = captchaAttempt
+                case .error(let msg):
+                    SharedLogger.shared.log("[AppDebug] pre-bootstrap: error: \(msg)")
+                    errorMessage = "Не удалось подключиться: \(msg)"
+                    return
+                }
+            }
+
+            guard let seeded = seededTURN else {
+                SharedLogger.shared.log("[AppDebug] pre-bootstrap: exhausted 5 attempts without success")
+                errorMessage = "Не удалось получить креды после 5 попыток captcha"
+                return
+            }
+
+            // Build proxy config JSON, seeding credPool slot 0 with the
+            // pre-fetched TURN creds.
+            let proxyConfig = buildProxyConfig(config: config, vkHostIPs: vkHostIPs, seededTURN: seeded)
 
             // Pick serverAddress. Prefer the TURN relay IP cached from a
             // previous session by the extension (via AppGroup UserDefaults):
@@ -318,6 +419,13 @@ class TunnelManager: ObservableObject {
             debugLog("captcha auto-refresh: sheet dismissed by user, stopping timer (attempt was \(captchaRefreshAttempt))")
             stopCaptchaAutoRefresh()
         }
+        // Pre-bootstrap path: user gave up. Resolve continuation with
+        // empty string so connect() unwinds cleanly without leaking
+        // the awaiter.
+        if let resolver = preBootstrapResolver {
+            preBootstrapResolver = nil
+            resolver.resume(returning: "")
+        }
     }
 
     private func stopCaptchaAutoRefresh() {
@@ -359,6 +467,15 @@ class TunnelManager: ObservableObject {
     }
 
     func solveCaptcha(answer: String) {
+        // Pre-bootstrap path: connect() is awaiting the answer.
+        if let resolver = preBootstrapResolver {
+            preBootstrapResolver = nil
+            captchaPending = false
+            captchaImageURL = nil
+            resolver.resume(returning: answer)
+            return
+        }
+        // Existing mid-session path: forward to extension via IPC.
         guard let session = manager?.connection as? NETunnelProviderSession else { return }
         guard let msg = "solve_captcha:\(answer)".data(using: .utf8) else { return }
         do {
@@ -372,6 +489,20 @@ class TunnelManager: ObservableObject {
         } catch {
             // Extension might not be running
         }
+    }
+
+    /// Show the captcha WebView and await the user's success_token. Used
+    /// by the pre-bootstrap captcha flow in connect(): we cycle until the
+    /// Go-side probe accepts our solution. Empty string = user dismissed.
+    func awaitPreBootstrapCaptcha(url: String) async -> String {
+        let token: String = await withCheckedContinuation { (cont: CheckedContinuation<String, Never>) in
+            DispatchQueue.main.async {
+                self.preBootstrapResolver = cont
+                self.captchaImageURL = url
+                self.captchaPending = true
+            }
+        }
+        return token
     }
 
     // MARK: - Private
@@ -717,7 +848,11 @@ class TunnelManager: ObservableObject {
         return lines.joined(separator: "\n")
     }
 
-    private func buildProxyConfig(config: TunnelConfig, vkHostIPs: [String: [String]] = [:]) -> String {
+    private func buildProxyConfig(
+        config: TunnelConfig,
+        vkHostIPs: [String: [String]] = [:],
+        seededTURN: (address: String, username: String, password: String)? = nil
+    ) -> String {
         var dict: [String: Any] = [
             "vk_link": config.vkLink,
             "peer_addr": config.peerAddress,
@@ -730,6 +865,13 @@ class TunnelManager: ObservableObject {
         ]
         if !vkHostIPs.isEmpty {
             dict["vk_host_ips"] = vkHostIPs
+        }
+        if let s = seededTURN {
+            dict["seeded_turn"] = [
+                "address": s.address,
+                "username": s.username,
+                "password": s.password
+            ]
         }
 
         guard let data = try? JSONSerialization.data(withJSONObject: dict),
@@ -835,6 +977,75 @@ class TunnelManager: ObservableObject {
                 conn.cancel()
             }
         }
+    }
+
+    // MARK: - Pre-bootstrap captcha probe
+
+    enum ProbeResult {
+        case ok(address: String, username: String, password: String)
+        case captcha(url: String, sid: String, ts: Double, attempt: Double, token1: String, clientID: String, isRateLimit: Bool)
+        case error(message: String)
+    }
+
+    /// Calls Go-side wgProbeVKCreds. Returns parsed result. Synchronous,
+    /// runs on a background queue (Task.detached) — CFHost / TLS / VK API
+    /// over uTLS together can take several seconds.
+    nonisolated private func probeVKCreds(
+        linkID: String,
+        vkHostIPsJSON: String,
+        savedSID: String = "",
+        savedKey: String = "",
+        savedToken1: String = "",
+        savedClientID: String = "",
+        savedTs: Double = 0,
+        savedAttempt: Double = 0
+    ) async -> ProbeResult {
+        return await Task.detached(priority: .userInitiated) {
+            let cResult: UnsafePointer<CChar>? = linkID.withCString { l in
+                vkHostIPsJSON.withCString { h in
+                    savedSID.withCString { s in
+                        savedKey.withCString { k in
+                            savedToken1.withCString { t in
+                                savedClientID.withCString { c in
+                                    wgProbeVKCreds(l, h, s, k, t, c, savedTs, savedAttempt)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            guard let cResult = cResult else {
+                return ProbeResult.error(message: "wgProbeVKCreds returned NULL")
+            }
+            let jsonStr = String(cString: cResult)
+            free(UnsafeMutableRawPointer(mutating: cResult))
+
+            guard let data = jsonStr.data(using: .utf8),
+                  let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                return ProbeResult.error(message: "wgProbeVKCreds invalid JSON: \(jsonStr.prefix(200))")
+            }
+            let status = dict["status"] as? String ?? ""
+            switch status {
+            case "ok":
+                return .ok(
+                    address: dict["turn_address"] as? String ?? "",
+                    username: dict["turn_username"] as? String ?? "",
+                    password: dict["turn_password"] as? String ?? ""
+                )
+            case "captcha":
+                return .captcha(
+                    url: dict["captcha_url"] as? String ?? "",
+                    sid: dict["sid"] as? String ?? "",
+                    ts: dict["ts"] as? Double ?? 0,
+                    attempt: dict["attempt"] as? Double ?? 0,
+                    token1: dict["token1"] as? String ?? "",
+                    clientID: dict["client_id"] as? String ?? "",
+                    isRateLimit: dict["is_rate_limit"] as? Bool ?? false
+                )
+            default:
+                return .error(message: dict["message"] as? String ?? "unknown probe error")
+            }
+        }.value
     }
 
     /// Resolve VK API hostnames in the main-app process. Returns the

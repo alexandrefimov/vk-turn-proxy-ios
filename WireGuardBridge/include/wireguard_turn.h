@@ -100,6 +100,31 @@ void wgSetLogFilePath(const char *path);
 /// Go runtime on iOS has no tzdata, so this aligns Go log timestamps with local time.
 void wgSetTimezoneOffset(int offsetSeconds);
 
+/// Probe VK credentials in the main-app process before startVPNTunnel,
+/// to pre-solve any captcha while the main app still has full network
+/// access (Step 4's deferred-tunnel-settings architecture cuts off
+/// main-app network the moment startVPNTunnel runs, leaving the WebView
+/// captcha flow no path to VK).
+/// @param linkID VK call invite link ID (last path component of vk_link)
+/// @param vkHostIPsJSON Hostname→[]IP map (JSON), pre-resolved by main app
+/// @param savedSID Captcha SID from previous round, "" on first call
+/// @param savedKey success_token from user's WebView solve, "" on first
+/// @param savedToken1 step1 access_token from previous round, "" on first
+/// @param savedClientID VK client_id pinned for retry (must match savedToken1)
+/// @param savedTs captcha_ts from previous round, 0 on first
+/// @param savedAttempt captcha_attempt from previous round, 0 on first
+/// @return JSON string (caller must free()):
+///   {"status":"ok",       "turn_address":"...","turn_username":"...",
+///                         "turn_password":"..."}
+///   {"status":"captcha",  "captcha_url":"...","sid":"...","ts":...,
+///                         "attempt":...,"token1":"...","client_id":"...",
+///                         "is_rate_limit":false}
+///   {"status":"error",    "message":"..."}
+const char *wgProbeVKCreds(const char *linkID, const char *vkHostIPsJSON,
+                           const char *savedSID, const char *savedKey,
+                           const char *savedToken1, const char *savedClientID,
+                           double savedTs, double savedAttempt);
+
 /// Get library version.
 /// @return Version string
 const char *wgVersion(void);

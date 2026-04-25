@@ -45,6 +45,7 @@ type CaptchaRequiredError struct {
 	CaptchaTs      float64
 	CaptchaAttempt float64
 	Token1         string // step1 access_token — must be reused when retrying with captcha
+	ClientID       string // VK app client_id — must be reused with savedToken1 (token1 is bound to this client_id)
 	IsRateLimit    bool   // true when VK returned ERROR_LIMIT (PoW exhausted)
 }
 
@@ -88,7 +89,10 @@ func isTransientNetworkError(err error) bool {
 // solvedCaptchaTs/solvedCaptchaAttempt are from the original captcha error response.
 // savedToken1: if non-empty, reuse this access_token from step1 instead of fetching a new one
 // (the captcha is tied to the original step2 call which used this token1).
-func GetVKCreds(linkID string, captchaSolver CaptchaSolver, solvedCaptchaSID, solvedCaptchaKey string, solvedCaptchaTs, solvedCaptchaAttempt float64, savedToken1 string) (*TURNCreds, error) {
+// savedClientID: if non-empty, restrict the call to the matching credentials entry
+// (the saved token1 is bound to a specific client_id, so on a captcha-retry we MUST
+// reuse the same client). When empty, the normal client_id rotation+shuffle applies.
+func GetVKCreds(linkID string, captchaSolver CaptchaSolver, solvedCaptchaSID, solvedCaptchaKey string, solvedCaptchaTs, solvedCaptchaAttempt float64, savedToken1, savedClientID string) (*TURNCreds, error) {
 	// Outer retry loop guards against transient network/DNS errors at the very
 	// start of an extension launch — see isTransientNetworkError. We only loop
 	// if EVERY client_id failed with such an error in the same wave; as soon
@@ -105,13 +109,38 @@ func GetVKCreds(linkID string, captchaSolver CaptchaSolver, solvedCaptchaSID, so
 	const maxNetworkRetries = 12
 	const retryDelay = 4 * time.Second
 
+	// Build the credentials list to walk. Normally we shuffle the full list
+	// for per-app rate-limiting reasons, but when retrying with a saved
+	// captcha solution + saved token1 we MUST stick to the original
+	// client_id (token1 is bound to it; trying with a different client_id
+	// would make step2 reject the captcha).
+	var baseCreds []vkCredentials
+	if savedClientID != "" {
+		for _, vc := range vkCredentialsList {
+			if vc.ClientID == savedClientID {
+				baseCreds = []vkCredentials{vc}
+				log.Printf("vk: pinned to client_id=%s for captcha-retry", savedClientID)
+				break
+			}
+		}
+		if len(baseCreds) == 0 {
+			return nil, fmt.Errorf("savedClientID %q not in vkCredentialsList", savedClientID)
+		}
+	}
+
 	var lastErr error
 	for retry := 0; retry < maxNetworkRetries; retry++ {
-		// Rotate through client_id/client_secret pairs to reduce per-app rate limiting.
-		// Shuffle the list so each connection attempt uses a different order.
-		creds := make([]vkCredentials, len(vkCredentialsList))
-		copy(creds, vkCredentialsList)
-		mathrand.Shuffle(len(creds), func(i, j int) { creds[i], creds[j] = creds[j], creds[i] })
+		var creds []vkCredentials
+		if baseCreds != nil {
+			// Pinned mode — single client_id, no shuffle.
+			creds = baseCreds
+		} else {
+			// Rotate through client_id/client_secret pairs to reduce per-app rate limiting.
+			// Shuffle the list so each connection attempt uses a different order.
+			creds = make([]vkCredentials, len(vkCredentialsList))
+			copy(creds, vkCredentialsList)
+			mathrand.Shuffle(len(creds), func(i, j int) { creds[i], creds[j] = creds[j], creds[i] })
+		}
 
 		allTransient := true
 		for credIdx, vc := range creds {
@@ -344,7 +373,15 @@ func getVKCredsWithClientID(linkID string, vc vkCredentials, captchaSolver Captc
 			log.Printf("vk: all %d PoW attempts failed, returning CaptchaRequiredError to caller (rateLimit=%v)", maxPoWRetries, isRateLimit)
 
 			if captchaSolver == nil {
-				return nil, &CaptchaRequiredError{ImageURL: currentImg, SID: currentSID, CaptchaTs: currentTs, CaptchaAttempt: currentAttempt, Token1: token1, IsRateLimit: isRateLimit}
+				return nil, &CaptchaRequiredError{
+					ImageURL:       currentImg,
+					SID:            currentSID,
+					CaptchaTs:      currentTs,
+					CaptchaAttempt: currentAttempt,
+					Token1:         token1,
+					ClientID:       vc.ClientID,
+					IsRateLimit:    isRateLimit,
+				}
 			}
 			answer, err := captchaSolver(currentImg)
 			if err != nil {
@@ -523,6 +560,26 @@ func poolSizeForNumConns(n int) int {
 
 // newCredPool builds a pool sized to `size` conns with per-entry `ttl`.
 // The post-failure cooldown is fixed at 5 minutes.
+// seedSlot fills `slot` with externally-provided credentials, marked fresh
+// (ts=now). Used by NewProxy when the main app's pre-bootstrap captcha
+// flow already obtained TURN creds via wgProbeVKCreds — we plant them in
+// slot 0 so the first conn's get() returns them without any VK API call,
+// avoiding the .connecting-window deadlock where a cold credPool would
+// trigger another captcha request the main app can't service.
+func (cp *credPool) seedSlot(slot int, addr string, creds *TURNCreds) {
+	cp.mu.Lock()
+	defer cp.mu.Unlock()
+	for len(cp.pool) <= slot {
+		cp.pool = append(cp.pool, credPoolEntry{})
+	}
+	cp.pool[slot] = credPoolEntry{
+		addr:  addr,
+		creds: creds,
+		ts:    time.Now(),
+	}
+	log.Printf("credpool: seeded slot %d with externally-provided creds (addr=%s)", slot, addr)
+}
+
 func newCredPool(size int, ttl time.Duration, fetch func(bool) (string, *TURNCreds, error)) *credPool {
 	if size < 1 {
 		size = 1

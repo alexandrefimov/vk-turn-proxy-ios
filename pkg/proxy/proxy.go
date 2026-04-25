@@ -36,6 +36,10 @@ type Config struct {
 	NumConns      int           // number of concurrent connections (default 1)
 	CredPoolTTL   time.Duration // per-entry freshness in the cred pool; <=0 → default 10m
 	CaptchaSolver CaptchaSolver // called when VK requires captcha (may be nil)
+	// SeededTURN, if non-nil, pre-populates credPool slot 0 with these
+	// credentials so the first conn establishes immediately without
+	// hitting VK's API. Used by the pre-bootstrap captcha flow.
+	SeededTURN *TURNCreds
 }
 
 // Stats holds live tunnel statistics.
@@ -173,6 +177,29 @@ func NewProxy(cfg Config) *Proxy {
 	// captcha without the full per-conn PoW cost of a size=NumConns pool.
 	// TTL comes from Config; newCredPool falls back to 10m if <= 0.
 	p.credPool = newCredPool(poolSizeForNumConns(cfg.NumConns), cfg.CredPoolTTL, p.fetchFreshCreds)
+
+	// Seed slot 0 with pre-fetched TURN creds (from main app's pre-bootstrap
+	// captcha flow). The first conn's get() returns these without an API
+	// call, dodging the .connecting-window captcha deadlock.
+	if cfg.SeededTURN != nil {
+		// Build TURN host:port the same way fetchFreshCreds would,
+		// honoring TurnServer/TurnPort overrides if set.
+		turnHost, turnPort, err := net.SplitHostPort(cfg.SeededTURN.Address)
+		if err == nil {
+			if cfg.TurnServer != "" {
+				turnHost = cfg.TurnServer
+			}
+			if cfg.TurnPort != "" {
+				turnPort = cfg.TurnPort
+			}
+			addr := net.JoinHostPort(turnHost, turnPort)
+			p.credPool.seedSlot(0, addr, cfg.SeededTURN)
+			p.turnServerIP.Store(turnHost)
+		} else {
+			log.Printf("NewProxy: SeededTURN address %q is not host:port (%v) — ignoring", cfg.SeededTURN.Address, err)
+		}
+	}
+
 	return p
 }
 
@@ -1023,7 +1050,10 @@ func (p *Proxy) fetchFreshCreds(allowCaptchaBlock bool) (string, *TURNCreds, err
 	}
 
 	// solver=nil → CaptchaRequiredError surfaces instead of blocking.
-	creds, err := GetVKCreds(p.linkID, solver, solvedSID, solvedKey, solvedTs, solvedAttempt, savedToken1)
+	// savedClientID="" preserves existing mid-session behavior — proxy.go
+	// doesn't track client_id on captcha-retry today (independent of the
+	// pre-bootstrap captcha flow which does pin client_id strictly).
+	creds, err := GetVKCreds(p.linkID, solver, solvedSID, solvedKey, solvedTs, solvedAttempt, savedToken1, "")
 	if err != nil {
 		return "", nil, fmt.Errorf("get VK creds: %w", err)
 	}

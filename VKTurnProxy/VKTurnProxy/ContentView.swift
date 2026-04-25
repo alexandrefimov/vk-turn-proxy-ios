@@ -127,6 +127,10 @@ struct ContentView: View {
     // MARK: - Helpers
 
     private var statusColor: Color {
+        // pre-bootstrap captcha probe runs while NEVPNStatus is still
+        // .disconnected — show the "connecting" color so the UI reflects
+        // that connect() is actually working. See TunnelManager.connect.
+        if tunnel.preBootstrapInProgress { return .yellow }
         switch tunnel.status {
         case .connected: return .green
         case .connecting, .reasserting: return .yellow
@@ -136,6 +140,7 @@ struct ContentView: View {
     }
 
     private var statusText: String {
+        if tunnel.preBootstrapInProgress { return "Preparing..." }
         switch tunnel.status {
         case .connected: return "Connected"
         case .connecting: return "Connecting..."
@@ -148,6 +153,7 @@ struct ContentView: View {
     }
 
     private var buttonText: String {
+        if tunnel.preBootstrapInProgress { return "Disconnect" }
         switch tunnel.status {
         case .connected, .connecting: return "Disconnect"
         default: return "Connect"
@@ -155,6 +161,7 @@ struct ContentView: View {
     }
 
     private var buttonColor: Color {
+        if tunnel.preBootstrapInProgress { return .red }
         switch tunnel.status {
         case .connected, .connecting: return .red
         default: return .blue

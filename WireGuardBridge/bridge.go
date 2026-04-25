@@ -78,6 +78,18 @@ type ProxyConfig struct {
 	// in order until one accepts the connection, mirroring how the
 	// system resolver normally walks an A-record set.
 	VKHostIPs map[string][]string `json:"vk_host_ips,omitempty"`
+
+	// SeededTURN, if non-zero, is a pre-fetched TURN credential set
+	// from the main app's pre-bootstrap probe (see wgProbeVKCreds).
+	// When present, the proxy seeds credPool slot 0 with it so the
+	// first DTLS+TURN session establishes immediately, without any
+	// VK API call (no captcha risk in the .connecting window where
+	// the main app would be unable to display a WebView).
+	SeededTURN *struct {
+		Address  string `json:"address"`
+		Username string `json:"username"`
+		Password string `json:"password"`
+	} `json:"seeded_turn,omitempty"`
 }
 
 //export wgTurnOnWithTURN
@@ -214,6 +226,17 @@ func wgStartVKBootstrap(proxyConfigJSON *C.char) C.int32_t {
 		proxy.SetVKHostIPs(pcfg.VKHostIPs)
 	}
 
+	// Seeded TURN creds from main app's pre-bootstrap captcha flow (optional).
+	var seededTURN *proxy.TURNCreds
+	if pcfg.SeededTURN != nil && pcfg.SeededTURN.Address != "" {
+		seededTURN = &proxy.TURNCreds{
+			Username: pcfg.SeededTURN.Username,
+			Password: pcfg.SeededTURN.Password,
+			Address:  pcfg.SeededTURN.Address,
+		}
+		log.Printf("wgStartVKBootstrap: using pre-fetched TURN creds (addr=%s)", seededTURN.Address)
+	}
+
 	p := proxy.NewProxy(proxy.Config{
 		PeerAddr:     pcfg.PeerAddr,
 		TurnServer:   pcfg.TurnServer,
@@ -223,6 +246,7 @@ func wgStartVKBootstrap(proxyConfigJSON *C.char) C.int32_t {
 		UseUDP:       pcfg.UseUDP,
 		NumConns:     pcfg.NumConns,
 		CredPoolTTL:  time.Duration(pcfg.CredPoolTTLSeconds) * time.Second,
+		SeededTURN:   seededTURN,
 	})
 
 	// Proxy.Start blocks until the first conn is ready or a fatal error
@@ -533,6 +557,80 @@ func wgRefreshCaptchaURL(tunnelHandle C.int32_t) *C.char {
 
 	freshURL := entry.proxy.RefreshCaptchaURL()
 	return C.CString(freshURL)
+}
+
+// wgProbeVKCreds runs one round of GetVKCreds from the main app's process,
+// outside any tunnel session. Used by the pre-bootstrap captcha flow to
+// pre-solve VK captcha before startVPNTunnel — Step 4's deferred-tunnel-
+// settings architecture means the main app loses kernel-level network
+// access the moment startVPNTunnel is called, so any captcha encountered
+// after that has nowhere to go (extension can't show UI; main app can't
+// reach VK to render the WebView). Solving captcha here, while the main
+// app still has full network, avoids the deadlock.
+//
+// Inputs (all C strings; "" / 0 mean "not provided"):
+//   linkID, vkHostIPsJSON         — required
+//   savedSID, savedKey, savedTs,
+//   savedAttempt, savedToken1,
+//   savedClientID                 — set on retry after the user solved
+//                                   the captcha in a WebView; the entire
+//                                   tuple is reused as-is to retry step2.
+//
+// Returns a malloc'd C string with one of these JSON shapes; caller frees:
+//   {"status":"ok","success_token":"...","saved_token1":"...","client_id":"...",
+//    "turn_address":"host:port","turn_username":"...","turn_password":"..."}
+//   {"status":"captcha","captcha_url":"...","sid":"...","ts":...,
+//    "attempt":...,"token1":"...","client_id":"...","is_rate_limit":false}
+//   {"status":"error","message":"..."}
+//
+//export wgProbeVKCreds
+func wgProbeVKCreds(linkID, vkHostIPsJSON, savedSID, savedKey, savedToken1, savedClientID *C.char, savedTs, savedAttempt C.double) *C.char {
+	gLinkID := C.GoString(linkID)
+	gHostIPsJSON := C.GoString(vkHostIPsJSON)
+	gSavedSID := C.GoString(savedSID)
+	gSavedKey := C.GoString(savedKey)
+	gSavedToken1 := C.GoString(savedToken1)
+	gSavedClientID := C.GoString(savedClientID)
+
+	// Apply pre-resolved VK host IPs — same as we do in wgStartVKBootstrap,
+	// since the probe happens in the same extension process and the dialer
+	// (utls.go) reads from package-level state.
+	if gHostIPsJSON != "" {
+		var hostIPs map[string][]string
+		if err := json.Unmarshal([]byte(gHostIPsJSON), &hostIPs); err == nil {
+			proxy.SetVKHostIPs(hostIPs)
+			log.Printf("wgProbeVKCreds: applied %d pre-resolved VK host IPs", len(hostIPs))
+		}
+	}
+
+	resp := map[string]interface{}{}
+	creds, err := proxy.GetVKCreds(gLinkID, nil, gSavedSID, gSavedKey, float64(savedTs), float64(savedAttempt), gSavedToken1, gSavedClientID)
+	if err != nil {
+		if cerr, ok := err.(*proxy.CaptchaRequiredError); ok {
+			resp["status"] = "captcha"
+			resp["captcha_url"] = cerr.ImageURL
+			resp["sid"] = cerr.SID
+			resp["ts"] = cerr.CaptchaTs
+			resp["attempt"] = cerr.CaptchaAttempt
+			resp["token1"] = cerr.Token1
+			resp["client_id"] = cerr.ClientID
+			resp["is_rate_limit"] = cerr.IsRateLimit
+		} else {
+			resp["status"] = "error"
+			resp["message"] = err.Error()
+		}
+	} else {
+		resp["status"] = "ok"
+		resp["turn_address"] = creds.Address
+		resp["turn_username"] = creds.Username
+		resp["turn_password"] = creds.Password
+	}
+
+	out, mErr := json.Marshal(resp)
+	if mErr != nil {
+		out = []byte(fmt.Sprintf(`{"status":"error","message":"marshal failed: %s"}`, mErr.Error()))
+	}
+	return C.CString(string(out))
 }
 
 //export wgVersion
