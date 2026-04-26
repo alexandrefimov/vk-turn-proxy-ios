@@ -504,7 +504,13 @@ func (p *Proxy) waitCaptchaAndRestart() {
 				}
 			}
 			log.Printf("proxy: probing if VK still requires captcha (interval was %s)...", probeInterval)
-			p.credPool.invalidate()
+			// DON'T wholesale-invalidate the pool here. If a background fetcher
+			// (or another path) has filled any slot, that's the strongest
+			// signal VK has cooled down — preserve it for use, not discard it.
+			// Invalidate would destroy creds other conns may be running on,
+			// creating a self-amplifying decay loop. credPool.get below
+			// returns cached cred if available, otherwise fetches with
+			// allowCaptchaBlock=false (surfaces captcha as error w/o blocking).
 			_, _, _, probeErr := p.resolveTURNAddr(-1, false)
 			if probeErr == nil {
 				log.Printf("proxy: VK no longer requires captcha (probe succeeded), resuming")
@@ -1018,9 +1024,13 @@ func (p *Proxy) runConnection(sessCtx context.Context, linkID string, readyCh ch
 				case <-time.After(dormantDuration):
 					shortFailures = 0 // reset after dormancy
 					log.Printf("proxy: waking from dormancy, retrying connection")
-					// Invalidate all cached creds so we get fresh ones after
-					// dormancy (entire TURN pool likely gone server-side by now).
-					p.credPool.invalidate()
+					// DON'T wholesale-invalidate the pool here. This conn was
+					// dormant, but other conns may have been running fine on
+					// existing creds — wholesale-invalidate destroys them and
+					// forces every conn to re-fetch (which often hits captcha).
+					// If our retry uses a stale cred and gets a short-lived
+					// session, the per-slot invalidateEntry path (line ~1228)
+					// drops only that bad slot. Other conns keep their creds.
 				case <-sessCtx.Done():
 					return sessCtx.Err()
 				case <-p.ctx.Done():
@@ -1291,7 +1301,17 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 									}
 								}
 								log.Printf("proxy: captcha wait timeout, probing (interval was %s)...", turnProbeInterval)
-								p.credPool.invalidate()
+								// DON'T wholesale-invalidate the pool here.
+								// This is the main bleeder: a single conn stuck
+								// in captcha-wait would wipe the pool every 2
+								// minutes, destroying creds other conns are
+								// actively running on. credPool.get below
+								// returns cached cred if available — that's
+								// the strongest possible signal that VK has
+								// cooled down (some other path successfully
+								// fetched). If pool is empty, fetch happens
+								// with allowCaptchaBlock=false, so captcha
+								// surfaces as error and we wait another cycle.
 								_, _, _, probeErr := p.resolveTURNAddr(connIdx, false)
 								if probeErr == nil {
 									log.Printf("proxy: VK no longer requires captcha (probe succeeded), resuming")
