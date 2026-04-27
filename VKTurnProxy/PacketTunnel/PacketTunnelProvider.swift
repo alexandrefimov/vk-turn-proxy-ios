@@ -1,10 +1,21 @@
 import NetworkExtension
+import Network
 import os.log
 
 class PacketTunnelProvider: NEPacketTunnelProvider {
 
     private var tunnelHandle: Int32 = -1
     private let log = OSLog(subsystem: "com.vkturnproxy.tunnel", category: "PacketTunnel")
+
+    // NWPathMonitor: passively logs every meaningful network state change so
+    // we can correlate "can't assign requested address" / mass-reconnect
+    // events with the underlying iOS network reality (DHCP renewal, WiFi
+    // handoff, cellular handover, interface flap, etc.). Without this, the
+    // Go log only shows the consequence ("socket dead") but not the cause
+    // ("interface bounced").
+    private var pathMonitor: NWPathMonitor?
+    private let pathMonitorQueue = DispatchQueue(label: "com.vkturnproxy.tunnel.pathmonitor")
+    private var lastPathDescription: String?
 
     private func logMsg(_ msg: String) {
         os_log("%{public}s", log: log, type: .default, msg)
@@ -44,6 +55,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     override func startTunnel(options: [String : NSObject]?, completionHandler: @escaping (Error?) -> Void) {
 
         logMsg("startTunnel called")
+        startPathMonitoring()
 
         // Configure Go log file path so Go logs also go to the shared file
         if let path = SharedLogger.shared.logFilePath {
@@ -311,11 +323,62 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     }
 
     override func stopTunnel(with reason: NEProviderStopReason, completionHandler: @escaping () -> Void) {
+        stopPathMonitoring()
         if tunnelHandle >= 0 {
             wgTurnOff(tunnelHandle)
             tunnelHandle = -1
         }
         completionHandler()
+    }
+
+    // MARK: - NWPathMonitor (passive network state logging)
+
+    private func startPathMonitoring() {
+        let monitor = NWPathMonitor()
+        monitor.pathUpdateHandler = { [weak self] path in
+            guard let self = self else { return }
+            let desc = self.describePath(path)
+            // Deduplicate identical updates — NWPathMonitor sometimes fires
+            // multiple times on a single transition (DNS update, IPv6
+            // configuration, etc.) without meaningful change for us.
+            if desc != self.lastPathDescription {
+                self.logMsg("[PathMonitor] \(desc)")
+                self.lastPathDescription = desc
+            }
+        }
+        monitor.start(queue: pathMonitorQueue)
+        pathMonitor = monitor
+        logMsg("[PathMonitor] started")
+    }
+
+    private func stopPathMonitoring() {
+        pathMonitor?.cancel()
+        pathMonitor = nil
+        lastPathDescription = nil
+    }
+
+    private func describePath(_ path: Network.NWPath) -> String {
+        let status: String
+        switch path.status {
+        case .satisfied: status = "satisfied"
+        case .unsatisfied: status = "unsatisfied"
+        case .requiresConnection: status = "requiresConnection"
+        @unknown default: status = "unknown"
+        }
+        var iface = "none"
+        if path.usesInterfaceType(Network.NWInterface.InterfaceType.wifi) { iface = "wifi" }
+        else if path.usesInterfaceType(Network.NWInterface.InterfaceType.cellular) { iface = "cellular" }
+        else if path.usesInterfaceType(Network.NWInterface.InterfaceType.wiredEthernet) { iface = "wired" }
+        else if path.usesInterfaceType(Network.NWInterface.InterfaceType.loopback) { iface = "loopback" }
+        else if path.usesInterfaceType(Network.NWInterface.InterfaceType.other) { iface = "other" }
+        var attrs: [String] = []
+        if path.isExpensive { attrs.append("expensive") }
+        if path.isConstrained { attrs.append("constrained") }
+        if path.supportsIPv4 { attrs.append("v4") }
+        if path.supportsIPv6 { attrs.append("v6") }
+        if path.supportsDNS { attrs.append("dns") }
+        let attrStr = attrs.isEmpty ? "" : " [\(attrs.joined(separator: ","))]"
+        return "\(status) iface=\(iface)\(attrStr)"
     }
 
     // MARK: - Network Settings
