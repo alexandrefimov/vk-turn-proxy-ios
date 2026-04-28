@@ -537,8 +537,11 @@ func (p *Proxy) waitCaptchaAndRestart() {
 			// creating a self-amplifying decay loop. credPool.get below
 			// returns cached cred if available, otherwise fetches with
 			// allowCaptchaBlock=false (surfaces captcha as error w/o blocking).
-			_, _, _, probeErr := p.resolveTURNAddr(-1, false)
+			_, _, probeSlot, probeErr := p.resolveTURNAddr(-1, false)
+			// Probe is non-consuming; release whatever slot got acquired so
+			// it doesn't leak quota count for a cred we never used.
 			if probeErr == nil {
+				p.credPool.release(probeSlot)
 				log.Printf("proxy: VK no longer requires captcha (probe succeeded), resuming")
 				p.captchaImageURL.Store("")
 				p.Resume()
@@ -1191,6 +1194,14 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 	if err != nil {
 		return err
 	}
+	// Each successful resolveTURNAddr increments cp.pool[credSlot].active
+	// to enforce the per-cred quota (~10 simultaneous allocations on VK).
+	// A defer pinned to currentSlot via closure releases the LATEST slot
+	// at function exit — important because the reconnect loop below may
+	// switch us to a different slot, and we need to release whatever
+	// slot we're holding when this conn's session finally ends.
+	currentSlot := credSlot
+	defer func() { p.credPool.release(currentSlot) }()
 
 	// Start TURN relay FIRST — DTLS handshake goes through it.
 	// TURN runs until it fails naturally (no forced lifetime).
@@ -1426,7 +1437,12 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 								// fetched). If pool is empty, fetch happens
 								// with allowCaptchaBlock=false, so captcha
 								// surfaces as error and we wait another cycle.
-								_, _, _, probeErr := p.resolveTURNAddr(connIdx, false)
+								_, _, probeSlot, probeErr := p.resolveTURNAddr(connIdx, false)
+								// Probe is non-consuming; release whatever slot
+								// got acquired (or no-op if probeSlot == -1).
+								if probeErr == nil {
+									p.credPool.release(probeSlot)
+								}
 								if probeErr == nil {
 									log.Printf("proxy: VK no longer requires captcha (probe succeeded), resuming")
 									p.captchaImageURL.Store("")
@@ -1482,7 +1498,15 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 				// Track which cred slot this new TURN session will run on
 				// so the next short-session detection invalidates the right
 				// slot rather than the nominal connIdx.
+				//
+				// Release the previous slot's active count: resolveTURNAddr
+				// already incremented active for the new acquire (whether or
+				// not it picked the same slot), and the previous active was
+				// from this conn's prior holding. Always one release to
+				// balance, regardless of whether newSlot == credSlot.
+				p.credPool.release(credSlot)
 				credSlot = newSlot
+				currentSlot = newSlot
 
 				log.Printf("proxy: [conn %d, cred %d] starting new TURN session (attempt %d)", connIdx, credSlot, retries+1)
 				turnStart = time.Now()
@@ -1599,6 +1623,8 @@ func (p *Proxy) runDirectSession(sessCtx context.Context, linkID string, readyCh
 	if err != nil {
 		return err
 	}
+	currentSlot := credSlot
+	defer func() { p.credPool.release(currentSlot) }()
 
 	turnDone := make(chan error, 1)
 	go func() {
@@ -1650,7 +1676,11 @@ func (p *Proxy) runDirectSession(sessCtx context.Context, linkID string, readyCh
 					}
 					continue
 				}
+				// Release the previous slot's quota slot; resolveTURNAddr
+				// has already incremented active for the new acquire.
+				p.credPool.release(credSlot)
 				credSlot = newSlot
+				currentSlot = newSlot
 				log.Printf("proxy: [conn %d, cred %d] starting new direct TURN session", connIdx, credSlot)
 				turnDone = make(chan error, 1)
 				go func() {
