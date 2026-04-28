@@ -138,6 +138,19 @@ class TunnelManager: ObservableObject {
         preBootstrapInProgress = true
         defer { preBootstrapInProgress = false }
 
+        // Redirect Go log output (from wgProbeVKCreds and downstream) to the
+        // shared SharedLogger file. The Go runtime in the main-app process is
+        // SEPARATE from the one in the Network Extension, and the extension's
+        // wgSetLogFilePath call only configures its own runtime. Without this,
+        // pre-bootstrap Go logs (vk:, pow:, slider: etc.) go to stderr and
+        // disappear. Both processes append to the same file via the AppGroup
+        // path — fine for diagnostic logs.
+        if let path = SharedLogger.shared.logFilePath {
+            path.withCString { ptr in
+                wgSetLogFilePath(UnsafeMutablePointer(mutating: ptr))
+            }
+        }
+
         do {
             let manager = try await getOrCreateManager()
 
