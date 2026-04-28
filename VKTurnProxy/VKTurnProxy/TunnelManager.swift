@@ -279,24 +279,43 @@ class TunnelManager: ObservableObject {
             // pre-fetched TURN creds.
             let proxyConfig = buildProxyConfig(config: config, vkHostIPs: vkHostIPs, seededTURN: seeded)
 
-            // Pick serverAddress. Prefer the TURN relay IP cached from a
-            // previous session by the extension (via AppGroup UserDefaults):
-            // this is what iOS exempts from the tunnel per Apple's documented
-            // serverAddress-always-excluded rule, so our TURN UDP doesn't
-            // loop back through the tunnel once includeAllNetworks=true ships
-            // in Step 4. Falls back to the VPS peerAddress on first launch
-            // when the extension hasn't recorded a TURN IP yet — bootstrap
-            // still works because excludedRoutes (current mode) still covers
-            // the TURN relay.
+            // Pick serverAddress. iOS always excludes serverAddress from the
+            // tunnel per Apple's documented rule (essential for Step 4's
+            // includeAllNetworks=true so TURN UDP doesn't loop back through
+            // the tunnel — recursive routing makes the dataplane unusable).
+            //
+            // Priority order:
+            //   1. The TURN IP we JUST got from pre-bootstrap (seeded.address).
+            //      This is the address conn 0 will actually allocate against,
+            //      so it MUST be the one iOS exempts. Critical when VK rotates
+            //      its TURN infrastructure (observed: VK migrated from
+            //      155.212.197.38 to 90.156.234.242, and using the cached old
+            //      IP caused recursive routing → 0.5 Mbps speeds).
+            //   2. The cached TURN IP from a previous session — used only if
+            //      pre-bootstrap somehow didn't run (defensive; normally we
+            //      always have seeded.address here).
+            //   3. The VPS peerAddress as last-resort fallback.
             let shared = UserDefaults(suiteName: "group.com.vkturnproxy.app")
             let savedTurnIP = shared?.string(forKey: "lastTurnServerIP") ?? ""
+            // Parse host from seeded.address ("host:port" format).
+            let seededHost: String = {
+                let parts = seeded.address.split(separator: ":", maxSplits: 1).map(String.init)
+                return parts.first ?? ""
+            }()
             let serverAddress: String
-            if !savedTurnIP.isEmpty {
+            if !seededHost.isEmpty {
+                serverAddress = seededHost
+                SharedLogger.shared.log("[AppDebug] TunnelManager.connect: using freshly-fetched TURN IP \(seededHost) as serverAddress")
+                // Update the cache so future fallbacks are also fresh.
+                if seededHost != savedTurnIP {
+                    shared?.set(seededHost, forKey: "lastTurnServerIP")
+                }
+            } else if !savedTurnIP.isEmpty {
                 serverAddress = savedTurnIP
-                SharedLogger.shared.log("[AppDebug] TunnelManager.connect: using cached TURN IP \(savedTurnIP) as serverAddress")
+                SharedLogger.shared.log("[AppDebug] TunnelManager.connect: using cached TURN IP \(savedTurnIP) as serverAddress (no seeded address)")
             } else {
                 serverAddress = config.peerAddress
-                SharedLogger.shared.log("[AppDebug] TunnelManager.connect: no cached TURN IP, using peerAddress \(config.peerAddress) as serverAddress")
+                SharedLogger.shared.log("[AppDebug] TunnelManager.connect: no TURN IP available, using peerAddress \(config.peerAddress) as serverAddress")
             }
 
             // Set provider configuration
