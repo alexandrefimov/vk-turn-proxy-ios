@@ -1169,10 +1169,30 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 	// Start TURN relay FIRST — DTLS handshake goes through it.
 	// TURN runs until it fails naturally (no forced lifetime).
 	// The pion/turn client handles allocation refresh automatically.
-	turnDone := make(chan error, 1)
-	go func() {
-		turnDone <- p.runTURN(connCtx, turnAddr, creds, conn2, connIdx)
-	}()
+	//
+	// spawnTURN shape: the goroutine writes the runTURN result to its
+	// returned channel. cancelOnError=true is used during bootstrap so that
+	// a fast TURN failure (e.g. 486 quota response in ~100ms) immediately
+	// cancels connCtx and unblocks dialDTLS — without this, dialDTLS sat
+	// for its full 15s timeout waiting for handshake bytes that would
+	// never come, wasting ~14.5s per failed bootstrap attempt.
+	//
+	// In the reconnect loop below, subsequent runTURN spawns use
+	// cancelOnError=false: the loop itself handles failure (chooses delay,
+	// fetches fresh creds, re-spawns), and a connCancel from inside the
+	// runTURN goroutine would kill the loop on the very first failure.
+	spawnTURN := func(addr string, c *TURNCreds, cancelOnError bool) chan error {
+		ch := make(chan error, 1)
+		go func() {
+			err := p.runTURN(connCtx, addr, c, conn2, connIdx)
+			ch <- err
+			if err != nil && cancelOnError {
+				connCancel()
+			}
+		}()
+		return ch
+	}
+	turnDone := spawnTURN(turnAddr, creds, true)
 
 	// DTLS handshake — packets go through conn1 → conn2 → TURN relay → peer
 	dtlsStart := time.Now()
@@ -1227,9 +1247,12 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 		defer connCancel() // if TURN loop gives up, kill DTLS too
 		turnStart := time.Now()
 		for {
-			// Wait for current TURN to finish (it runs until failure)
+			// Wait for current TURN to finish; capture err so the
+			// invalidate / delay decisions below can branch on the
+			// failure type instead of guessing from session duration.
+			var turnErr error
 			select {
-			case <-turnDone:
+			case turnErr = <-turnDone:
 			case <-connCtx.Done():
 				return
 			}
@@ -1240,23 +1263,48 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 
 			turnAge := time.Since(turnStart)
 			p.reconnects.Add(1)
-			log.Printf("proxy: [conn %d] TURN session ended after %s, reconnecting...", connIdx, turnAge.Round(time.Second))
+			log.Printf("proxy: [conn %d] TURN session ended after %s (err=%v), reconnecting...",
+				connIdx, turnAge.Round(time.Second), turnErr)
 
-			// If TURN session was short-lived, the cred that carried it is
-			// likely server-side expired. Invalidate the pool slot that
-			// actually produced that cred (may differ from connIdx if we
-			// were running on a fallback) so only the bad cred is dropped;
-			// other conns sharing a different cred stay fresh.
-			if turnAge < 30*time.Second {
+			// Decide whether to invalidate the cred slot.
+			//
+			// Previous heuristic was time-based (turnAge < 30s ⇒ assume
+			// cred expired ⇒ invalidate). That conflated three cases:
+			//   1. Auth error (401/403): cred truly stale → invalidate.
+			//   2. 486 quota: cred fine, just too many parallel allocs
+			//      on it. With NumConns > 10 (or even ~10 under
+			//      reconnect storm), the 11th-Nth attempt always gets
+			//      486 fast → time-based heuristic invalidated a
+			//      working cred and killed the pool for the other 10
+			//      conns. Observed: vpn.wifi.18.log at 20:28:17, where
+			//      a single 486 from a redundant conn killed slot 5
+			//      mid-session.
+			//   3. Network blip / iOS socket race: cred unrelated.
+			//
+			// New: invalidate only on auth errors. Quota and network
+			// errors keep the cred — caller's reconnect handles them
+			// via the delay choice below.
+			if isAuthError(turnErr) {
 				p.credPool.invalidateEntry(credSlot)
-				log.Printf("proxy: [conn %d] short-lived TURN session (%s), invalidated cred slot %d",
-					connIdx, turnAge.Round(time.Second), credSlot)
+				log.Printf("proxy: [conn %d] auth error (%v), invalidated cred slot %d",
+					connIdx, turnErr, credSlot)
 			}
 
-			// Brief pause before reconnecting (longer for short-lived sessions)
-			delay := 500 * time.Millisecond
-			if turnAge < 5*time.Second {
+			// Pause before reconnecting. 486 quota needs the longest
+			// delay — VK's allocation token bucket refills slowly
+			// (empirically ~30s for 1 token after the initial burst of
+			// ~10), so 5s here gives a partial refill window before
+			// the next attempt. Other short-lived failures keep the
+			// existing 3s pause; normal reconnects after long sessions
+			// just need 500ms.
+			var delay time.Duration
+			switch {
+			case isQuotaError(turnErr):
+				delay = 5 * time.Second
+			case turnAge < 5*time.Second:
 				delay = 3 * time.Second
+			default:
+				delay = 500 * time.Millisecond
 			}
 			select {
 			case <-time.After(delay):
@@ -1412,10 +1460,9 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 
 				log.Printf("proxy: [conn %d, cred %d] starting new TURN session (attempt %d)", connIdx, credSlot, retries+1)
 				turnStart = time.Now()
-				turnDone = make(chan error, 1)
-				go func() {
-					turnDone <- p.runTURN(connCtx, newAddr, newCreds, conn2, connIdx)
-				}()
+				// cancelOnError=false: this loop owns reconnection; an
+				// inner connCancel would kill the loop on first failure.
+				turnDone = spawnTURN(newAddr, newCreds, false)
 				break
 			}
 			if retries >= maxTurnReconnectRetries {
@@ -1974,3 +2021,39 @@ func (l *turnLogger) maybeCountTransientError(msg string) {
 // sanitizeLog removes null bytes from log messages (VK TURN server
 // includes trailing \0 in STUN error reason phrases).
 func sanitizeLog(s string) string { return strings.ReplaceAll(s, "\x00", "") }
+
+// isAuthError returns true if err looks like a TURN/STUN authentication
+// failure (401 Unauthorized, 403 Forbidden), meaning the credentials are
+// server-side stale and the cred pool slot should be invalidated.
+//
+// pion/turn surfaces these as e.g.
+//   "TURN allocate: Allocate error response (error 401: Unauthorized)"
+// We string-match the numeric codes because pion does not export typed
+// error wrappers we could errors.As against — the Allocate error is
+// constructed via fmt.Errorf with the integer formatted into the message.
+func isAuthError(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, "error 401:") || strings.Contains(s, "error 403:")
+}
+
+// isQuotaError returns true if err is a 486 Allocation Quota Reached
+// response from the TURN server. The cred is fine; the server is just
+// telling us to back off because either (a) too many parallel
+// allocations are already active on this cred, or (b) the cred's
+// allocation token bucket is empty and we should retry after refill
+// (~30s for one token after the initial burst of ~10).
+//
+// Crucially, NOT a signal that the cred should be invalidated — earlier
+// versions of this code conflated 486 with 401 via a time-based
+// heuristic and wholesale-invalidated working creds whenever a single
+// surplus conn hit the quota cap. See vpn.wifi.18.log 20:28:17 for a
+// case where this killed the only living cred slot mid-session.
+func isQuotaError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(err.Error(), "error 486:")
+}
