@@ -1278,10 +1278,15 @@ struct TunnelConfig {
     var numConnections: Int = 10 // configurable from Settings (VK allows max ~10 allocations)
     // Per-entry TTL for the cred pool. Drives when the background grower
     // considers a slot "stale" and tries to refetch it, and when a get()
-    // / fallback stops treating a slot as fresh. Default 600s (10 min).
-    // Longer = less PoW/VK pressure but more risk of caching creds past
-    // their server-side validity.
-    var credPoolTTLSeconds: Int = 600
+    // / fallback stops treating a slot as fresh. Default 4 hours.
+    // Was 10 min — empirically (2 days of testing 27-29 April) we never
+    // observed a single auth-error from VK on TURN allocate, so creds
+    // appear to live much longer than 10 min server-side. Higher TTL
+    // means fewer captcha encounters from background grower's TTL
+    // refresh cycle. If a cred actually does expire, the next allocate
+    // returns 401, isAuthError catches it, the slot is invalidated,
+    // and the conn re-fetches.
+    var credPoolTTLSeconds: Int = 14400
     // Per-slot cooldown after a failed fetch (typically captcha required).
     // Slot stays in cooldown for this long before being eligible to retry.
     // Shorter = pool recovers faster when VK cools down, longer = less VK

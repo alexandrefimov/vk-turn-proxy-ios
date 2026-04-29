@@ -2211,20 +2211,24 @@ func (l *turnLogger) Infof(format string, args ...interface{}) {}
 func (l *turnLogger) Warn(msg string) {
 	log.Printf("pion/%s: WARN: %s", l.scope, sanitizeLog(msg))
 	l.maybeCountTransientError(msg)
+	l.maybeFlagAuthError(msg)
 }
 func (l *turnLogger) Warnf(format string, args ...interface{}) {
 	msg := fmt.Sprintf(format, args...)
 	log.Printf("pion/%s: WARN: %s", l.scope, sanitizeLog(msg))
 	l.maybeCountTransientError(msg)
+	l.maybeFlagAuthError(msg)
 }
 func (l *turnLogger) Error(msg string) {
 	log.Printf("pion/%s: ERROR: %s", l.scope, sanitizeLog(msg))
 	l.maybeCountTransientError(msg)
+	l.maybeFlagAuthError(msg)
 }
 func (l *turnLogger) Errorf(format string, args ...interface{}) {
 	msg := fmt.Sprintf(format, args...)
 	log.Printf("pion/%s: ERROR: %s", l.scope, sanitizeLog(msg))
 	l.maybeCountTransientError(msg)
+	l.maybeFlagAuthError(msg)
 }
 
 // maybeCountTransientError bumps the per-Proxy silent-degradation counter when
@@ -2254,6 +2258,26 @@ func (l *turnLogger) Errorf(format string, args ...interface{}) {
 // This is safe because "No transaction for Refresh error response" is
 // logged by pion at Debugf level, not Warnf/Errorf, so it never reaches
 // this function.
+// maybeFlagAuthError surfaces a prominent log line whenever pion logs any
+// auth-related error from VK (401 Unauthorized, 403 Forbidden). Empirically
+// over 2+ days of testing (April 2026) we have NEVER observed these — TURN
+// allocations on a given cred work indefinitely as far as we can tell. The
+// dedicated marker exists so that IF a cred actually does expire mid-session
+// (most likely visible as "Fail to refresh permissions" with a 401 code from
+// VK), we'll see it immediately and can react. Includes the scope (turnc /
+// channelbind / etc.) and the original pion message.
+//
+// This is BESIDES our own runTURN-level isAuthError handling, which catches
+// auth errors on the next Allocate retry. The pion-logger path catches them
+// during steady-state Refresh cycles, before any reconnect would happen.
+func (l *turnLogger) maybeFlagAuthError(msg string) {
+	if !strings.Contains(msg, "401") && !strings.Contains(msg, "403") &&
+		!strings.Contains(msg, "Unauthorized") && !strings.Contains(msg, "Forbidden") {
+		return
+	}
+	log.Printf("proxy: PION AUTH ERROR DETECTED in %s: %s", l.scope, sanitizeLog(msg))
+}
+
 func (l *turnLogger) maybeCountTransientError(msg string) {
 	if l.proxy == nil {
 		return
