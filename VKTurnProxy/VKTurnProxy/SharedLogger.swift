@@ -73,11 +73,31 @@ class SharedLogger {
         }
     }
 
-    /// URL of the log file (for sharing via UIActivityViewController).
+    /// URL of the live log file. Used by the Go bridge as the write
+    /// target — must point at the SAME file appendData writes to (i.e.
+    /// the current, non-archived one), so do NOT use this for export.
     var logFileURL: URL? { fileURL }
 
     /// Absolute path string (for passing to Go bridge).
     var logFilePath: String? { fileURL?.path }
+
+    /// Build a single-file snapshot containing archive (.1) + current
+    /// log, suitable for Share-sheet export. Returns the URL of a temp
+    /// file owned by the app's tmp directory; iOS reaps tmp files
+    /// automatically, no cleanup needed by the caller. Synchronous —
+    /// called from the UI thread when the user taps Share.
+    ///
+    /// Without this, Share-sheet sent ONLY the current vpn.log and
+    /// silently dropped vpn.log.1, hiding however-many hours of
+    /// pre-rotation history the archive still held.
+    func exportSnapshotURL() -> URL? {
+        guard let url = fileURL else { return nil }
+        let combined = readLogs() // archive + current concatenated
+        let dst = FileManager.default.temporaryDirectory
+            .appendingPathComponent("vpn-export.log")
+        try? combined.write(to: dst, atomically: true, encoding: .utf8)
+        return FileManager.default.fileExists(atPath: dst.path) ? dst : url
+    }
 
     // MARK: - Private
 

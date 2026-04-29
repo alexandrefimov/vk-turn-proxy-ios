@@ -688,7 +688,10 @@ struct LogsView: View {
         .onAppear { loadLogs() }
         .onReceive(timer) { _ in loadLogs() }
         .sheet(isPresented: $showShareSheet) {
-            if let url = SharedLogger.shared.logFileURL,
+            // Export the COMBINED log (archive .1 + current) as a single
+            // temp file so the user gets the full history, not just the
+            // tail since the last rotation.
+            if let url = SharedLogger.shared.exportSnapshotURL(),
                FileManager.default.fileExists(atPath: url.path) {
                 ShareSheet(activityItems: [url])
             }
