@@ -708,7 +708,8 @@ func (p *Proxy) runWatchdog() {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
-	var lowConnSince time.Time // when we first noticed too few connections
+	var lowConnSince time.Time  // when we first noticed too few connections
+	var zeroConnSince time.Time // when we first noticed zero connections
 
 	for {
 		select {
@@ -777,6 +778,36 @@ func (p *Proxy) runWatchdog() {
 				}
 			} else {
 				lowConnSince = time.Time{} // reset if healthy
+			}
+
+			// Condition 4: Zero active connections for too long.
+			// Conditions 1 and 2 both require active>0, so a hard
+			// bootstrap dead-end (e.g. ForceReconnect → all 4 retry
+			// attempts hit cred-486 → "first connection failed" → no
+			// more retries) leaves the watchdog mute and the tunnel
+			// stays down indefinitely. Observed in vpn.lte.0.log on
+			// 2026-04-29 at 09:05:52 — log just trails into background
+			// captcha activity with 0 active conns and no recovery.
+			//
+			// 5-minute threshold is long enough that the initial
+			// startup phase (typically 5-30s but can stretch to several
+			// minutes if the cred pool needs to fetch through captcha)
+			// finishes without us spuriously retrying it. After that,
+			// firing every 5 minutes gives saturated slots time to
+			// recover (10-minute markSaturated cooldown) between
+			// attempts and gives the cred-pool grower a window to fill
+			// new slots.
+			if active == 0 {
+				if zeroConnSince.IsZero() {
+					zeroConnSince = time.Now()
+				} else if time.Since(zeroConnSince) > 5*time.Minute {
+					log.Printf("proxy: watchdog — 0 active conns for 5+ min, forcing reconnect")
+					zeroConnSince = time.Time{}
+					p.ForceReconnect()
+					continue
+				}
+			} else {
+				zeroConnSince = time.Time{}
 			}
 		case <-p.ctx.Done():
 			return
@@ -1239,6 +1270,21 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 		select {
 		case turnErr := <-turnDone:
 			if turnErr != nil {
+				// Bootstrap-path equivalent of the reconnect-loop's
+				// markSaturated branch. Without this, a quota error during
+				// the first allocation on this conn would surface as a
+				// generic "DTLS failed" and the bootstrap retry loop in
+				// startConnections would burn its 4-attempt budget retrying
+				// the same saturated slot.
+				if isQuotaError(turnErr) {
+					p.credPool.markSaturated(credSlot, 10*time.Minute)
+					log.Printf("proxy: [conn %d] bootstrap quota error on slot %d, marked VK-saturated for 10m",
+						connIdx, credSlot)
+				} else if isAuthError(turnErr) {
+					p.credPool.invalidateEntry(credSlot)
+					log.Printf("proxy: [conn %d] bootstrap auth error on slot %d, invalidated",
+						connIdx, credSlot)
+				}
 				return fmt.Errorf("DTLS failed: %w (TURN error: %v)", err, turnErr)
 			}
 		default:
@@ -1325,6 +1371,20 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 				p.credPool.invalidateEntry(credSlot)
 				log.Printf("proxy: [conn %d] auth error (%v), invalidated cred slot %d",
 					connIdx, turnErr, credSlot)
+			} else if isQuotaError(turnErr) {
+				// VK's allocation count for this cred is at 10 from prior
+				// (possibly already-killed-on-our-side) allocations. The
+				// cred is fine; VK just won't accept more on it for the
+				// remainder of those allocations' TURN lifetime (~10 min).
+				// Mark the slot saturated so subsequent get() calls steer
+				// elsewhere instead of looping on the same cred. Without
+				// this, ForceReconnect after a watchdog trip is a deadlock
+				// (vpn.lte.0.log on 2026-04-29: 4 bootstrap attempts all
+				// hit cred 0 → 486 → "first connection failed" → no more
+				// retries since watchdog conditions all require active>0).
+				p.credPool.markSaturated(credSlot, 10*time.Minute)
+				log.Printf("proxy: [conn %d] quota error on slot %d, marked VK-saturated for 10m",
+					connIdx, credSlot)
 			}
 
 			// Pause before reconnecting. 486 quota needs the longest

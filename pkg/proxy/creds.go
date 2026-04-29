@@ -519,6 +519,20 @@ type credPoolEntry struct {
 	// calling release() when the cred is no longer in use (typically when
 	// the TURN session ends or the conn switches to a different slot).
 	active int
+
+	// saturatedUntil: VK-side quota saturation marker. When a runTURN
+	// allocation fails with 486 Allocation Quota Reached, the cred is
+	// marked as saturated by the proxy: VK still considers prior client-
+	// side-killed allocations alive on this cred for the remainder of
+	// their TURN lifetime (~600s default). Our local active count says 0
+	// after we release them, but VK's count is still 10 → next Allocate
+	// gets 486 immediately. Without this marker the proxy would loop on
+	// the same cred forever; with it, get() Phase 1 skips saturated
+	// slots and the conn falls through to Phase 2 (fetch a fresh cred
+	// in another slot) or returns "no slot available" so the caller
+	// backs off. Cleared automatically when the slot is replaced via
+	// fresh fetch (since the new cred has a clean VK quota).
+	saturatedUntil time.Time
 }
 
 // credPool holds up to `size` independent TURN credential slots, one per
@@ -709,20 +723,30 @@ func (cp *credPool) get(connIdx int, allowCaptchaBlock bool) (string, *TURNCreds
 		return out
 	}
 
-	// Phase 1: any fresh slot with quota room? Prefer ownSlot.
+	// Phase 1: any fresh slot with quota room? Prefer ownSlot. Skip
+	// slots marked as VK-side saturated — their cred is still valid
+	// (will be reused once the cooldown expires) but VK has lingering
+	// allocations from before that are blocking new ones.
+	now := time.Now()
 	for _, slot := range candidatesOrdered() {
-		if cp.isFreshLocked(slot) && cp.pool[slot].active < connsPerSlot {
-			cp.pool[slot].active++
-			e := cp.pool[slot]
-			cp.mu.Unlock()
-			tag := "own slot"
-			if slot != ownSlot {
-				tag = "fallback"
-			}
-			log.Printf("credpool: conn %d acquired slot %d (%s, active=%d/%d, age %s)",
-				connIdx, slot, tag, e.active, connsPerSlot, time.Since(e.ts).Round(time.Second))
-			return e.addr, e.creds, slot, nil
+		if !cp.isFreshLocked(slot) || cp.pool[slot].active >= connsPerSlot {
+			continue
 		}
+		if now.Before(cp.pool[slot].saturatedUntil) {
+			log.Printf("credpool: conn %d skipping slot %d (VK-saturated for %s more)",
+				connIdx, slot, cp.pool[slot].saturatedUntil.Sub(now).Round(time.Second))
+			continue
+		}
+		cp.pool[slot].active++
+		e := cp.pool[slot]
+		cp.mu.Unlock()
+		tag := "own slot"
+		if slot != ownSlot {
+			tag = "fallback"
+		}
+		log.Printf("credpool: conn %d acquired slot %d (%s, active=%d/%d, age %s)",
+			connIdx, slot, tag, e.active, connsPerSlot, time.Since(e.ts).Round(time.Second))
+		return e.addr, e.creds, slot, nil
 	}
 
 	// Phase 2: no usable fresh slot. Pick a fetch target — first
@@ -730,7 +754,7 @@ func (cp *credPool) get(connIdx int, allowCaptchaBlock bool) (string, *TURNCreds
 	// being fetched. Prefer ownSlot here too. Skipping fresh-saturated
 	// slots is critical: replacing the cred there would orphan the
 	// 10 conns currently bound to it.
-	now := time.Now()
+	now = time.Now()
 	target := -1
 	for _, slot := range candidatesOrdered() {
 		if cp.isFreshLocked(slot) {
@@ -808,6 +832,30 @@ func (cp *credPool) release(slot int) {
 	if cp.pool[slot].active > 0 {
 		cp.pool[slot].active--
 	}
+}
+
+// markSaturated marks slot as VK-side quota-saturated until time.Now()+
+// duration. Phase 1 of get() will skip the slot during this window even
+// if it's otherwise fresh — the cred is fine, but VK still has lingering
+// allocations from before that prevent us from acquiring new ones.
+//
+// Called by the proxy's reconnect path when runTURN fails with 486
+// Allocation Quota Reached. The 10-minute window matches VK's default
+// TURN allocation lifetime: after that, VK's leftover allocations
+// expire server-side and the cred becomes usable again. If we're still
+// hitting 486 after the saturation expires, the next call will re-mark.
+//
+// Idempotent for invalid slot indices.
+func (cp *credPool) markSaturated(slot int, duration time.Duration) {
+	if slot < 0 {
+		return
+	}
+	cp.mu.Lock()
+	defer cp.mu.Unlock()
+	if slot >= cp.size || slot >= len(cp.pool) {
+		return
+	}
+	cp.pool[slot].saturatedUntil = time.Now().Add(duration)
 }
 
 // tryFill is called by the background grower (see Proxy.growCredPool) to
