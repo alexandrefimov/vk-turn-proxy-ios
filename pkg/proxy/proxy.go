@@ -1534,6 +1534,21 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 			// we've truly hit a dead-end.
 			const maxTurnReconnectRetries = 12
 			retries := 0
+			// Release the old slot's active count BEFORE entering the
+			// retry loop, so the upcoming get() sees realistic free
+			// quota. Critical during network handover (vpn.wifi-lte.0.log
+			// 2026-04-29 14:19:30): with 30 conns simultaneously falling
+			// into reconnect, if release happens AFTER acquire then their
+			// 10 active counts on each cred slot persist while every one
+			// of them is queueing for a new slot. Phase 1 sees all slots
+			// active=10/10, Phase 2 finds nothing fetchable (all on
+			// cooldown or being fetched by other goroutines) → "no slot
+			// available" cascade for ~all 30. With release-first, the
+			// active counts drop to 0 immediately, slots become acquirable
+			// in Phase 1.
+			p.credPool.release(credSlot)
+			credSlot = -1
+			currentSlot = -1
 			for retries < maxTurnReconnectRetries {
 				if connCtx.Err() != nil {
 					return
@@ -1664,16 +1679,9 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 					continue
 				}
 
-				// Track which cred slot this new TURN session will run on
-				// so the next short-session detection invalidates the right
-				// slot rather than the nominal connIdx.
-				//
-				// Release the previous slot's active count: resolveTURNAddr
-				// already incremented active for the new acquire (whether or
-				// not it picked the same slot), and the previous active was
-				// from this conn's prior holding. Always one release to
-				// balance, regardless of whether newSlot == credSlot.
-				p.credPool.release(credSlot)
+				// Track which cred slot this new TURN session will run on.
+				// Old slot was already released before the retry loop; we
+				// just adopt the new one here (no double-release path).
 				credSlot = newSlot
 				currentSlot = newSlot
 
@@ -1846,6 +1854,12 @@ func (p *Proxy) runDirectSession(sessCtx context.Context, linkID string, readyCh
 			case <-connCtx.Done():
 				return
 			}
+			// Release before retry loop — see runDTLSSession for full
+			// rationale. Same pattern: avoid stale active counts during
+			// reconnect storm.
+			p.credPool.release(credSlot)
+			credSlot = -1
+			currentSlot = -1
 			retries := 0
 			for retries < 5 {
 				if connCtx.Err() != nil {
@@ -1861,9 +1875,6 @@ func (p *Proxy) runDirectSession(sessCtx context.Context, linkID string, readyCh
 					}
 					continue
 				}
-				// Release the previous slot's quota slot; resolveTURNAddr
-				// has already incremented active for the new acquire.
-				p.credPool.release(credSlot)
 				credSlot = newSlot
 				currentSlot = newSlot
 				log.Printf("proxy: [conn %d, cred %d] starting new direct TURN session", connIdx, credSlot)
