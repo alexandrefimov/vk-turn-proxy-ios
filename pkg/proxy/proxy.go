@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"crypto/tls"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -133,6 +134,31 @@ type Proxy struct {
 	dtlsHSns    atomic.Int64 // nanoseconds
 	reconnects  atomic.Int64
 
+	// Per-conn liveness probe. Detects "zombie" conns where the TURN
+	// allocation appears alive (NAT keepalive Binding to VK succeeds,
+	// pion's Refresh succeeds) but actual data path is broken — typically
+	// after iOS network handover where VK's relay is still pointing at
+	// the old NAT mapping.
+	//
+	// Mechanism: each conn periodically writes a sentinel packet through
+	// its DTLS pipe. The patched server (vk-turn-proxy-server with
+	// matching support) recognizes the magic bytes and echoes the
+	// packet back. An unpatched server forwards the bytes to WireGuard
+	// which drops them (first byte 0xff doesn't match WG message types
+	// 1..4) — no echo, no harm.
+	//
+	// On the client side, ANY received pong sets serverProbeable to
+	// true. From that point on, every conn's lastPongTime is checked
+	// for staleness; stale conns are killed via connCancel and the
+	// reconnect loop rebuilds them with fresh TURN allocations.
+	//
+	// Backward compat: with an old server, no pongs ever arrive,
+	// serverProbeable stays false, no kills happen — behaviour is
+	// identical to pre-probe code modulo a steady ~1-3 kbps of probe
+	// traffic that the server silently drops.
+	serverProbeable atomic.Bool
+	lastPongTimes   []atomic.Int64 // per conn, indexed by connIdx; Unix seconds
+
 	// Bootstrap-ready signaling. Fires exactly once per proxy lifetime, when
 	// either (a) the first conn establishes a live DTLS+TURN session (signaled
 	// with nil from runConnection), or (b) Start() hits a fatal non-captcha
@@ -164,6 +190,7 @@ func NewProxy(cfg Config) *Proxy {
 		sessCancel:      sessCancel,
 		captchaCh:       make(chan string, 1),
 		bootstrapDoneCh: make(chan error, 1),
+		lastPongTimes:   make([]atomic.Int64, cfg.NumConns),
 	}
 	// If no external solver provided, use the built-in channel-based solver
 	// that waits for SolveCaptcha() to be called (e.g. from iOS UI).
@@ -1323,6 +1350,66 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 
 	log.Printf("proxy: [conn %d, cred %d] DTLS+TURN session established", connIdx, credSlot)
 
+	// Reset this conn's last-pong time to "now" so the zombie watchdog
+	// gives the conn a fresh probeStaleThreshold window before it
+	// considers killing it. Without this, a re-established conn whose
+	// previous incarnation died with stale lastPongTime would be
+	// killed immediately on its first probe tick.
+	if connIdx >= 0 && connIdx < len(p.lastPongTimes) {
+		p.lastPongTimes[connIdx].Store(time.Now().Unix())
+	}
+
+	// Liveness-probe sender. Periodically writes a sentinel packet
+	// through this conn's DTLS pipe; the server echoes if it's
+	// patched, drops to WireGuard if not (and WG drops it as malformed).
+	// On the receive side the recv goroutine recognizes the magic
+	// bytes and updates p.lastPongTimes[connIdx]. After any pong has
+	// arrived (serverProbeable=true), each tick checks whether
+	// lastPongTime is stale beyond probeStaleThreshold and if so
+	// cancels connCtx, which propagates through wg.Wait below and
+	// returns from runDTLSSession — runConnection then takes over and
+	// rebuilds the conn with a fresh TURN allocation. See proxy
+	// struct comment on serverProbeable / lastPongTimes for full
+	// rationale.
+	go func() {
+		ticker := time.NewTicker(probeInterval)
+		defer ticker.Stop()
+		var seq uint64
+		pingPkt := make([]byte, len(probePingMagic)+8)
+		copy(pingPkt[0:len(probePingMagic)], probePingMagic)
+		for {
+			select {
+			case <-ticker.C:
+				seq++
+				binary.BigEndian.PutUint64(pingPkt[len(probePingMagic):], seq)
+				dtlsConn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+				if _, err := dtlsConn.Write(pingPkt); err != nil {
+					// Write failure means the conn is already broken.
+					// Other goroutines (DTLS recv timeout, TURN reconnect
+					// loop) will handle the actual teardown — we just
+					// stop sending probes.
+					return
+				}
+				// Zombie check, only after we've ever seen a pong from
+				// the server. With an unpatched server pings go out
+				// but no pongs come back, serverProbeable stays false,
+				// and this branch is dead — preserves backward compat.
+				if p.serverProbeable.Load() && connIdx >= 0 && connIdx < len(p.lastPongTimes) {
+					lastPong := time.Unix(p.lastPongTimes[connIdx].Load(), 0)
+					stale := time.Since(lastPong)
+					if stale > probeStaleThreshold {
+						log.Printf("proxy: [conn %d] zombie detected (no pong for %s), killing",
+							connIdx, stale.Round(time.Second))
+						connCancel()
+						return
+					}
+				}
+			case <-connCtx.Done():
+				return
+			}
+		}
+	}()
+
 	// TURN reconnection loop in background.
 	// Only reconnects when TURN actually fails (not proactively).
 	// The same conn2 is reused — DTLS doesn't see the reconnection.
@@ -1650,6 +1737,22 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 				return
 			}
 			p.lastRecvTime.Store(time.Now().Unix())
+			// Liveness-probe pong recognition: any DTLS payload starting
+			// with probePingMagic is a server echo of one of our pings.
+			// Update per-conn last-pong time and the global
+			// serverProbeable flag, then drop the packet — it must NOT
+			// reach WireGuard, which would treat the 0xff... bytes as
+			// an invalid message type. With an unpatched server these
+			// packets never appear (server forwards our ping to WG and
+			// WG drops it; nothing comes back), so this branch is a
+			// no-op until the server gets the matching patch.
+			if isProbePacket(buf[:n]) {
+				p.serverProbeable.Store(true)
+				if connIdx >= 0 && connIdx < len(p.lastPongTimes) {
+					p.lastPongTimes[connIdx].Store(time.Now().Unix())
+				}
+				continue
+			}
 			pkt := make([]byte, n)
 			copy(pkt, buf[:n])
 			select {
@@ -2172,4 +2275,42 @@ func isQuotaError(err error) bool {
 		return false
 	}
 	return strings.Contains(err.Error(), "error 486:")
+}
+
+// Liveness-probe protocol constants.
+//
+// probePingMagic is a 4-byte sentinel for sentinel/echo packets sent
+// over each conn's DTLS pipe to detect zombie conns. The first byte
+// 0xff is deliberately chosen to fall outside WireGuard's 1..4 message
+// type range, so an unpatched server forwards the packet to its WG
+// instance and WG silently drops it as malformed — making the probe
+// fully backward-compatible with non-probe-aware servers.
+//
+// probeInterval / probeStaleThreshold: the probe goroutine sends a
+// ping every probeInterval. After serverProbeable has been observed
+// true at least once (i.e. some conn DID get a pong), each conn's
+// lastPongTime is checked: if no pong has arrived within
+// probeStaleThreshold, the conn is treated as zombie and killed.
+// 30s × 4 = 120s gives enough room for one missed probe + reasonable
+// network jitter before declaring a conn dead.
+var probePingMagic = []byte{0xff, 'P', 'N', 'G'}
+
+const (
+	probeInterval       = 30 * time.Second
+	probeStaleThreshold = 120 * time.Second
+)
+
+// isProbePacket returns true if buf is a probe ping/pong sentinel.
+// Both directions use the same magic — server echoes the client's
+// packet bytes verbatim — so the same predicate works on both sides.
+func isProbePacket(buf []byte) bool {
+	if len(buf) < len(probePingMagic) {
+		return false
+	}
+	for i, b := range probePingMagic {
+		if buf[i] != b {
+			return false
+		}
+	}
+	return true
 }
