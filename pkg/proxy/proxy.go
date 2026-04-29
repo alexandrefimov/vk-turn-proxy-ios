@@ -1390,40 +1390,38 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 					// stop sending probes.
 					return
 				}
-				// Zombie check — currently DETECT-ONLY, no kill.
+				// Zombie check: if no pong for probeStaleThreshold (default
+				// 120s) AND the server has been observed responding to at
+				// least one probe at some point (serverProbeable), kill
+				// this conn so the reconnect path can rebuild it with a
+				// fresh TURN allocation.
 				//
-				// Reason for not killing: when a network handover (e.g.
-				// WiFi→LTE) zombifies all 30 conns simultaneously, mass-
-				// killing leads to a recovery storm:
-				//   1. All 30 conns reconnect simultaneously
-				//   2. Each tries ownSlot, gets 486 (cred quota saturated
-				//      server-side by old NAT mapping's allocations,
-				//      lifetime ~10 min)
-				//   3. markSaturated → fallback → next slot also 486 →
-				//      eventually all 4 cred slots VK-saturated
-				//   4. Phase 2 → fresh fetch → captcha required
-				//   5. Captcha WebView page is hosted on id.vk.ru, which
-				//      is routed THROUGH the tunnel (iOS ignores
-				//      excludedRoutes when includeAllNetworks=true — our
-				//      vpn-routing-diag project verified this) — so with
-				//      0 alive conns, the WebView request can't reach VK.
-				//      User sees blank captcha, infinite stuck.
-				//
-				// Without kill: 30 conns stay "active" with high packet
-				// loss (35%), tunnel is degraded but the user can still
-				// see/fix it. Better UX than total deadlock.
-				//
-				// Re-enable when we have a captcha-during-broken-tunnel
-				// recovery path — e.g., extension-side captcha rendering
-				// + WKURLSchemeHandler bypass, or cancelTunnelWithError +
-				// trigger pre-bootstrap from main app.
+				// Re-enabled after the original captcha-storm post-mortem
+				// (vpn.wifi-lte.0.log 2026-04-29). Conditions improved:
+				//   - release-before-get fix (commit fbf7abf) keeps the
+				//     reconnect cascade from spuriously logging "no slot
+				//     available" 30 times during handover.
+				//   - cred TTL increased to 4h default (commit 919f1e0)
+				//     means slots are far less likely to be on cooldown
+				//     when a kill arrives.
+				// The captcha-during-broken-tunnel issue is still real
+				// (see open question #4 / feedback_ios_routing.md), but
+				// the recovery path now has more headroom: with TTL 4h
+				// the spare slot+1 is usually fresh, so 10/30 conns
+				// recover instantly on the spare cred without needing a
+				// fresh VK fetch. Remaining 20/30 are blocked by VK's
+				// per-cred quota until old WiFi allocations expire on
+				// VK side (~10 min) — same constraint as before, but
+				// now we KNOW we're waiting on quota expiry rather than
+				// being silently broken with 35% loss.
 				if p.serverProbeable.Load() && connIdx >= 0 && connIdx < len(p.lastPongTimes) {
 					lastPong := time.Unix(p.lastPongTimes[connIdx].Load(), 0)
 					stale := time.Since(lastPong)
 					if stale > probeStaleThreshold {
-						log.Printf("proxy: [conn %d] zombie detected (no pong for %s) — kill disabled, see comment in proxy.go",
+						log.Printf("proxy: [conn %d] zombie detected (no pong for %s), killing",
 							connIdx, stale.Round(time.Second))
-						// connCancel()  // NOT called — see comment above.
+						connCancel()
+						return
 					}
 				}
 			case <-connCtx.Done():
