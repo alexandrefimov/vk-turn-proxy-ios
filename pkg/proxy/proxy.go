@@ -2013,8 +2013,18 @@ func (l *turnLogger) Errorf(format string, args ...interface{}) {
 // auth errors on the next Allocate retry. The pion-logger path catches them
 // during steady-state Refresh cycles, before any reconnect would happen.
 func (l *turnLogger) maybeFlagAuthError(msg string) {
-	if !strings.Contains(msg, "401") && !strings.Contains(msg, "403") &&
-		!strings.Contains(msg, "Unauthorized") && !strings.Contains(msg, "Forbidden") {
+	// Match anchored auth-error patterns only.
+	//
+	// Bare "401" / "403" substring matching produced false positives:
+	// vpn.lte-wifi.0.log on 2026-04-30 04:38:58 surfaced "PION AUTH ERROR
+	// DETECTED" on a refresh failure where the message contained the
+	// ephemeral UDP port "64014" (treated as substring "401"). Real pion
+	// auth errors always include either the word "Unauthorized"/"Forbidden"
+	// or the STUN error-response prefix "error 401:"/"error 403:".
+	if !strings.Contains(msg, "Unauthorized") &&
+		!strings.Contains(msg, "Forbidden") &&
+		!strings.Contains(msg, "error 401:") &&
+		!strings.Contains(msg, "error 403:") {
 		return
 	}
 	log.Printf("proxy: PION AUTH ERROR DETECTED in %s: %s", l.scope, sanitizeLog(msg))
