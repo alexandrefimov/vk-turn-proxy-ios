@@ -19,7 +19,6 @@ struct ContentView: View {
     @AppStorage("peerAddress") private var peerAddress = ""
     @AppStorage("useDTLS") private var useDTLS = true
     @AppStorage("numConnections") private var numConnections = 10
-    @AppStorage("credPoolTTLMinutes") private var credPoolTTLMinutes = 240
     @AppStorage("credPoolCooldownSeconds") private var credPoolCooldownSeconds = 120
 
     var body: some View {
@@ -69,7 +68,6 @@ struct ContentView: View {
                             peerAddress: peerAddress,
                             useDTLS: useDTLS,
                             numConnections: numConnections,
-                            credPoolTTLSeconds: credPoolTTLMinutes * 60,
                             credPoolCooldownSeconds: credPoolCooldownSeconds
                         )
                         Task {
@@ -184,7 +182,6 @@ struct SettingsView: View {
     @AppStorage("peerAddress") private var peerAddress = ""
     @AppStorage("useDTLS") private var useDTLS = true
     @AppStorage("numConnections") private var numConnections = 10
-    @AppStorage("credPoolTTLMinutes") private var credPoolTTLMinutes = 240
     @AppStorage("credPoolCooldownSeconds") private var credPoolCooldownSeconds = 120
 
     var body: some View {
@@ -202,8 +199,6 @@ struct SettingsView: View {
                 Toggle("DTLS Obfuscation", isOn: $useDTLS)
 
                 Stepper("Connections: \(numConnections)", value: $numConnections, in: 1...64)
-
-                Stepper("Cred pool TTL: \(credPoolTTLMinutes) min", value: $credPoolTTLMinutes, in: 2...1440, step: 5)
 
                 Stepper("Cred pool cooldown: \(credPoolCooldownSeconds) s", value: $credPoolCooldownSeconds, in: 30...600, step: 30)
             }

@@ -10,12 +10,46 @@ import (
 	mathrand "math/rand"
 	"net/http"
 	neturl "net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
 )
+
+// credExpiryBuffer is the safety margin before a TURN cred's expiry timestamp
+// at which we consider the cred no longer fresh and start refreshing. The
+// expiry comes from VK's TURN REST API (draft-uberti-behave-turn-rest):
+// the credentials Username is "<expiry_unix_timestamp>:<key_id>", with the
+// timestamp being the moment after which VK's TURN server rejects the
+// cred with error 401. We stop using the cred before that point so an
+// in-flight TURN refresh (every ~5 min via pion) doesn't surprise us with
+// a 401 mid-session, and we have enough headroom for the fresh-fetch path
+// to finish (including a possible captcha solve, which can take many
+// seconds on a hostile VK day).
+//
+// 30 min works out to ~7h 30m of usage on VK's typical 8h-validity creds —
+// one fetch per cred-lifetime, no thrashing, plenty of margin if
+// VK suddenly demands captcha during refresh.
+const credExpiryBuffer = 30 * time.Minute
+
+// parseCredExpiry extracts the expiry timestamp from a VK TURN cred Username.
+// VK follows draft-uberti-behave-turn-rest: Username is
+// "<unix_expiry_timestamp>:<key_id>". Returns (expiry, true) on parse success.
+// On failure (malformed username) returns (zero, false) — caller should
+// treat the slot as expired and refetch.
+func parseCredExpiry(username string) (time.Time, bool) {
+	idx := strings.IndexByte(username, ':')
+	if idx <= 0 {
+		return time.Time{}, false
+	}
+	ts, err := strconv.ParseInt(username[:idx], 10, 64)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return time.Unix(ts, 0), true
+}
 
 // vkCredentials holds a VK API client_id/client_secret pair.
 type vkCredentials struct {
@@ -558,7 +592,6 @@ type credPool struct {
 	mu       sync.Mutex
 	pool     []credPoolEntry // indexed by slot index; grown lazily up to size
 	size     int             // pool capacity, derived from NumConns via poolSizeForNumConns
-	ttl      time.Duration   // per-entry freshness (default 10m)
 	cooldown time.Duration   // post-failure skip-fetch window (default 5m)
 
 	// fetch is the underlying credential fetcher. It must do all the work
@@ -618,15 +651,18 @@ func poolSizeForNumConns(n int) int {
 	return (n+9)/10 + 1 // ceil(n/10) + 1
 }
 
-// newCredPool builds a pool sized to `size` conns with per-entry `ttl`
-// and post-failure `cooldown` (the time a slot waits after a failed fetch
-// before being eligible to retry).
-// seedSlot fills `slot` with externally-provided credentials, marked fresh
-// (ts=now). Used by NewProxy when the main app's pre-bootstrap captcha
-// flow already obtained TURN creds via wgProbeVKCreds — we plant them in
-// slot 0 so the first conn's get() returns them without any VK API call,
-// avoiding the .connecting-window deadlock where a cold credPool would
-// trigger another captcha request the main app can't service.
+// newCredPool builds a pool sized to `size` conns with post-failure
+// `cooldown` (the time a slot waits after a failed fetch before being
+// eligible to retry). Per-entry freshness is derived from the cred's own
+// VK-supplied expiry timestamp (encoded in Username), with a safety
+// margin of credExpiryBuffer — see parseCredExpiry / isFreshLocked.
+//
+// seedSlot fills `slot` with externally-provided credentials. Used by
+// NewProxy when the main app's pre-bootstrap captcha flow already obtained
+// TURN creds via wgProbeVKCreds — we plant them in slot 0 so the first
+// conn's get() returns them without any VK API call, avoiding the
+// .connecting-window deadlock where a cold credPool would trigger another
+// captcha request the main app can't service.
 func (cp *credPool) seedSlot(slot int, addr string, creds *TURNCreds) {
 	cp.mu.Lock()
 	defer cp.mu.Unlock()
@@ -638,26 +674,29 @@ func (cp *credPool) seedSlot(slot int, addr string, creds *TURNCreds) {
 		creds: creds,
 		ts:    time.Now(),
 	}
-	log.Printf("credpool: seeded slot %d with externally-provided creds (addr=%s)", slot, addr)
+	if creds != nil {
+		if exp, ok := parseCredExpiry(creds.Username); ok {
+			log.Printf("credpool: seeded slot %d with externally-provided creds (addr=%s, expires in %s)",
+				slot, addr, time.Until(exp).Round(time.Second))
+		} else {
+			log.Printf("credpool: seeded slot %d with externally-provided creds (addr=%s, malformed username — will refetch on first use)", slot, addr)
+		}
+	}
 }
 
-func newCredPool(size int, ttl time.Duration, cooldown time.Duration, fetch func(bool) (string, *TURNCreds, error)) *credPool {
+func newCredPool(size int, cooldown time.Duration, fetch func(bool) (string, *TURNCreds, error)) *credPool {
 	if size < 1 {
 		size = 1
-	}
-	if ttl <= 0 {
-		ttl = 10 * time.Minute
 	}
 	if cooldown <= 0 {
 		cooldown = 2 * time.Minute
 	}
 	cp := &credPool{
 		size:     size,
-		ttl:      ttl,
 		cooldown: cooldown,
 		fetch:    fetch,
 	}
-	log.Printf("credpool: initialized with %d slots (ttl=%s, cooldown=%s)", size, ttl, cp.cooldown)
+	log.Printf("credpool: initialized with %d slots (expiry-buffer=%s, cooldown=%s)", size, credExpiryBuffer, cp.cooldown)
 	return cp
 }
 
@@ -914,8 +953,8 @@ func (cp *credPool) pickSlotToFill() int {
 	now := time.Now()
 	for i := 0; i < cp.size; i++ {
 		e := cp.pool[i]
-		if e.creds != nil && now.Sub(e.ts) < cp.ttl {
-			continue // fresh
+		if entryIsFresh(e) {
+			continue // fresh (cred not yet near expiry)
 		}
 		if e.fetching {
 			continue
@@ -959,20 +998,37 @@ func (cp *credPool) invalidateEntry(slot int) {
 	cp.mu.Unlock()
 }
 
-// isFreshLocked assumes cp.mu is held.
+// isFreshLocked assumes cp.mu is held. A slot is fresh iff it holds creds
+// AND those creds will still be valid on VK's TURN server credExpiryBuffer
+// from now (see parseCredExpiry for the expiry source).
 func (cp *credPool) isFreshLocked(slot int) bool {
 	if slot < 0 || slot >= len(cp.pool) {
 		return false
 	}
-	e := cp.pool[slot]
-	return e.creds != nil && time.Since(e.ts) < cp.ttl
+	return entryIsFresh(cp.pool[slot])
+}
+
+// entryIsFresh is the slot-agnostic version, used by isFreshLocked /
+// countFreshLocked / pickSlotToFill on already-snapshotted entries.
+func entryIsFresh(e credPoolEntry) bool {
+	if e.creds == nil {
+		return false
+	}
+	exp, ok := parseCredExpiry(e.creds.Username)
+	if !ok {
+		// Malformed username — treat as already expired so the next
+		// fetch path replaces it. Safer than trusting an unparseable
+		// cred indefinitely.
+		return false
+	}
+	return time.Now().Add(credExpiryBuffer).Before(exp)
 }
 
 // countFreshLocked assumes cp.mu is held.
 func (cp *credPool) countFreshLocked() int {
 	n := 0
 	for _, e := range cp.pool {
-		if e.creds != nil && time.Since(e.ts) < cp.ttl {
+		if entryIsFresh(e) {
 			n++
 		}
 	}

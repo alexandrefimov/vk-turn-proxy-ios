@@ -68,7 +68,6 @@ type ProxyConfig struct {
 	UseDTLS             bool              `json:"use_dtls"`
 	UseUDP              bool              `json:"use_udp"`
 	NumConns                int `json:"num_conns,omitempty"`
-	CredPoolTTLSeconds      int `json:"cred_pool_ttl_seconds,omitempty"`
 	CredPoolCooldownSeconds int `json:"cred_pool_cooldown_seconds,omitempty"`
 	// VKHostIPs is a hostname→[]IP map pre-resolved by the main app
 	// before startVPNTunnel. The extension can't resolve VK hosts on
@@ -128,7 +127,6 @@ func wgTurnOnWithTURN(settings *C.char, tunFd C.int32_t, proxyConfigJSON *C.char
 		UseDTLS:          pcfg.UseDTLS,
 		UseUDP:           pcfg.UseUDP,
 		NumConns:         pcfg.NumConns,
-		CredPoolTTL:      time.Duration(pcfg.CredPoolTTLSeconds) * time.Second,
 		CredPoolCooldown: time.Duration(pcfg.CredPoolCooldownSeconds) * time.Second,
 	})
 
@@ -247,7 +245,6 @@ func wgStartVKBootstrap(proxyConfigJSON *C.char) C.int32_t {
 		UseDTLS:          pcfg.UseDTLS,
 		UseUDP:           pcfg.UseUDP,
 		NumConns:         pcfg.NumConns,
-		CredPoolTTL:      time.Duration(pcfg.CredPoolTTLSeconds) * time.Second,
 		CredPoolCooldown: time.Duration(pcfg.CredPoolCooldownSeconds) * time.Second,
 		SeededTURN:       seededTURN,
 	})
