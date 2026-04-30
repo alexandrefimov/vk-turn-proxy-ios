@@ -389,6 +389,27 @@ class TunnelManager: ObservableObject {
             try await manager.saveToPreferences()
             try await manager.loadFromPreferences()
 
+            // NECP settle delay before startVPNTunnel.
+            //
+            // Empirically observed (vpn YESGLITCH 2026-04-30 17:32:48):
+            // saveToPreferences() with includeAllNetworks=true triggers iOS
+            // NECP rule rebuild that briefly nulls all primary interfaces
+            // (en0, pdp_ip0) for ~370 ms. If startVPNTunnel() races into
+            // PreparingNetwork during that window, iOS aborts the session
+            // with stop reason 4 (NEUnrecoverableNetworkChange / "No
+            // network available"). The first extension instance dies, iOS
+            // auto-relaunches a second one ~800 ms later — visible as the
+            // cosmetic "preparing → connecting → connected → disconnecting
+            // → disconnected → connected" UI glitch.
+            //
+            // 700 ms covers the empirical 370 ms blackout with margin and
+            // is unnoticeable on top of the multi-second pre-bootstrap
+            // captcha flow that already runs before connect().
+            //
+            // TEMP for diagnostics — do not commit until verified across
+            // a handful of connect/disconnect cycles.
+            try await Task.sleep(nanoseconds: 700_000_000)
+
             try manager.connection.startVPNTunnel()
         } catch {
             errorMessage = error.localizedDescription
