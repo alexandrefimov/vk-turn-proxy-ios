@@ -13,6 +13,8 @@ struct TunnelStats: Codable {
     var turnRTTms: Double = 0
     var dtlsHandshakeMs: Double = 0
     var reconnects: Int64 = 0
+    var credPoolFilled: Int32 = 0
+    var credPoolSize: Int32 = 0
     var captchaImageURL: String?
     var captchaSID: String?
 
@@ -24,6 +26,8 @@ struct TunnelStats: Codable {
         case turnRTTms = "turn_rtt_ms"
         case dtlsHandshakeMs = "dtls_handshake_ms"
         case reconnects
+        case credPoolFilled = "cred_pool_filled"
+        case credPoolSize = "cred_pool_size"
         case captchaImageURL = "captcha_image_url"
         case captchaSID = "captcha_sid"
     }
@@ -34,6 +38,9 @@ class TunnelManager: ObservableObject {
     @Published var status: NEVPNStatus = .disconnected
     @Published var errorMessage: String?
     @Published var stats = TunnelStats()
+    // Set when tunnel transitions into .connected, cleared on any other
+    // status. StatsView reads this via TimelineView to show live uptime.
+    @Published var connectedAt: Date?
 
     private var manager: NETunnelProviderManager?
     private var statusObserver: NSObjectProtocol?
@@ -689,6 +696,13 @@ class TunnelManager: ObservableObject {
                 self.status = newStatus
                 switch newStatus {
                 case .connected:
+                    // Stamp the moment we first reach .connected so StatsView
+                    // can render a live uptime via TimelineView. Don't reset
+                    // on .connecting/.reasserting cycles inside an existing
+                    // session — those count as part of the same uptime.
+                    if self.connectedAt == nil {
+                        self.connectedAt = Date()
+                    }
                     // (Re)start polling, preserving captcha state across reconnects
                     self.startStatsPolling(reset: false)
                     // Once the tunnel is actually up, any error message left
@@ -731,6 +745,7 @@ class TunnelManager: ObservableObject {
                     // Terminal states — full cleanup
                     self.stopStatsPolling()
                     self.resetCaptchaState()
+                    self.connectedAt = nil
                 default:
                     // .disconnecting only — keep polling/state, the tunnel
                     // may recover momentarily (e.g., sleep/wake cycle).

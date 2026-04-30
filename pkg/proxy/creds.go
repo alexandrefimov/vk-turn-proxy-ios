@@ -998,6 +998,17 @@ func (cp *credPool) invalidateEntry(slot int) {
 	cp.mu.Unlock()
 }
 
+// snapshotSize returns (freshCount, totalCapacity) of the pool — used by
+// the stats endpoint so the UI can display "X / Y" pool fullness. Takes
+// the lock briefly; safe to call from any goroutine.
+func (cp *credPool) snapshotSize() (filled int, size int) {
+	cp.mu.Lock()
+	filled = cp.countFreshLocked()
+	size = cp.size
+	cp.mu.Unlock()
+	return
+}
+
 // isFreshLocked assumes cp.mu is held. A slot is fresh iff it holds creds
 // AND those creds will still be valid on VK's TURN server credExpiryBuffer
 // from now (see parseCredExpiry for the expiry source).

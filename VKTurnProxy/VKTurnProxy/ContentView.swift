@@ -23,80 +23,88 @@ struct ContentView: View {
 
     var body: some View {
         NavigationView {
-            VStack(spacing: 32) {
-                Spacer()
+            // ScrollView is the safety net for very small screens
+            // (iPhone SE etc.). When the stats grid grows enough that
+            // it would push Logs/Settings below the visible area, the
+            // user can scroll instead of losing access to them. On
+            // larger screens the content fits without scrolling.
+            ScrollView {
+                VStack(spacing: 16) {
+                    // Status indicator — compact size so the rest of the
+                    // controls stay visible on small screens.
+                    Circle()
+                        .fill(statusColor)
+                        .frame(width: 44, height: 44)
+                        .shadow(color: statusColor.opacity(0.5), radius: 8)
+                        .padding(.top, 8)
 
-                // Status indicator
-                Circle()
-                    .fill(statusColor)
-                    .frame(width: 80, height: 80)
-                    .shadow(color: statusColor.opacity(0.5), radius: 12)
+                    Text(statusText)
+                        .font(.headline)
 
-                Text(statusText)
-                    .font(.title2)
-                    .fontWeight(.medium)
+                    if let error = tunnel.errorMessage {
+                        Text(error)
+                            .font(.caption)
+                            .foregroundColor(.red)
+                            .multilineTextAlignment(.center)
+                            .padding(.horizontal)
+                    }
 
-                if let error = tunnel.errorMessage {
-                    Text(error)
-                        .font(.caption)
-                        .foregroundColor(.red)
-                        .multilineTextAlignment(.center)
-                        .padding(.horizontal)
-                }
+                    // Stats (shown when connected)
+                    if tunnel.status == .connected {
+                        StatsView(tunnel: tunnel)
+                            .padding(.horizontal)
+                    }
 
-                // Stats (shown when connected)
-                if tunnel.status == .connected {
-                    StatsView(tunnel: tunnel)
-                        .padding(.horizontal)
-                }
+                    // Connect / Disconnect button
+                    Button(action: {
+                        if tunnel.status == .connected || tunnel.status == .connecting {
+                            tunnel.disconnect()
+                        } else {
+                            let config = TunnelConfig(
+                                privateKey: privateKey,
+                                peerPublicKey: peerPublicKey,
+                                presharedKey: presharedKey.isEmpty ? nil : presharedKey,
+                                tunnelAddress: tunnelAddress,
+                                dnsServers: dnsServers,
+                                allowedIPs: allowedIPs,
+                                vkLink: vkLink,
+                                peerAddress: peerAddress,
+                                useDTLS: useDTLS,
+                                numConnections: numConnections,
+                                credPoolCooldownSeconds: credPoolCooldownSeconds
+                            )
+                            Task {
+                                await tunnel.connect(config: config)
+                            }
+                        }
+                    }) {
+                        Text(buttonText)
+                            .font(.headline)
+                            .foregroundColor(.white)
+                            .frame(maxWidth: .infinity)
+                            .padding()
+                            .background(buttonColor)
+                            .cornerRadius(12)
+                    }
+                    .padding(.horizontal)
+                    .padding(.top, 8)
 
-                Spacer()
-
-                // Connect / Disconnect button
-                Button(action: {
-                    if tunnel.status == .connected || tunnel.status == .connecting {
-                        tunnel.disconnect()
-                    } else {
-                        let config = TunnelConfig(
-                            privateKey: privateKey,
-                            peerPublicKey: peerPublicKey,
-                            presharedKey: presharedKey.isEmpty ? nil : presharedKey,
-                            tunnelAddress: tunnelAddress,
-                            dnsServers: dnsServers,
-                            allowedIPs: allowedIPs,
-                            vkLink: vkLink,
-                            peerAddress: peerAddress,
-                            useDTLS: useDTLS,
-                            numConnections: numConnections,
-                            credPoolCooldownSeconds: credPoolCooldownSeconds
-                        )
-                        Task {
-                            await tunnel.connect(config: config)
+                    // Logs & Settings links
+                    HStack(spacing: 24) {
+                        NavigationLink(destination: LogsView()) {
+                            Label("Logs", systemImage: "doc.text")
+                        }
+                        NavigationLink(destination: SettingsView()) {
+                            Label("Settings", systemImage: "gear")
                         }
                     }
-                }) {
-                    Text(buttonText)
-                        .font(.headline)
-                        .foregroundColor(.white)
-                        .frame(maxWidth: .infinity)
-                        .padding()
-                        .background(buttonColor)
-                        .cornerRadius(12)
+                    .padding(.bottom, 8)
                 }
-                .padding(.horizontal)
-
-                // Logs & Settings links
-                HStack(spacing: 24) {
-                    NavigationLink(destination: LogsView()) {
-                        Label("Logs", systemImage: "doc.text")
-                    }
-                    NavigationLink(destination: SettingsView()) {
-                        Label("Settings", systemImage: "gear")
-                    }
-                }
-                .padding(.bottom, 24)
+                .frame(maxWidth: .infinity)
+                .padding(.top, 8)
             }
             .navigationTitle("VK Turn Proxy")
+            .navigationBarTitleDisplayMode(.inline)
             .sheet(isPresented: $tunnel.captchaPending) {
                 if let urlStr = tunnel.captchaImageURL, let url = URL(string: urlStr) {
                     CaptchaWebView(
@@ -236,7 +244,7 @@ struct StatsView: View {
     @ObservedObject var tunnel: TunnelManager
 
     var body: some View {
-        VStack(spacing: 8) {
+        VStack(spacing: 6) {
             HStack {
                 StatBox(title: "↑ TX", value: formatBytes(tunnel.stats.txBytes), sub: formatRate(tunnel.txRate))
                 StatBox(title: "↓ RX", value: formatBytes(tunnel.stats.rxBytes), sub: formatRate(tunnel.rxRate))
@@ -251,6 +259,25 @@ struct StatsView: View {
             HStack {
                 StatBox(title: "Conns", value: "\(tunnel.stats.activeConns)/\(tunnel.stats.totalConns)", sub: nil)
                 StatBox(title: "Reconnects", value: "\(tunnel.stats.reconnects)", sub: nil)
+            }
+
+            HStack {
+                // Uptime updates live via TimelineView ticking once a second.
+                // Falls back to "—" if the tunnel hasn't reached .connected
+                // yet (briefly visible during the .connecting → .connected
+                // transition since StatsView is gated on .connected).
+                TimelineView(.periodic(from: .now, by: 1)) { context in
+                    StatBox(
+                        title: "Uptime",
+                        value: formatUptime(tunnel.connectedAt.map { context.date.timeIntervalSince($0) }),
+                        sub: nil
+                    )
+                }
+                StatBox(
+                    title: "Pool",
+                    value: "\(tunnel.stats.credPoolFilled)/\(tunnel.stats.credPoolSize)",
+                    sub: nil
+                )
             }
         }
     }
@@ -268,6 +295,18 @@ struct StatsView: View {
         if bytesPerSec >= 1024 { return String(format: "%.1f KB/s", bytesPerSec / 1024) }
         if bytesPerSec > 0 { return String(format: "%.0f B/s", bytesPerSec) }
         return "0 B/s"
+    }
+
+    private func formatUptime(_ seconds: TimeInterval?) -> String {
+        guard let s = seconds, s >= 0 else { return "—" }
+        let total = Int(s)
+        let h = total / 3600
+        let m = (total % 3600) / 60
+        let sec = total % 60
+        if h > 0 {
+            return String(format: "%d:%02d:%02d", h, m, sec)
+        }
+        return String(format: "%d:%02d", m, sec)
     }
 }
 
