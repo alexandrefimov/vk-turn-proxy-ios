@@ -1416,7 +1416,7 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 				//     means slots are far less likely to be on cooldown
 				//     when a kill arrives.
 				// The captcha-during-broken-tunnel issue is still real
-				// (see open question #4 / feedback_ios_routing.md), but
+				// (see feedback_ios_routing.md), but
 				// the recovery path now has more headroom: with TTL 4h
 				// the spare slot+1 is usually fresh, so 10/30 conns
 				// recover instantly on the spare cred without needing a
