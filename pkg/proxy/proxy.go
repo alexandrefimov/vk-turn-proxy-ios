@@ -726,17 +726,26 @@ func (p *Proxy) WakeHealthCheck() {
 //
 // Three conditions trigger a full reconnect:
 //  1. No packets for 2 min with active connections → dead tunnel
-//  2. Active connections < half of expected for 5+ min → partial recovery stuck
-//     (e.g., after Allocation Quota Reached, only 1-2 of 10 connections survive)
-//  3. Pion permission/binding refresh failures persist past a threshold →
+//  2. Pion permission/binding refresh failures persist past a threshold →
 //     silent partial degradation (some clients still alive, but server-side
 //     permissions are gone for the others; UI shows 10/10 with 0 reconnects
 //     while throughput collapses to 1/N)
+//  3. Zero active connections for 5+ min → bootstrap dead-end (cred fetch
+//     can't get past captcha and the conn pool never establishes a single
+//     working session)
+//
+// Removed condition (vpn.wifi.5.log on 2026-04-30): "active < expected/2
+// for 5 min → reconnect". Designed for the post-sleep/wake quota cascade,
+// where most conns were stuck dormant. Now obsolete:
+//   - Stuck conns get killed by the zombie probe in 2 min, not 5+
+//   - markSaturated handles 486-cascade with a 10m cooldown
+//   - Captcha-triggered slow ramp-up commonly leaves us at "10/30 active
+//     for 5+ min" while VK rate-limits PoW for our IP. Forcing reconnect
+//     in that state killed 10 working conns and didn't help unstick VK.
 func (p *Proxy) runWatchdog() {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
-	var lowConnSince time.Time  // when we first noticed too few connections
 	var zeroConnSince time.Time // when we first noticed zero connections
 
 	for {
@@ -753,7 +762,6 @@ func (p *Proxy) runWatchdog() {
 
 			lastRecv := p.lastRecvTime.Load()
 			active := p.activeConns.Load()
-			expected := int32(p.config.NumConns)
 
 			// Condition 1: No packets despite active connections → dead tunnel
 			if lastRecv > 0 && active > 0 {
@@ -761,13 +769,12 @@ func (p *Proxy) runWatchdog() {
 				if elapsed > 2*time.Minute {
 					log.Printf("proxy: watchdog — no packets for %s with %d active conns, forcing reconnect",
 						elapsed.Round(time.Second), active)
-					lowConnSince = time.Time{} // reset
 					p.ForceReconnect()
 					continue
 				}
 			}
 
-			// Condition 3: Silent partial degradation — pion is logging
+			// Condition 2: Silent partial degradation — pion is logging
 			// permission or channel-binding refresh failures but the surviving
 			// clients keep lastRecvTime fresh, so condition 1 never trips.
 			// Trigger if we've accumulated enough errors AND they have been
@@ -785,37 +792,18 @@ func (p *Proxy) runWatchdog() {
 			if pionErrs >= 5 && firstErr > 0 && time.Since(time.Unix(firstErr, 0)) > 90*time.Second {
 				log.Printf("proxy: watchdog — %d pion permission/binding errors over %s, tunnel silently degraded, forcing reconnect",
 					pionErrs, time.Since(time.Unix(firstErr, 0)).Round(time.Second))
-				lowConnSince = time.Time{} // reset
 				p.ForceReconnect()
 				continue
 			}
 
-			// Condition 2: Too few active connections for too long.
-			// After sleep/wake, Allocation Quota Reached kills most connections.
-			// Dormant goroutines will eventually retry (30s-3min), but if the
-			// situation persists, force a clean restart.
-			if lastRecv > 0 && active > 0 && active < expected/2 {
-				if lowConnSince.IsZero() {
-					lowConnSince = time.Now()
-				} else if time.Since(lowConnSince) > 5*time.Minute {
-					log.Printf("proxy: watchdog — only %d/%d conns active for 5+ min, forcing reconnect",
-						active, expected)
-					lowConnSince = time.Time{}
-					p.ForceReconnect()
-					continue
-				}
-			} else {
-				lowConnSince = time.Time{} // reset if healthy
-			}
-
-			// Condition 4: Zero active connections for too long.
+			// Condition 3: Zero active connections for too long.
 			// Conditions 1 and 2 both require active>0, so a hard
-			// bootstrap dead-end (e.g. ForceReconnect → all 4 retry
-			// attempts hit cred-486 → "first connection failed" → no
-			// more retries) leaves the watchdog mute and the tunnel
-			// stays down indefinitely. Observed in vpn.lte.0.log on
-			// 2026-04-29 at 09:05:52 — log just trails into background
-			// captcha activity with 0 active conns and no recovery.
+			// bootstrap dead-end (e.g. all retry attempts hit cred-486
+			// → "first connection failed" → no more retries) leaves
+			// the watchdog mute and the tunnel stays down indefinitely.
+			// Observed in vpn.lte.0.log on 2026-04-29 at 09:05:52 —
+			// log just trails into background captcha activity with
+			// 0 active conns and no recovery.
 			//
 			// 5-minute threshold is long enough that the initial
 			// startup phase (typically 5-30s but can stretch to several
