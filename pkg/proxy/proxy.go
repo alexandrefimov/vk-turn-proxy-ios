@@ -1238,7 +1238,10 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 	defer connCancel()
 
 	// Create AsyncPacketPipe: conn1 = DTLS transport, conn2 = TURN transport.
-	// The same conn2 is reused across TURN reconnections (matching the original client).
+	// One pipe per runDTLSSession invocation — the conns get torn down
+	// together when TURN or DTLS fails, and the outer runConnection loop
+	// re-enters runDTLSSession to build a fresh pair. See spawnTURN comment
+	// below for why we do NOT reuse pipes across TURN reconnects.
 	conn1, conn2 := connutil.AsyncPacketPipe()
 	defer conn1.Close()
 	defer conn2.Close()
@@ -1265,29 +1268,37 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 	// TURN runs until it fails naturally (no forced lifetime).
 	// The pion/turn client handles allocation refresh automatically.
 	//
-	// spawnTURN shape: the goroutine writes the runTURN result to its
-	// returned channel. cancelOnError=true is used during bootstrap so that
-	// a fast TURN failure (e.g. 486 quota response in ~100ms) immediately
-	// cancels connCtx and unblocks dialDTLS — without this, dialDTLS sat
-	// for its full 15s timeout waiting for handshake bytes that would
-	// never come, wasting ~14.5s per failed bootstrap attempt.
+	// On any TURN exit (whether error or normal close) we cancelOnError=true:
+	// connCancel propagates to dtlsConn.Close (via context.AfterFunc below)
+	// and unblocks both dialDTLS during initial handshake AND the long-lived
+	// send/recv goroutines after handshake. runDTLSSession then returns and
+	// the outer loop in runConnection rebuilds this conn from scratch with a
+	// fresh AsyncPacketPipe, fresh dialDTLS, fresh TURN allocate.
 	//
-	// In the reconnect loop below, subsequent runTURN spawns use
-	// cancelOnError=false: the loop itself handles failure (chooses delay,
-	// fetches fresh creds, re-spawns), and a connCancel from inside the
-	// runTURN goroutine would kill the loop on the very first failure.
-	spawnTURN := func(addr string, c *TURNCreds, cancelOnError bool) chan error {
+	// We do NOT reconnect TURN within runDTLSSession anymore. The previous
+	// in-place reconnect kept the same dtlsConn across TURN reconnects, which
+	// looked like an optimization (peer's DTLS session continues seamlessly)
+	// but was actually broken: every TURN reconnect from pion's Allocate()
+	// hands back a NEW relay address, so peer sees our DTLS source change
+	// and treats it as a brand-new session — but our dtlsConn still holds
+	// the old session's keys/state and tries to send application data
+	// peer can't decrypt. Symptom: silent 2-minute hang after handover (only
+	// the zombie probe finally kills the conn so the outer loop can rebuild
+	// it). See vpn.lte-wifi.0.log conn 27 around 00:50:18 — first TURN
+	// allocate succeeds but DTLS handshake never completes; conn 27's second
+	// allocate via the outer loop goes through DTLS in 57 ms.
+	spawnTURN := func(addr string, c *TURNCreds) chan error {
 		ch := make(chan error, 1)
 		go func() {
 			err := p.runTURN(connCtx, addr, c, conn2, connIdx)
 			ch <- err
-			if err != nil && cancelOnError {
-				connCancel()
-			}
+			// Always cancel on TURN exit. Without TURN there's no DTLS
+			// transport, so the conn is dead either way.
+			connCancel()
 		}()
 		return ch
 	}
-	turnDone := spawnTURN(turnAddr, creds, true)
+	turnDone := spawnTURN(turnAddr, creds)
 
 	// DTLS handshake — packets go through conn1 → conn2 → TURN relay → peer
 	dtlsStart := time.Now()
@@ -1426,273 +1437,6 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 				}
 			case <-connCtx.Done():
 				return
-			}
-		}
-	}()
-
-	// TURN reconnection loop in background.
-	// Only reconnects when TURN actually fails (not proactively).
-	// The same conn2 is reused — DTLS doesn't see the reconnection.
-	go func() {
-		defer connCancel() // if TURN loop gives up, kill DTLS too
-		turnStart := time.Now()
-		for {
-			// Wait for current TURN to finish; capture err so the
-			// invalidate / delay decisions below can branch on the
-			// failure type instead of guessing from session duration.
-			var turnErr error
-			select {
-			case turnErr = <-turnDone:
-			case <-connCtx.Done():
-				return
-			}
-
-			if connCtx.Err() != nil {
-				return
-			}
-
-			turnAge := time.Since(turnStart)
-			p.reconnects.Add(1)
-			log.Printf("proxy: [conn %d] TURN session ended after %s (err=%v), reconnecting...",
-				connIdx, turnAge.Round(time.Second), turnErr)
-
-			// Decide whether to invalidate the cred slot.
-			//
-			// Previous heuristic was time-based (turnAge < 30s ⇒ assume
-			// cred expired ⇒ invalidate). That conflated three cases:
-			//   1. Auth error (401/403): cred truly stale → invalidate.
-			//   2. 486 quota: cred fine, just too many parallel allocs
-			//      on it. With NumConns > 10 (or even ~10 under
-			//      reconnect storm), the 11th-Nth attempt always gets
-			//      486 fast → time-based heuristic invalidated a
-			//      working cred and killed the pool for the other 10
-			//      conns. Observed: vpn.wifi.18.log at 20:28:17, where
-			//      a single 486 from a redundant conn killed slot 5
-			//      mid-session.
-			//   3. Network blip / iOS socket race: cred unrelated.
-			//
-			// New: invalidate only on auth errors. Quota and network
-			// errors keep the cred — caller's reconnect handles them
-			// via the delay choice below.
-			if isAuthError(turnErr) {
-				p.credPool.invalidateEntry(credSlot)
-				log.Printf("proxy: [conn %d] auth error (%v), invalidated cred slot %d",
-					connIdx, turnErr, credSlot)
-			} else if isQuotaError(turnErr) {
-				// VK's allocation count for this cred is at 10 from prior
-				// (possibly already-killed-on-our-side) allocations. The
-				// cred is fine; VK just won't accept more on it for the
-				// remainder of those allocations' TURN lifetime (~10 min).
-				// Mark the slot saturated so subsequent get() calls steer
-				// elsewhere instead of looping on the same cred. Without
-				// this, ForceReconnect after a watchdog trip is a deadlock
-				// (vpn.lte.0.log on 2026-04-29: 4 bootstrap attempts all
-				// hit cred 0 → 486 → "first connection failed" → no more
-				// retries since watchdog conditions all require active>0).
-				p.credPool.markSaturated(credSlot, 10*time.Minute)
-				log.Printf("proxy: [conn %d] quota error on slot %d, marked VK-saturated for 10m",
-					connIdx, credSlot)
-			}
-
-			// Pause before reconnecting. 486 quota needs the longest
-			// delay — VK's allocation token bucket refills slowly
-			// (empirically ~30s for 1 token after the initial burst of
-			// ~10), so 5s here gives a partial refill window before
-			// the next attempt. Other short-lived failures keep the
-			// existing 3s pause; normal reconnects after long sessions
-			// just need 500ms.
-			var delay time.Duration
-			switch {
-			case isQuotaError(turnErr):
-				delay = 5 * time.Second
-			case turnAge < 5*time.Second:
-				delay = 3 * time.Second
-			default:
-				delay = 500 * time.Millisecond
-			}
-			select {
-			case <-time.After(delay):
-			case <-connCtx.Done():
-				return
-			}
-
-			// Get fresh VK credentials and reconnect TURN.
-			//
-			// Retry budget is wide because mass-failure events (e.g. iOS DHCP
-			// renewal kills all 10 sockets simultaneously, observed every ~2h
-			// on routers with short lease) put every conn into reconnect at
-			// once with an empty/cooldown pool. Pool grower runs in the
-			// background at ~15% PoW success rate, so a working cred typically
-			// arrives within 30-60s — but only if our retry loop hasn't
-			// already given up.
-			//
-			// 12 attempts × linear backoff capped at 30s ≈ 2.5 min total wait
-			// budget per conn. Long enough to outlast a typical pool refill,
-			// short enough that runConnection's outer loop still kicks in if
-			// we've truly hit a dead-end.
-			const maxTurnReconnectRetries = 12
-			retries := 0
-			// Release the old slot's active count BEFORE entering the
-			// retry loop, so the upcoming get() sees realistic free
-			// quota. Critical during network handover (vpn.wifi-lte.0.log
-			// 2026-04-29 14:19:30): with 30 conns simultaneously falling
-			// into reconnect, if release happens AFTER acquire then their
-			// 10 active counts on each cred slot persist while every one
-			// of them is queueing for a new slot. Phase 1 sees all slots
-			// active=10/10, Phase 2 finds nothing fetchable (all on
-			// cooldown or being fetched by other goroutines) → "no slot
-			// available" cascade for ~all 30. With release-first, the
-			// active counts drop to 0 immediately, slots become acquirable
-			// in Phase 1.
-			p.credPool.release(credSlot)
-			credSlot = -1
-			currentSlot = -1
-			for retries < maxTurnReconnectRetries {
-				if connCtx.Err() != nil {
-					return
-				}
-				// allowCaptchaBlock=false: surface CaptchaRequiredError instead
-				// of letting cp.fetch invoke the user solver (waitForCaptchaAnswer)
-				// which would block indefinitely on captchaCh until a user
-				// answer arrives. The CaptchaRequiredError is then caught a
-				// few lines below and handled via the explicit captcha-wait
-				// probe loop, which periodically probes the pool every 2 min
-				// and exits as soon as background grower fills any slot.
-				//
-				// Without this, a single conn whose TURN goes short-lived at
-				// a moment when VK requires captcha would silently sit blocked
-				// in the solver forever (observed: conn 0 in vpn.wifi.3.log
-				// stuck from 12:51:41 onward, missed every subsequent network
-				// reconnect event).
-				newAddr, newCreds, newSlot, err := p.resolveTURNAddr(connIdx, false)
-				if err != nil {
-					// Check if it's a captcha that needs human interaction.
-					// Instead of burning retries, freeze and wait for the user.
-					var captchaErr *CaptchaRequiredError
-					if errors.As(err, &captchaErr) {
-						log.Printf("proxy: TURN reconnect needs captcha (slider), waiting for user or periodic retry")
-						p.captchaImageURL.Store(captchaErr.ImageURL)
-						p.lastCaptchaSID.Store(captchaErr.SID)
-						p.lastCaptchaTs.Store(captchaErr.CaptchaTs)
-						p.lastCaptchaAttempt.Store(captchaErr.CaptchaAttempt)
-						p.lastCaptchaToken1.Store(captchaErr.Token1)
-						// Wait for user to solve captcha OR periodic self-retry.
-						// Self-retry every 2 min handles the case where VK cools down
-						// while the user is unavailable (overnight, meeting, etc.).
-						// RefreshCaptchaURL no longer auto-unblocks to avoid ping-pong.
-						captchaResolved := false
-						turnProbeInterval := 2 * time.Minute
-						for !captchaResolved {
-							select {
-							case answer := <-p.captchaCh:
-								p.captchaImageURL.Store("")
-								if answer != "" {
-									p.lastCaptchaKey.Store(answer)
-									log.Printf("proxy: captcha solved during TURN reconnect (%d chars), retrying", len(answer))
-								} else {
-									log.Printf("proxy: VK no longer requires captcha, retrying normally")
-								}
-								captchaResolved = true
-							case <-time.After(turnProbeInterval):
-								// Periodic self-retry: try the full credential flow
-								// without captcha solver to see if VK cooled down.
-								// But suppress if user is actively viewing captcha WebView
-								// (RefreshCaptchaURL was called < 10 min ago). Probing would
-								// create new VK sessions that invalidate the current one,
-								// causing "Attempt limit reached" in the WebView.
-								if lastRefresh := p.lastRefreshCaptchaTime.Load(); lastRefresh > 0 {
-									if time.Since(time.Unix(lastRefresh, 0)) < 10*time.Minute {
-										log.Printf("proxy: captcha wait timeout, but user is viewing WebView (last refresh %s ago), skipping probe",
-											time.Since(time.Unix(lastRefresh, 0)).Round(time.Second))
-										continue
-									}
-								}
-								log.Printf("proxy: captcha wait timeout, probing (interval was %s)...", turnProbeInterval)
-								// DON'T wholesale-invalidate the pool here.
-								// This is the main bleeder: a single conn stuck
-								// in captcha-wait would wipe the pool every 2
-								// minutes, destroying creds other conns are
-								// actively running on. credPool.get below
-								// returns cached cred if available — that's
-								// the strongest possible signal that VK has
-								// cooled down (some other path successfully
-								// fetched). If pool is empty, fetch happens
-								// with allowCaptchaBlock=false, so captcha
-								// surfaces as error and we wait another cycle.
-								_, _, probeSlot, probeErr := p.resolveTURNAddr(connIdx, false)
-								// Probe is non-consuming; release whatever slot
-								// got acquired (or no-op if probeSlot == -1).
-								if probeErr == nil {
-									p.credPool.release(probeSlot)
-								}
-								if probeErr == nil {
-									log.Printf("proxy: VK no longer requires captcha (probe succeeded), resuming")
-									p.captchaImageURL.Store("")
-									captchaResolved = true
-								} else {
-									var probeCapErr *CaptchaRequiredError
-									if errors.As(probeErr, &probeCapErr) {
-										if probeCapErr.IsRateLimit {
-											turnProbeInterval = 10 * time.Minute
-											log.Printf("proxy: VK rate-limited (ERROR_LIMIT), backing off to %s", turnProbeInterval)
-										} else {
-											turnProbeInterval = 2 * time.Minute
-											log.Printf("proxy: VK still requires captcha, waiting %s", turnProbeInterval)
-										}
-										p.captchaImageURL.Store(probeCapErr.ImageURL)
-										p.lastCaptchaSID.Store(probeCapErr.SID)
-										p.lastCaptchaTs.Store(probeCapErr.CaptchaTs)
-										p.lastCaptchaAttempt.Store(probeCapErr.CaptchaAttempt)
-										p.lastCaptchaToken1.Store(probeCapErr.Token1)
-									} else {
-										log.Printf("proxy: probe failed (non-captcha): %v, waiting %s", probeErr, turnProbeInterval)
-									}
-								}
-							case <-connCtx.Done():
-								p.captchaImageURL.Store("")
-								return
-							case <-p.ctx.Done():
-								p.captchaImageURL.Store("")
-								return
-							}
-						}
-						// Don't increment retries — this wasn't a real failure
-						continue
-					}
-					retries++
-					log.Printf("proxy: TURN creds fetch failed (attempt %d/%d): %s", retries, maxTurnReconnectRetries, err)
-					// Linear backoff capped at 30s. With maxTurnReconnectRetries=12
-					// the per-attempt waits are 2,4,6,8,10,12,14,16,18,20,22,24
-					// (caps don't kick in but the cap is defensive). Total
-					// ~156s ≈ 2.5 min wait budget.
-					backoff := time.Duration(retries*2) * time.Second
-					if backoff > 30*time.Second {
-						backoff = 30 * time.Second
-					}
-					select {
-					case <-time.After(backoff):
-					case <-connCtx.Done():
-						return
-					}
-					continue
-				}
-
-				// Track which cred slot this new TURN session will run on.
-				// Old slot was already released before the retry loop; we
-				// just adopt the new one here (no double-release path).
-				credSlot = newSlot
-				currentSlot = newSlot
-
-				log.Printf("proxy: [conn %d, cred %d] starting new TURN session (attempt %d)", connIdx, credSlot, retries+1)
-				turnStart = time.Now()
-				// cancelOnError=false: this loop owns reconnection; an
-				// inner connCancel would kill the loop on first failure.
-				turnDone = spawnTURN(newAddr, newCreds, false)
-				break
-			}
-			if retries >= maxTurnReconnectRetries {
-				log.Printf("proxy: TURN reconnection failed after %d attempts, giving up", maxTurnReconnectRetries)
-				return // session dies → runConnection will wait 5 min or ForceReconnect
 			}
 		}
 	}()
