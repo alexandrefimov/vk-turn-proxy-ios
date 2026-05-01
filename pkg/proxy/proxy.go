@@ -116,6 +116,18 @@ type Proxy struct {
 	pionTransientErrors atomic.Int64 // cumulative since last ForceReconnect
 	firstPionErrorTime  atomic.Int64 // unix seconds, 0 = no errors yet
 
+	// Snapshot of txBytes at the previous WakeHealthCheck call. Used to
+	// detect "user is actively trying to send but no replies are coming
+	// back" between consecutive iOS wake() callbacks — a strong signal
+	// that the tunnel is broken and rebuild is needed immediately
+	// instead of waiting for Condition 2 to re-accumulate ~90s of pion
+	// errors after each freeze. See vpn.wifi.4.log on 2026-05-01: user
+	// was awake and trying to use the network from 12:20, but tunnel
+	// was broken (TURN permissions expired during prior 5m25s freeze)
+	// and recovery only completed at 12:26:08 via Condition 2 — a 6+
+	// minute outage of the user's network.
+	lastWakeTxBytes atomic.Int64
+
 	// Guard against multiple concurrent waitCaptchaAndRestart goroutines.
 	// Only one should be running at a time; extras just compete on captchaCh.
 	captchaWaiterActive atomic.Bool
@@ -703,13 +715,27 @@ func (p *Proxy) ForceReconnect() {
 // post-wake refresh. Both inflate pionTransientErrors with values that
 // don't reflect ongoing tunnel breakage.
 //
-// We DO NOT trigger ForceReconnect here. An earlier version did
-// (threshold 5), but vpn.wifi.1.log on 2026-05-01 showed this
-// false-positives badly: a single 10-minute freeze produced 150+ pion
-// errors in the same wake-millisecond, blasting past the threshold and
-// cascading into the 486 quota lockout. Resetting instead lets watchdog
-// Condition 2 (errors >= 5 AND first-error-age > 90s) catch genuinely
-// persistent breakage by observing post-wake error rate.
+// We don't blindly trigger ForceReconnect on accumulated pion errors —
+// a single 10-minute freeze produced 150+ pion errors in the same
+// wake-millisecond (vpn.wifi.1.log on 2026-05-01), blasting past any
+// fixed threshold and cascading into the 486 quota lockout.
+//
+// Instead we use a TX-vs-RX cross-check: between consecutive wake()
+// callbacks, did the user's app try to send packets, and did anything
+// come back? A non-trivial TX delta with a stale lastRecvTime is an
+// unambiguous signal of "user is using the network but the tunnel is
+// dead" — exactly the broken state where users wait for connectivity
+// to come back. ForceReconnect on that signal cuts recovery from the
+// 90s+ that Condition 2 needs (and may keep resetting on intermittent
+// freezes between user-triggered wakes) down to ~5-10s. During
+// overnight sleep or other genuinely idle periods, TX delta stays at
+// 0 and we don't spuriously reconnect.
+//
+// vpn.wifi.4.log on 2026-05-01 showed the failure mode this targets:
+// 5m25s freeze 12:15:53→12:21:19 expired TURN permissions on 41 conns;
+// user awake from 12:20 actively trying to use the network, but
+// recovery only completed at 12:26:08 via Condition 2 — a 6+ minute
+// outage observable to the user as "internet just doesn't work."
 func (p *Proxy) WakeHealthCheck() {
 	// Don't interfere with an in-progress captcha flow.
 	if v := p.captchaImageURL.Load(); v != nil {
@@ -722,6 +748,25 @@ func (p *Proxy) WakeHealthCheck() {
 		log.Printf("proxy: wake check — clearing %d accumulated pion errors (likely freeze artifacts)", pionErrs)
 		p.pionTransientErrors.Store(0)
 		p.firstPionErrorTime.Store(0)
+	}
+
+	// TX-vs-RX cross-check: if the app sent a meaningful amount of data
+	// since the previous wake but the tunnel hasn't received anything
+	// recently, the tunnel is broken and the user is currently waiting.
+	// 4 KB threshold filters out bookkeeping noise (a single TLS handshake
+	// is ~5 KB, a DNS query+response is ~200 B). 90s RX-staleness is past
+	// any normal probe-pong cycle (probeInterval 30s × 2-3 cycles).
+	txNow := p.txBytes.Load()
+	txPrev := p.lastWakeTxBytes.Swap(txNow)
+	txDelta := txNow - txPrev
+	lastRecv := p.lastRecvTime.Load()
+	if txDelta > 4096 && lastRecv > 0 {
+		rxStale := time.Since(time.Unix(lastRecv, 0))
+		if rxStale > 90*time.Second {
+			log.Printf("proxy: wake check — %d bytes TX since last wake but no RX for %s, forcing reconnect",
+				txDelta, rxStale.Round(time.Second))
+			p.ForceReconnect()
+		}
 	}
 }
 
