@@ -10,6 +10,8 @@ import (
 	mathrand "math/rand"
 	"net/http"
 	neturl "net/url"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -554,6 +556,24 @@ type credPoolEntry struct {
 	// the TURN session ends or the conn switches to a different slot).
 	active int
 
+	// lastUsedAt is the most recent moment when this slot's `active`
+	// count transitioned from >0 to 0 — i.e. the last conn to hold a
+	// TURN allocation against this cred just released it. While `active`
+	// is still >0 we don't update this field; saveToDisk substitutes
+	// time.Now() in the persisted record so an in-flight session always
+	// looks "active" to the next load even if no one called release()
+	// yet (e.g. iOS jetsam'd the extension mid-session).
+	//
+	// Persisted to disk so loadFromDisk can decide per-entry whether
+	// the cred is still potentially saturated by lingering VK-side
+	// allocations: if (now - lastUsedAt) > ~10 min, all allocations
+	// have timed out server-side and the cred is safe to reuse. If
+	// lastUsedAt is the zero value (slot was filled by background
+	// grower but no conn ever took it), the slot is safe regardless
+	// of how recently the file was saved — this is the typical state
+	// of the "+1 reserve" slot in the pool.
+	lastUsedAt time.Time
+
 	// saturatedUntil: VK-side quota saturation marker. When a runTURN
 	// allocation fails with 486 Allocation Quota Reached, the cred is
 	// marked as saturated by the proxy: VK still considers prior client-
@@ -567,6 +587,75 @@ type credPoolEntry struct {
 	// backs off. Cleared automatically when the slot is replaced via
 	// fresh fetch (since the new cred has a clean VK quota).
 	saturatedUntil time.Time
+}
+
+// credCacheVersion is the on-disk JSON schema version. Loaders that find
+// a different version log a warning and skip — caller falls through to
+// fresh fetch as if no cache existed.
+//
+// Bumped to 2 on 2026-05-01: per-entry LastUsedAt added so loadFromDisk
+// can decide saturation cooldown per-slot instead of per-file. The
+// previous file-level cooldown was overly conservative — it skipped the
+// whole cache (including the "+1 reserve" slot, which by design sits
+// at active=0 and has zero VK-side allocations) whenever a recent
+// session had touched ANY slot. Per-entry check loads the reserve and
+// any other never-used / long-since-released slots while still
+// skipping the genuinely saturated ones.
+const credCacheVersion = 2
+
+// credSaturationCooldown is the minimum gap from a slot's last release
+// before we trust it on load. VK allows 10 concurrent TURN allocations
+// per cred set with ~600s server-side lifetime. When a session ends,
+// pion's Refresh(lifetime=0) over UDP is best-effort — VK frequently
+// keeps the previous session's allocations live until they expire on
+// their own. Loading a cred whose lastUsedAt is within that window
+// would 486 every bootstrap allocation, and the extension can't
+// recover before iOS kills it on startTunnel timeout.
+//
+// Slots with lastUsedAt == 0 (background-grower-filled but never used
+// by any conn — typically the "+1 reserve" slot) are safe regardless
+// of file age: VK has no allocations on them.
+//
+// vpn.wifi.9.log on 2026-05-01: reconnect 6 minutes after disconnect
+// entered an infinite preparing → connecting → disconnecting loop
+// because the only persisted slot (slot 0) was reused from cache and
+// VK still had its 10 lingering allocations from the prior session.
+const credSaturationCooldown = 10 * time.Minute
+
+// credPeriodicSaveInterval keeps the on-disk file's per-slot
+// lastUsedAt within ~1 minute of reality even when no fetch / invalidate
+// events fire (steady state, no pool churn). Without this, an extension
+// that ran cleanly for hours then got jetsam'd would leave the disk
+// reflecting only the initial-startup save, with lastUsedAt frozen at
+// "fetch time" — far enough in the past that the per-entry cooldown
+// would mistakenly mark all slots as safe even though their
+// allocations were still live until the kill moment.
+const credPeriodicSaveInterval = 60 * time.Second
+
+// credCacheFile is the JSON-on-disk shape persisted to App Group container.
+// One file per pool. Contents are non-secret: VK TURN creds are session
+// tokens with ~8h validity, sandbox-protected by App Group entitlement.
+// Runtime state (saturatedUntil, cooldownUntil, active count, fetching)
+// is intentionally excluded — those are per-process and shouldn't survive
+// across launches.
+type credCacheFile struct {
+	Version int              `json:"version"`
+	SavedAt int64            `json:"saved_at"`
+	Creds   []credCacheEntry `json:"creds"`
+}
+
+type credCacheEntry struct {
+	Slot     int    `json:"slot"`
+	Address  string `json:"address"`
+	Username string `json:"username"`
+	Password string `json:"password"`
+	// LastUsedAt is the most recent moment a conn was holding a TURN
+	// allocation against this cred (Unix seconds, 0 = never used in
+	// this session). Drives the per-entry saturation-cooldown check
+	// in loadFromDisk. saveToDisk substitutes time.Now() for slots
+	// that are currently active so a kill mid-session still records
+	// "this slot was alive" rather than the last release time.
+	LastUsedAt int64 `json:"last_used_at,omitempty"`
 }
 
 // credPool holds up to `size` independent TURN credential slots, one per
@@ -601,6 +690,20 @@ type credPool struct {
 	// the pool may choose to fall back to an existing entry instead of
 	// surfacing the error.
 	fetch func(allowCaptchaBlock bool) (string, *TURNCreds, error)
+
+	// cachePath is the on-disk JSON file that persists the pool across
+	// extension launches. Empty disables persistence. The file lives in
+	// the App Group container alongside vpn.log and is sandbox-protected
+	// by the group entitlement. Contents (TURN session tokens, ~8h
+	// validity) are not Keychain-grade sensitive.
+	cachePath string
+
+	// saveMu serializes disk writes. saveToDisk snapshots pool state under
+	// cp.mu (briefly), then releases cp.mu and writes under saveMu — this
+	// avoids holding cp.mu during the (potentially slow) filesystem write
+	// while still preventing concurrent writers from racing on the .tmp
+	// file before the atomic rename.
+	saveMu sync.Mutex
 }
 
 // poolSizeForNumConns derives the cred pool size from the configured
@@ -663,9 +766,21 @@ func poolSizeForNumConns(n int) int {
 // conn's get() returns them without any VK API call, avoiding the
 // .connecting-window deadlock where a cold credPool would trigger another
 // captcha request the main app can't service.
+//
+// If the slot already holds a fresh cred (e.g. loaded from disk on
+// startup), the seed is ignored — the pre-existing cred is presumed
+// equally valid and equally usable, so there's no point overwriting it.
+// This is what makes "main app reads cache and uses cached cred as the
+// pre-bootstrap seed" work cleanly: the cache-read in the app and the
+// independent loadFromDisk in this pool both arrive at the same cred,
+// and seedSlot recognizes that and no-ops.
 func (cp *credPool) seedSlot(slot int, addr string, creds *TURNCreds) {
 	cp.mu.Lock()
-	defer cp.mu.Unlock()
+	if len(cp.pool) > slot && cp.isFreshLocked(slot) {
+		cp.mu.Unlock()
+		log.Printf("credpool: seed for slot %d ignored — slot already has a fresh cred (likely loaded from disk)", slot)
+		return
+	}
 	for len(cp.pool) <= slot {
 		cp.pool = append(cp.pool, credPoolEntry{})
 	}
@@ -674,6 +789,32 @@ func (cp *credPool) seedSlot(slot int, addr string, creds *TURNCreds) {
 		creds: creds,
 		ts:    time.Now(),
 	}
+	// Dedup: clear any OTHER slot holding the same VK cred set. This
+	// happens when app-side reads creds-pool.json, picks an entry
+	// (e.g. a never-used reserve slot) as the seed, and our own
+	// loadFromDisk also loads that same entry into its original slot.
+	// Without dedup the same cred ends up in two slots: pool count is
+	// inflated, conns falling back to the duplicate slot compete for
+	// the same VK 10-allocation quota, and background grower thinks
+	// it has more cred sets than it really does.
+	//
+	// Username uniquely identifies a VK cred set per
+	// draft-uberti-behave-turn-rest format (<expiry_unix>:<key_id>):
+	// VK never reissues the same key_id+expiry tuple to a different
+	// session, so equal usernames mean equal cred sets.
+	duplicates := 0
+	if creds != nil {
+		for i := range cp.pool {
+			if i == slot {
+				continue
+			}
+			if cp.pool[i].creds != nil && cp.pool[i].creds.Username == creds.Username {
+				cp.pool[i] = credPoolEntry{}
+				duplicates++
+			}
+		}
+	}
+	cp.mu.Unlock()
 	if creds != nil {
 		if exp, ok := parseCredExpiry(creds.Username); ok {
 			log.Printf("credpool: seeded slot %d with externally-provided creds (addr=%s, expires in %s)",
@@ -681,10 +822,15 @@ func (cp *credPool) seedSlot(slot int, addr string, creds *TURNCreds) {
 		} else {
 			log.Printf("credpool: seeded slot %d with externally-provided creds (addr=%s, malformed username — will refetch on first use)", slot, addr)
 		}
+		if duplicates > 0 {
+			log.Printf("credpool: cleared %d duplicate slot(s) holding the same cred set as slot %d (disk-load + app-seed convergence)",
+				duplicates, slot)
+		}
 	}
+	cp.saveToDisk()
 }
 
-func newCredPool(size int, cooldown time.Duration, fetch func(bool) (string, *TURNCreds, error)) *credPool {
+func newCredPool(ctx context.Context, size int, cooldown time.Duration, cachePath string, fetch func(bool) (string, *TURNCreds, error)) *credPool {
 	if size < 1 {
 		size = 1
 	}
@@ -692,12 +838,216 @@ func newCredPool(size int, cooldown time.Duration, fetch func(bool) (string, *TU
 		cooldown = 2 * time.Minute
 	}
 	cp := &credPool{
-		size:     size,
-		cooldown: cooldown,
-		fetch:    fetch,
+		size:      size,
+		cooldown:  cooldown,
+		cachePath: cachePath,
+		fetch:     fetch,
 	}
-	log.Printf("credpool: initialized with %d slots (expiry-buffer=%s, cooldown=%s)", size, credExpiryBuffer, cp.cooldown)
+	if cachePath != "" {
+		cp.loadFromDisk()
+		// Periodic-save goroutine keeps lastUsedAt fresh on disk so a
+		// kill-mid-session leaves the file reflecting current activity.
+		// See credPeriodicSaveInterval comment.
+		go cp.runPeriodicSave(ctx)
+	}
+	log.Printf("credpool: initialized with %d slots (expiry-buffer=%s, cooldown=%s, cache=%q)", size, credExpiryBuffer, cp.cooldown, cachePath)
 	return cp
+}
+
+// runPeriodicSave wakes every credPeriodicSaveInterval and re-snapshots
+// the pool to disk. The snapshot stamps LastUsedAt = now for every
+// currently-active slot so the on-disk view stays within ~1 minute of
+// "what slots were last holding live VK allocations" even when no fetch
+// or invalidate event fires (steady-state). Exits when ctx is cancelled.
+func (cp *credPool) runPeriodicSave(ctx context.Context) {
+	ticker := time.NewTicker(credPeriodicSaveInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			cp.saveToDisk()
+		case <-ctx.Done():
+			// Final save on shutdown so any in-memory lastUsedAt
+			// updates from release() since the last tick make it
+			// to disk before the goroutine exits.
+			cp.saveToDisk()
+			return
+		}
+	}
+}
+
+// loadFromDisk populates the pool from cachePath (JSON written by a prior
+// process). Skips entries whose username-encoded expiry has elapsed
+// (with credExpiryBuffer margin), entries whose slot index exceeds the
+// current pool size (handles users shrinking NumConns between launches),
+// and the whole file on parse error or version mismatch — the pool just
+// stays empty in those cases and the normal fetch path takes over.
+//
+// Called once from newCredPool before the proxy starts handing out conns,
+// so no other goroutine is touching cp.pool yet — but we still take cp.mu
+// for clarity and to satisfy isFreshLocked's lock-held precondition.
+func (cp *credPool) loadFromDisk() {
+	data, err := os.ReadFile(cp.cachePath)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			log.Printf("credpool: load: read %s: %v", cp.cachePath, err)
+		}
+		return
+	}
+	var f credCacheFile
+	if err := json.Unmarshal(data, &f); err != nil {
+		log.Printf("credpool: load: corrupt JSON in %s: %v — ignoring file", cp.cachePath, err)
+		return
+	}
+	if f.Version != credCacheVersion {
+		log.Printf("credpool: load: version %d != expected %d — ignoring file", f.Version, credCacheVersion)
+		return
+	}
+
+	cp.mu.Lock()
+	defer cp.mu.Unlock()
+
+	now := time.Now()
+	loaded, skipped := 0, 0
+	for _, entry := range f.Creds {
+		if entry.Slot < 0 || entry.Slot >= cp.size {
+			skipped++
+			continue
+		}
+		creds := &TURNCreds{
+			Username: entry.Username,
+			Password: entry.Password,
+			Address:  entry.Address,
+		}
+		exp, ok := parseCredExpiry(creds.Username)
+		if !ok {
+			log.Printf("credpool: load: slot %d malformed username, skipping", entry.Slot)
+			skipped++
+			continue
+		}
+		if exp.Sub(now) < credExpiryBuffer {
+			log.Printf("credpool: load: slot %d expired or expiring within %s, skipping (expires in %s)",
+				entry.Slot, credExpiryBuffer, time.Until(exp).Round(time.Second))
+			skipped++
+			continue
+		}
+		// Per-slot saturation cooldown. lastUsedAt == 0 means the slot
+		// was filled but no conn ever took it (background-grower
+		// reserve case) — VK has no allocations on this cred, safe.
+		// Otherwise enforce a 10-min gap from the last release moment.
+		if entry.LastUsedAt > 0 {
+			lastUsed := time.Unix(entry.LastUsedAt, 0)
+			sinceUse := now.Sub(lastUsed)
+			if sinceUse < credSaturationCooldown {
+				log.Printf("credpool: load: slot %d last used %s ago (< %s), skipping to avoid VK 486 on lingering allocations",
+					entry.Slot, sinceUse.Round(time.Second), credSaturationCooldown)
+				skipped++
+				continue
+			}
+		}
+		for len(cp.pool) <= entry.Slot {
+			cp.pool = append(cp.pool, credPoolEntry{})
+		}
+		var lastUsed time.Time
+		if entry.LastUsedAt > 0 {
+			lastUsed = time.Unix(entry.LastUsedAt, 0)
+		}
+		cp.pool[entry.Slot] = credPoolEntry{
+			addr:       entry.Address,
+			creds:      creds,
+			ts:         now,
+			lastUsedAt: lastUsed,
+		}
+		loaded++
+		usageNote := "never used in last session"
+		if entry.LastUsedAt > 0 {
+			usageNote = fmt.Sprintf("last used %s ago", now.Sub(time.Unix(entry.LastUsedAt, 0)).Round(time.Second))
+		}
+		log.Printf("credpool: load: slot %d ready (addr=%s, expires in %s, %s)",
+			entry.Slot, entry.Address, time.Until(exp).Round(time.Second), usageNote)
+	}
+	log.Printf("credpool: loaded %d slots from disk (%d skipped); file saved at %s",
+		loaded, skipped, time.Unix(f.SavedAt, 0).Format(time.RFC3339))
+}
+
+// saveToDisk snapshots the pool's filled slots and writes them to
+// cachePath via tmp+rename. Called from any code path that mutates
+// pool[].creds: seedSlot (slot 0 from app), tryFill / get's fetch
+// branches (background grower and inline fetch), invalidateEntry (after
+// a 401/403 drops a slot — the next snapshot just won't include it).
+//
+// Snapshot is taken under cp.mu (brief), but the actual file write runs
+// under saveMu only — we don't want to block credPool callers on disk
+// I/O. Two concurrent fetches completing simultaneously will serialize
+// here without trampling each other's .tmp file.
+func (cp *credPool) saveToDisk() {
+	if cp.cachePath == "" {
+		return
+	}
+
+	now := time.Now()
+	cp.mu.Lock()
+	f := credCacheFile{
+		Version: credCacheVersion,
+		SavedAt: now.Unix(),
+	}
+	for slot, entry := range cp.pool {
+		if entry.creds == nil {
+			continue
+		}
+		// For active slots stamp LastUsedAt as "now" — the slot is
+		// holding live VK allocations at this very moment, which is the
+		// most recent ground truth we have. release() will update the
+		// in-memory lastUsedAt when active drops to 0; until then the
+		// in-memory value may be stale (e.g. zero for a slot that was
+		// filled by background grower and is currently in active use).
+		var lastUsed int64
+		if entry.active > 0 {
+			lastUsed = now.Unix()
+		} else if !entry.lastUsedAt.IsZero() {
+			lastUsed = entry.lastUsedAt.Unix()
+		}
+		f.Creds = append(f.Creds, credCacheEntry{
+			Slot:       slot,
+			Address:    entry.addr,
+			Username:   entry.creds.Username,
+			Password:   entry.creds.Password,
+			LastUsedAt: lastUsed,
+		})
+	}
+	cp.mu.Unlock()
+
+	cp.saveMu.Lock()
+	defer cp.saveMu.Unlock()
+
+	data, err := json.MarshalIndent(f, "", "  ")
+	if err != nil {
+		log.Printf("credpool: save: marshal: %v", err)
+		return
+	}
+
+	tmpPath := cp.cachePath + ".tmp"
+	// Best-effort cleanup: remove any tmp file left from a prior crash.
+	// Ignore errors — WriteFile below will fail loud if anything's
+	// genuinely wrong with the directory.
+	_ = os.Remove(tmpPath)
+	if err := os.WriteFile(tmpPath, data, 0600); err != nil {
+		log.Printf("credpool: save: write %s: %v", tmpPath, err)
+		return
+	}
+	if err := os.Rename(tmpPath, cp.cachePath); err != nil {
+		log.Printf("credpool: save: rename %s -> %s: %v", tmpPath, cp.cachePath, err)
+		_ = os.Remove(tmpPath)
+		return
+	}
+	// Ensure the directory entry hits the disk too — on iOS App Group
+	// containers the parent directory's metadata write isn't always
+	// flushed by rename alone. Best-effort, log only.
+	if dir, err := os.Open(filepath.Dir(cp.cachePath)); err == nil {
+		_ = dir.Sync()
+		_ = dir.Close()
+	}
+	log.Printf("credpool: saved %d slots to disk", len(f.Creds))
 }
 
 // get returns (addr, creds, credSlot, err) for the given connIdx.
@@ -831,6 +1181,7 @@ func (cp *credPool) get(connIdx int, allowCaptchaBlock bool) (string, *TURNCreds
 		cp.mu.Unlock()
 		log.Printf("credpool: conn %d fetched fresh cred into slot %d (%d/%d slots filled)",
 			connIdx, target, filled, cp.size)
+		cp.saveToDisk()
 		return addr, creds, target, nil
 	}
 
@@ -859,6 +1210,13 @@ func (cp *credPool) get(connIdx int, allowCaptchaBlock bool) (string, *TURNCreds
 // caller is no longer using its cred. Must be paired with a successful
 // get() on the same slot. Idempotent for invalid slot indices (e.g. -1
 // from a get() that errored out).
+//
+// When active drops to zero we stamp lastUsedAt with the current time —
+// that's the latest moment we can be sure the slot was carrying live
+// VK-side allocations. saveToDisk persists this so the next launch can
+// decide per-slot whether enough time has passed for those allocations
+// to have expired server-side (~10 min lifetime) before reusing the
+// cred. See loadFromDisk's per-entry cooldown check.
 func (cp *credPool) release(slot int) {
 	if slot < 0 {
 		return
@@ -870,6 +1228,9 @@ func (cp *credPool) release(slot int) {
 	}
 	if cp.pool[slot].active > 0 {
 		cp.pool[slot].active--
+		if cp.pool[slot].active == 0 {
+			cp.pool[slot].lastUsedAt = time.Now()
+		}
 	}
 }
 
@@ -933,6 +1294,7 @@ func (cp *credPool) tryFill(slot int, allowCaptchaBlock bool) bool {
 		filled := cp.countFreshLocked()
 		cp.mu.Unlock()
 		log.Printf("credpool: background filled slot %d (%d/%d slots filled)", slot, filled, cp.size)
+		cp.saveToDisk()
 		return true
 	}
 	cp.pool[slot].cooldownUntil = time.Now().Add(cp.cooldown)
@@ -987,15 +1349,25 @@ func (cp *credPool) invalidate() {
 // Callers should pass the slot that actually produced the bad cred —
 // for conns that fell back via credPool.get fallback, that's the
 // credSlot returned by get(), NOT the caller's connIdx.
+//
+// Persists the new pool state to disk so the next launch doesn't try
+// to use this server-rejected cred (which would cost a 401 round-trip
+// to discover the same thing). saveToDisk is a snapshot of current
+// pool[].creds, so dropping the entry above is enough — no separate
+// "delete from cache file" step.
 func (cp *credPool) invalidateEntry(slot int) {
 	if slot < 0 {
 		return
 	}
 	cp.mu.Lock()
+	dropped := slot < len(cp.pool) && cp.pool[slot].creds != nil
 	if slot < len(cp.pool) {
 		cp.pool[slot] = credPoolEntry{}
 	}
 	cp.mu.Unlock()
+	if dropped {
+		cp.saveToDisk()
+	}
 }
 
 // snapshotSize returns (freshCount, totalCapacity) of the pool — used by

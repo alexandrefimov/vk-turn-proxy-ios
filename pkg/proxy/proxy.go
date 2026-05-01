@@ -41,6 +41,14 @@ type Config struct {
 	// credentials so the first conn establishes immediately without
 	// hitting VK's API. Used by the pre-bootstrap captcha flow.
 	SeededTURN *TURNCreds
+	// CredCachePath is the on-disk JSON file the credPool uses to persist
+	// fetched credentials across extension launches. Empty disables
+	// persistence. Typically set to "<App Group container>/creds-pool.json"
+	// alongside the log file. Cred contents are session tokens with ~8h
+	// validity, so the file becomes useful for short-cycle reconnects
+	// (user toggling VPN, iOS killing the extension and respawning) but
+	// expires naturally on its own clock without active cleanup.
+	CredCachePath string
 }
 
 // Stats holds live tunnel statistics.
@@ -218,7 +226,7 @@ func NewProxy(cfg Config) *Proxy {
 	// if <= 0. Per-entry freshness is now derived from each cred's
 	// VK-supplied expiry timestamp (see parseCredExpiry / credExpiryBuffer
 	// in creds.go) — no separate TTL setting needed.
-	p.credPool = newCredPool(poolSizeForNumConns(cfg.NumConns), cfg.CredPoolCooldown, p.fetchFreshCreds)
+	p.credPool = newCredPool(ctx, poolSizeForNumConns(cfg.NumConns), cfg.CredPoolCooldown, cfg.CredCachePath, p.fetchFreshCreds)
 
 	// Seed slot 0 with pre-fetched TURN creds (from main app's pre-bootstrap
 	// captcha flow). The first conn's get() returns these without an API

@@ -32,6 +32,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -237,6 +238,15 @@ func wgStartVKBootstrap(proxyConfigJSON *C.char) C.int32_t {
 		log.Printf("wgStartVKBootstrap: using pre-fetched TURN creds (addr=%s)", seededTURN.Address)
 	}
 
+	// Derive cred-cache path from logFilePath (already pointing into the
+	// App Group container). Same directory, fixed filename. If logging
+	// wasn't configured (logFilePath == ""), persistence is silently
+	// disabled — credPool will treat empty path as "no persist".
+	var credCachePath string
+	if logFilePath != "" {
+		credCachePath = filepath.Join(filepath.Dir(logFilePath), "creds-pool.json")
+	}
+
 	p := proxy.NewProxy(proxy.Config{
 		PeerAddr:         pcfg.PeerAddr,
 		TurnServer:       pcfg.TurnServer,
@@ -247,6 +257,7 @@ func wgStartVKBootstrap(proxyConfigJSON *C.char) C.int32_t {
 		NumConns:         pcfg.NumConns,
 		CredPoolCooldown: time.Duration(pcfg.CredPoolCooldownSeconds) * time.Second,
 		SeededTURN:       seededTURN,
+		CredCachePath:    credCachePath,
 	})
 
 	// Proxy.Start blocks until the first conn is ready or a fatal error

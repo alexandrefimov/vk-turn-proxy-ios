@@ -231,7 +231,26 @@ class TunnelManager: ObservableObject {
             var savedAttempt: Double = 0
             var seededTURN: (address: String, username: String, password: String)? = nil
 
-            probeLoop: for attempt in 1...5 {
+            // Cache fast-path: the extension persists every successfully-
+            // fetched VK cred to creds-pool.json in the App Group container
+            // (see pkg/proxy/creds.go credPool.saveToDisk). On a typical
+            // reconnect within the cred's ~8h validity window, we already
+            // have a still-valid cred sitting on disk — using it as the
+            // seeded TURN cred lets the extension establish the first conn
+            // without ANY VK API call, captcha, or rate-limit risk.
+            //
+            // If loadValidCred() returns nil (no file / expired entries /
+            // parse error), we fall through to the normal probe loop and
+            // the extension's credPool will repopulate the cache on its
+            // first successful fetch.
+            if let cached = CredCache.loadValidCred() {
+                seededTURN = cached
+                SharedLogger.shared.log("[AppDebug] pre-bootstrap: using cached TURN cred from disk (addr=\(cached.address)), skipping captcha probe")
+            } else {
+                SharedLogger.shared.log("[AppDebug] pre-bootstrap: no usable cached cred (no file or all entries expired), starting captcha probe")
+            }
+
+            probeLoop: for attempt in 1...5 where seededTURN == nil {
                 SharedLogger.shared.log("[AppDebug] pre-bootstrap probe attempt \(attempt)/5")
                 let result = await probeVKCreds(
                     linkID: linkID,
