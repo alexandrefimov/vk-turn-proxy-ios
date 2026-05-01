@@ -1329,12 +1329,14 @@ struct TunnelConfig {
     var peerAddress: String = ""  // vk-turn-proxy server host:port
     var useDTLS: Bool = true
     var useUDP: Bool = true
-    var numConnections: Int = 10 // configurable from Settings (VK allows max ~10 allocations)
+    var numConnections: Int = 30 // configurable from Settings; VK allows ~10 simultaneous TURN allocations per cred set, so 30 conns spreads over ceil(N/10) = 3 cred sets plus a "+1 reserve" (4 total slots). 30 strikes a useful balance: enough parallelism for high-throughput single sessions, few enough to avoid overwhelming VK's per-IP rate-limit on cred refresh.
     // Per-slot cooldown after a failed fetch (typically captcha required).
     // Slot stays in cooldown for this long before being eligible to retry.
     // Shorter = pool recovers faster when VK cools down, longer = less VK
-    // pressure but slower recovery. Default 120s.
-    var credPoolCooldownSeconds: Int = 120
+    // pressure but slower recovery. Default 150s — long enough for VK to
+    // forget our captcha-failure rate-limit window without making real
+    // failed-cred recovery feel laggy.
+    var credPoolCooldownSeconds: Int = 150
     var turnServerOverride: String?
     var turnPortOverride: String?
 }

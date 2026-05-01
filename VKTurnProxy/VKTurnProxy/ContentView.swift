@@ -18,8 +18,8 @@ struct ContentView: View {
     @AppStorage("vkLink") private var vkLink = ""
     @AppStorage("peerAddress") private var peerAddress = ""
     @AppStorage("useDTLS") private var useDTLS = true
-    @AppStorage("numConnections") private var numConnections = 10
-    @AppStorage("credPoolCooldownSeconds") private var credPoolCooldownSeconds = 120
+    @AppStorage("numConnections") private var numConnections = 30
+    @AppStorage("credPoolCooldownSeconds") private var credPoolCooldownSeconds = 150
 
     var body: some View {
         NavigationView {
@@ -189,8 +189,8 @@ struct SettingsView: View {
     @AppStorage("vkLink") private var vkLink = ""
     @AppStorage("peerAddress") private var peerAddress = ""
     @AppStorage("useDTLS") private var useDTLS = true
-    @AppStorage("numConnections") private var numConnections = 10
-    @AppStorage("credPoolCooldownSeconds") private var credPoolCooldownSeconds = 120
+    @AppStorage("numConnections") private var numConnections = 30
+    @AppStorage("credPoolCooldownSeconds") private var credPoolCooldownSeconds = 150
 
     var body: some View {
         Form {
