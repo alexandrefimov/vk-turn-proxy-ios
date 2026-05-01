@@ -1,6 +1,7 @@
 import SwiftUI
 import NetworkExtension
 import WebKit
+import UniformTypeIdentifiers
 import os.log
 
 private let captchaLog = OSLog(subsystem: "com.vkturnproxy.app", category: "Captcha")
@@ -192,6 +193,25 @@ struct SettingsView: View {
     @AppStorage("numConnections") private var numConnections = 30
     @AppStorage("credPoolCooldownSeconds") private var credPoolCooldownSeconds = 150
 
+    // Backup & Restore state. exportURL drives the share sheet; the
+    // sheet only appears when this is non-nil so the URL is guaranteed
+    // valid by the time UIActivityViewController is constructed. Each
+    // confirm alert and the document picker are gated by their own
+    // `show*` flag — keeping them independent prevents any one of them
+    // from blocking the others if the user rapid-taps.
+    //
+    // Wrapped in IdentifiableURL because sheet(item:) requires the bound
+    // type to be Identifiable, and we deliberately avoid extending URL
+    // itself — Apple may ship that conformance in a future Foundation
+    // and the resulting silent override would be a debugging trap.
+    @State private var exportURL: IdentifiableURL? = nil
+    @State private var showImportPicker = false
+    @State private var pendingImportConfig: AppConfig? = nil
+    @State private var showImportConfirm = false
+    @State private var showResetConfirm = false
+    @State private var alertMessage: String? = nil
+    @State private var alertTitle: String = ""
+
     var body: some View {
         Form {
             Section("VK TURN Proxy") {
@@ -233,8 +253,190 @@ struct SettingsView: View {
                 TextField("Allowed IPs", text: $allowedIPs)
                     .autocapitalization(.none)
             }
+
+            Section {
+                Button(action: handleExport) {
+                    Label("Export Full Backup…", systemImage: "square.and.arrow.up")
+                }
+
+                Button(action: { showImportPicker = true }) {
+                    Label("Import Full Backup…", systemImage: "square.and.arrow.down")
+                }
+
+                Button(role: .destructive, action: { showResetConfirm = true }) {
+                    Label("Reset TURN Cache", systemImage: "trash")
+                }
+            } header: {
+                Text("Backup & Restore")
+            } footer: {
+                // Make the sensitivity explicit. Settings + WireGuard
+                // private/preshared keys + cached VK TURN credentials
+                // give whoever holds the file the same VPN access the
+                // user has — there's no encryption layer.
+                Text("Backup contains all settings, WireGuard keys, and TURN credentials. Treat the exported file as a secret.")
+            }
         }
         .navigationTitle("Settings")
+        // Share sheet for the freshly-exported temp file. Bound to a
+        // sheet(item:) so the file is in scope while the sheet is open
+        // and gets cleaned up implicitly when SwiftUI sets the binding
+        // back to nil after dismissal.
+        .sheet(item: $exportURL) { wrapped in
+            ShareSheet(activityItems: [wrapped.url])
+        }
+        // Document picker for Import. Filtering on .json keeps random
+        // unrelated files out of the picker — the AppConfig decode would
+        // reject them anyway, but the friendly hint is nicer.
+        .sheet(isPresented: $showImportPicker) {
+            DocumentPicker(contentTypes: [.json]) { url in
+                handleImportPicked(url: url)
+            }
+        }
+        // Import confirm — shown after the picker hands us a valid file
+        // we successfully parsed. pendingImportConfig is the parsed
+        // AppConfig waiting to be applied; the alert's primary button
+        // does the apply.
+        .alert("Import Backup?", isPresented: $showImportConfirm, presenting: pendingImportConfig) { config in
+            Button("Import", role: .destructive) {
+                applyPendingImport(config)
+            }
+            Button("Cancel", role: .cancel) {
+                pendingImportConfig = nil
+            }
+        } message: { config in
+            let date = Date(timeIntervalSince1970: TimeInterval(config.exportedAt))
+            let formatter = DateFormatter()
+            formatter.dateStyle = .medium
+            formatter.timeStyle = .short
+            let credCount = config.turnPool?.creds.count ?? 0
+            return Text("Backup from \(formatter.string(from: date)) with \(credCount) cached TURN cred(s). This will overwrite all current settings.")
+        }
+        // Reset confirm — destructive button on the alert removes the
+        // creds-pool.json. UserDefaults are untouched.
+        .alert("Reset TURN Cache?", isPresented: $showResetConfirm) {
+            Button("Reset", role: .destructive) {
+                handleReset()
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Deletes the cached TURN credentials. The pool will be rebuilt on next connect via the regular VK API + captcha flow.")
+        }
+        // Result alert — shared across export/import/reset success and
+        // error paths since the message is what differs, not the
+        // presentation. Dismiss is just OK.
+        .alert(alertTitle, isPresented: Binding(
+            get: { alertMessage != nil },
+            set: { if !$0 { alertMessage = nil } }
+        )) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            if let msg = alertMessage {
+                Text(msg)
+            }
+        }
+    }
+
+    // MARK: - Backup actions
+
+    private func handleExport() {
+        do {
+            let url = try BackupManager.exportToTempFile()
+            exportURL = IdentifiableURL(url: url)
+        } catch {
+            alertTitle = "Export Failed"
+            alertMessage = error.localizedDescription
+        }
+    }
+
+    private func handleImportPicked(url: URL) {
+        do {
+            let config = try BackupManager.importFromFileURL(url)
+            pendingImportConfig = config
+            showImportConfirm = true
+        } catch {
+            alertTitle = "Import Failed"
+            alertMessage = error.localizedDescription
+        }
+    }
+
+    private func applyPendingImport(_ config: AppConfig) {
+        do {
+            try BackupManager.applyConfig(config)
+            pendingImportConfig = nil
+            alertTitle = "Import Complete"
+            let credCount = config.turnPool?.creds.count ?? 0
+            alertMessage = "Settings restored. TURN cache: \(credCount) slot(s)."
+        } catch {
+            alertTitle = "Import Failed"
+            alertMessage = error.localizedDescription
+        }
+    }
+
+    private func handleReset() {
+        do {
+            try BackupManager.resetTurnCache()
+            alertTitle = "TURN Cache Cleared"
+            alertMessage = "creds-pool.json deleted. The pool will be rebuilt on next connect."
+        } catch {
+            alertTitle = "Reset Failed"
+            alertMessage = error.localizedDescription
+        }
+    }
+}
+
+/// Wraps a URL so sheet(item:) can use it without us conforming URL itself
+/// to Identifiable — see exportURL's comment for why we avoid the
+/// retroactive conformance.
+struct IdentifiableURL: Identifiable {
+    let url: URL
+    var id: String { url.absoluteString }
+}
+
+// MARK: - Document Picker (Import file)
+
+/// UIDocumentPickerViewController wrapper for picking a JSON backup file.
+/// The picker hands back a security-scoped URL that the caller must
+/// access via startAccessingSecurityScopedResource — BackupManager.importFromFileURL
+/// handles that internally so this wrapper just forwards the URL.
+///
+/// contentTypes is `[UTType]` rather than `[String]` so callers pass the
+/// type-safe `UTType.json` (or similar) directly — earlier code took a
+/// `[String]` of UTI identifiers and converted via the failable
+/// `UTType(_:)` init. When that init returned nil for any reason, the
+/// resulting empty filter let the picker show every file as selectable
+/// AND failed to highlight the genuine JSON ones — observed empirically
+/// during the schema migration test where vkturnproxy-backup-*.json sat
+/// un-highlighted in Files.app's Downloads view and had to be located by
+/// search instead of by browsing.
+struct DocumentPicker: UIViewControllerRepresentable {
+    let contentTypes: [UTType]
+    let onPicked: (URL) -> Void
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(onPicked: onPicked)
+    }
+
+    func makeUIViewController(context: Context) -> UIDocumentPickerViewController {
+        let picker = UIDocumentPickerViewController(
+            forOpeningContentTypes: contentTypes
+        )
+        picker.delegate = context.coordinator
+        picker.allowsMultipleSelection = false
+        return picker
+    }
+
+    func updateUIViewController(_ uiViewController: UIDocumentPickerViewController, context: Context) {}
+
+    class Coordinator: NSObject, UIDocumentPickerDelegate {
+        let onPicked: (URL) -> Void
+        init(onPicked: @escaping (URL) -> Void) {
+            self.onPicked = onPicked
+        }
+
+        func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
+            guard let url = urls.first else { return }
+            onPicked(url)
+        }
     }
 }
 
