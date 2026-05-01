@@ -556,6 +556,25 @@ type credPoolEntry struct {
 	// the TURN session ends or the conn switches to a different slot).
 	active int
 
+	// availableAt is the earliest moment this slot's cred is safe to
+	// hand out. Set by loadFromDisk when the on-disk lastUsedAt falls
+	// within credSaturationCooldown of now: instead of dropping the
+	// cred (forcing an expensive fresh VK fetch via PoW that can take
+	// 10-30+ minutes when VK is hostile), we keep it in the pool but
+	// mark it not-yet-usable until availableAt. entryIsFresh returns
+	// false while now < availableAt, so get() Phase 1 ignores the slot
+	// and pickSlotToFill skips it (background grower won't overwrite a
+	// soon-available cred with a new fetch).
+	//
+	// Once availableAt passes (~10 min after the previous session's
+	// last release), VK's lingering allocations have timed out
+	// server-side and the cred is safe again. The slot becomes "fresh"
+	// without any VK API call.
+	//
+	// Zero value means the cred is immediately usable (no pending
+	// cooldown). Cleared on any successful fetch into this slot.
+	availableAt time.Time
+
 	// lastUsedAt is the most recent moment when this slot's `active`
 	// count transitioned from >0 to 0 — i.e. the last conn to hold a
 	// TURN allocation against this cred just released it. While `active`
@@ -784,6 +803,16 @@ func (cp *credPool) seedSlot(slot int, addr string, creds *TURNCreds) {
 	for len(cp.pool) <= slot {
 		cp.pool = append(cp.pool, credPoolEntry{})
 	}
+	// If the target slot already holds a pending cred (loaded from
+	// disk, waiting on saturation cooldown) with a DIFFERENT cred set
+	// than the seed, we'll move it aside instead of dropping it — it
+	// might still become useful in 10 minutes. Slots vacated by the
+	// dedup pass below are good targets for the relocation.
+	var displaced *credPoolEntry
+	if entry := cp.pool[slot]; entry.creds != nil && entry.creds.Username != creds.Username {
+		copyEntry := entry
+		displaced = &copyEntry
+	}
 	cp.pool[slot] = credPoolEntry{
 		addr:  addr,
 		creds: creds,
@@ -814,6 +843,20 @@ func (cp *credPool) seedSlot(slot int, addr string, creds *TURNCreds) {
 			}
 		}
 	}
+	// Relocate the pre-seed pending cred (if any) into the first now-
+	// empty slot. We'd rather keep it pending and have it become
+	// usable in 10 min than discard a perfectly good cred and pay
+	// the VK PoW tax to refetch.
+	relocatedTo := -1
+	if displaced != nil {
+		for i := range cp.pool {
+			if cp.pool[i].creds == nil {
+				cp.pool[i] = *displaced
+				relocatedTo = i
+				break
+			}
+		}
+	}
 	cp.mu.Unlock()
 	if creds != nil {
 		if exp, ok := parseCredExpiry(creds.Username); ok {
@@ -825,6 +868,13 @@ func (cp *credPool) seedSlot(slot int, addr string, creds *TURNCreds) {
 		if duplicates > 0 {
 			log.Printf("credpool: cleared %d duplicate slot(s) holding the same cred set as slot %d (disk-load + app-seed convergence)",
 				duplicates, slot)
+		}
+		if relocatedTo >= 0 {
+			log.Printf("credpool: relocated pre-seed pending cred from slot %d to slot %d (will become usable when its saturation cooldown expires)",
+				slot, relocatedTo)
+		} else if displaced != nil {
+			log.Printf("credpool: pre-seed pending cred at slot %d had no empty slot to relocate to, dropped",
+				slot)
 		}
 	}
 	cp.saveToDisk()
@@ -842,6 +892,17 @@ func newCredPool(ctx context.Context, size int, cooldown time.Duration, cachePat
 		cooldown:  cooldown,
 		cachePath: cachePath,
 		fetch:     fetch,
+		// Pre-size to `size` so later code (loadFromDisk, seedSlot,
+		// the relocation loop in seedSlot, etc.) always sees the full
+		// slot array with empty zero-entries in unused positions
+		// rather than a truncated slice that hides real slots. Earlier
+		// code grew the slice lazily with `for len(cp.pool) <= slot
+		// { append... }`; that worked when callers always referenced
+		// every slot eventually, but the seedSlot relocation loop had
+		// no way to find an empty target slot if loadFromDisk only
+		// populated slot 0 (cp.pool had len 1, so the loop saw only
+		// the seed-target slot itself). Pre-sizing fixes that.
+		pool: make([]credPoolEntry, size),
 	}
 	if cachePath != "" {
 		cp.loadFromDisk()
@@ -931,40 +992,50 @@ func (cp *credPool) loadFromDisk() {
 			skipped++
 			continue
 		}
-		// Per-slot saturation cooldown. lastUsedAt == 0 means the slot
-		// was filled but no conn ever took it (background-grower
-		// reserve case) — VK has no allocations on this cred, safe.
-		// Otherwise enforce a 10-min gap from the last release moment.
+		// Per-slot saturation. lastUsedAt == 0 means the slot was
+		// filled but no conn ever took it (background-grower reserve
+		// case) — VK has no allocations on this cred, immediately
+		// usable. Otherwise compute when VK's lingering allocations
+		// will have expired (lastUsedAt + credSaturationCooldown);
+		// while now < availableAt the slot is loaded but PENDING,
+		// not handed out to conns yet. This avoids the 486 cascade
+		// (using cred while VK still has live allocations on it) WHILE
+		// preserving a usable cred we'd otherwise discard — VK's PoW
+		// fetch path takes 10-30+ min on hostile days, far longer than
+		// the 10-min cooldown.
+		var lastUsed, availableAt time.Time
 		if entry.LastUsedAt > 0 {
-			lastUsed := time.Unix(entry.LastUsedAt, 0)
-			sinceUse := now.Sub(lastUsed)
-			if sinceUse < credSaturationCooldown {
-				log.Printf("credpool: load: slot %d last used %s ago (< %s), skipping to avoid VK 486 on lingering allocations",
-					entry.Slot, sinceUse.Round(time.Second), credSaturationCooldown)
-				skipped++
-				continue
+			lastUsed = time.Unix(entry.LastUsedAt, 0)
+			ready := lastUsed.Add(credSaturationCooldown)
+			if now.Before(ready) {
+				availableAt = ready
 			}
 		}
 		for len(cp.pool) <= entry.Slot {
 			cp.pool = append(cp.pool, credPoolEntry{})
 		}
-		var lastUsed time.Time
-		if entry.LastUsedAt > 0 {
-			lastUsed = time.Unix(entry.LastUsedAt, 0)
-		}
 		cp.pool[entry.Slot] = credPoolEntry{
-			addr:       entry.Address,
-			creds:      creds,
-			ts:         now,
-			lastUsedAt: lastUsed,
+			addr:        entry.Address,
+			creds:       creds,
+			ts:          now,
+			lastUsedAt:  lastUsed,
+			availableAt: availableAt,
 		}
 		loaded++
-		usageNote := "never used in last session"
-		if entry.LastUsedAt > 0 {
-			usageNote = fmt.Sprintf("last used %s ago", now.Sub(time.Unix(entry.LastUsedAt, 0)).Round(time.Second))
+		switch {
+		case entry.LastUsedAt == 0:
+			log.Printf("credpool: load: slot %d ready (addr=%s, expires in %s, never used in last session)",
+				entry.Slot, entry.Address, time.Until(exp).Round(time.Second))
+		case availableAt.IsZero():
+			log.Printf("credpool: load: slot %d ready (addr=%s, expires in %s, last used %s ago — outside saturation window)",
+				entry.Slot, entry.Address, time.Until(exp).Round(time.Second),
+				now.Sub(lastUsed).Round(time.Second))
+		default:
+			log.Printf("credpool: load: slot %d pending (addr=%s, expires in %s, last used %s ago — usable in %s once VK allocations expire)",
+				entry.Slot, entry.Address, time.Until(exp).Round(time.Second),
+				now.Sub(lastUsed).Round(time.Second),
+				availableAt.Sub(now).Round(time.Second))
 		}
-		log.Printf("credpool: load: slot %d ready (addr=%s, expires in %s, %s)",
-			entry.Slot, entry.Address, time.Until(exp).Round(time.Second), usageNote)
 	}
 	log.Printf("credpool: loaded %d slots from disk (%d skipped); file saved at %s",
 		loaded, skipped, time.Unix(f.SavedAt, 0).Format(time.RFC3339))
@@ -1139,15 +1210,21 @@ func (cp *credPool) get(connIdx int, allowCaptchaBlock bool) (string, *TURNCreds
 	}
 
 	// Phase 2: no usable fresh slot. Pick a fetch target — first
-	// candidate that's not fresh AND not on cooldown AND not already
-	// being fetched. Prefer ownSlot here too. Skipping fresh-saturated
-	// slots is critical: replacing the cred there would orphan the
-	// 10 conns currently bound to it.
+	// candidate that's not fresh AND not pending AND not on cooldown
+	// AND not already being fetched. Prefer ownSlot here too. Skipping
+	// fresh-saturated slots is critical: replacing the cred there
+	// would orphan the 10 conns currently bound to it. Skipping
+	// pending slots avoids overwriting a disk-loaded cred that's about
+	// to become available on its own — a wasted VK fetch (and likely
+	// captcha attempt) for no benefit.
 	now = time.Now()
 	target := -1
 	for _, slot := range candidatesOrdered() {
 		if cp.isFreshLocked(slot) {
 			continue // saturated-fresh, must not be replaced
+		}
+		if entryIsPending(cp.pool[slot]) {
+			continue // disk-loaded, waiting on saturation cooldown
 		}
 		if now.Before(cp.pool[slot].cooldownUntil) {
 			continue
@@ -1278,6 +1355,14 @@ func (cp *credPool) tryFill(slot int, allowCaptchaBlock bool) bool {
 		cp.mu.Unlock()
 		return true
 	}
+	// Defense in depth: pickSlotToFill already filters pending slots
+	// for the background grower, but a direct tryFill caller (none in
+	// the current code, but harmless future-proofing) shouldn't waste
+	// a VK fetch on a slot that's about to become usable on its own.
+	if entryIsPending(cp.pool[slot]) {
+		cp.mu.Unlock()
+		return true // pending counts as "filled" — the cred is there, just not yet usable
+	}
 	if time.Now().Before(cp.pool[slot].cooldownUntil) || cp.pool[slot].fetching {
 		cp.mu.Unlock()
 		return false
@@ -1305,7 +1390,13 @@ func (cp *credPool) tryFill(slot int, allowCaptchaBlock bool) bool {
 
 // pickSlotToFill returns the index of a slot that is eligible for the
 // background grower to attempt (empty or stale, not fetching, not on
-// cooldown). Returns -1 if nothing to do right now.
+// cooldown, not pending). Returns -1 if nothing to do right now.
+//
+// Pending slots (loaded from disk but waiting on saturation cooldown)
+// are NOT picked: a fresh fetch would overwrite a cred that's about
+// to become available on its own, wasting a VK API call (and risking
+// captcha) for no benefit. Once the cooldown passes, the pending slot
+// transitions to fresh and pickSlotToFill skips it as already-good.
 func (cp *credPool) pickSlotToFill() int {
 	cp.mu.Lock()
 	defer cp.mu.Unlock()
@@ -1317,6 +1408,9 @@ func (cp *credPool) pickSlotToFill() int {
 		e := cp.pool[i]
 		if entryIsFresh(e) {
 			continue // fresh (cred not yet near expiry)
+		}
+		if entryIsPending(e) {
+			continue // loaded from disk, waiting on saturation cooldown
 		}
 		if e.fetching {
 			continue
@@ -1334,8 +1428,16 @@ func (cp *credPool) pickSlotToFill() int {
 // probes that need to force a fresh VK session.
 func (cp *credPool) invalidate() {
 	cp.mu.Lock()
-	n := len(cp.pool)
-	cp.pool = nil
+	n := 0
+	for _, e := range cp.pool {
+		if e.creds != nil {
+			n++
+		}
+	}
+	// Reset to pre-sized empty slice so subsequent ops (seedSlot
+	// relocation, pickSlotToFill iteration) keep seeing the full
+	// slot array; see newCredPool's pre-size comment.
+	cp.pool = make([]credPoolEntry, cp.size)
 	cp.mu.Unlock()
 	if n > 0 {
 		log.Printf("credpool: invalidated %d entries", n)
@@ -1393,6 +1495,12 @@ func (cp *credPool) isFreshLocked(slot int) bool {
 
 // entryIsFresh is the slot-agnostic version, used by isFreshLocked /
 // countFreshLocked / pickSlotToFill on already-snapshotted entries.
+//
+// "Fresh" means the cred is usable RIGHT NOW: it has a valid VK-side
+// expiry far enough in the future, and any saturation cooldown from
+// a prior session has elapsed. Pending-but-loaded creds (creds != nil
+// AND availableAt is in the future) are NOT fresh — get() will skip
+// them so conns don't 486 against still-live allocations.
 func entryIsFresh(e credPoolEntry) bool {
 	if e.creds == nil {
 		return false
@@ -1402,6 +1510,33 @@ func entryIsFresh(e credPoolEntry) bool {
 		// Malformed username — treat as already expired so the next
 		// fetch path replaces it. Safer than trusting an unparseable
 		// cred indefinitely.
+		return false
+	}
+	if !time.Now().Add(credExpiryBuffer).Before(exp) {
+		return false
+	}
+	if !e.availableAt.IsZero() && time.Now().Before(e.availableAt) {
+		return false
+	}
+	return true
+}
+
+// entryIsPending reports whether the slot holds a cred that's
+// load-from-disk-pending: present, with a valid expiry, but not yet
+// past its saturation cooldown. pickSlotToFill uses this to leave
+// pending slots alone — we'd rather wait ~10 min for the prior
+// session's allocations to expire on VK's side than spend 10-30 min
+// chasing a fresh cred through PoW on a hostile day. Once availableAt
+// passes the slot transitions to fresh on its own.
+func entryIsPending(e credPoolEntry) bool {
+	if e.creds == nil {
+		return false
+	}
+	if e.availableAt.IsZero() || !time.Now().Before(e.availableAt) {
+		return false
+	}
+	exp, ok := parseCredExpiry(e.creds.Username)
+	if !ok {
 		return false
 	}
 	return time.Now().Add(credExpiryBuffer).Before(exp)
