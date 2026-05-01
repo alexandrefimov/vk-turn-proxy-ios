@@ -695,18 +695,21 @@ func (p *Proxy) ForceReconnect() {
 }
 
 // WakeHealthCheck is called from Swift wake() whenever iOS resumes the
-// Network Extension. It runs a fast-path variant of the watchdog's
-// condition 3 with a lower threshold: if even 2 pion permission/binding
-// errors have accumulated since the last ForceReconnect, we immediately
-// tear down and rebuild everything, on the assumption that the user is
-// about to use the network and we'd rather spend ~5 seconds reconnecting
-// now than let them hit a broken tunnel.
+// Network Extension. Its job is to clear stale state that accumulated
+// during the iOS freeze: pion's permission-refresh and channel-bind
+// transactions issued just before freeze receive late responses on wake
+// (so pion treats them as failed), and TURN-server permissions that
+// expired during multi-minute freezes get 400 Bad Request on the first
+// post-wake refresh. Both inflate pionTransientErrors with values that
+// don't reflect ongoing tunnel breakage.
 //
-// This complements the normal 30-second watchdog tick: the watchdog is
-// tuned for slow-moving degradation over minutes, while wake() fires
-// precisely when fast detection matters most. Without this hook, a
-// degradation that started during sleep could take several more minutes
-// of accumulated errors after wake before the normal watchdog triggers.
+// We DO NOT trigger ForceReconnect here. An earlier version did
+// (threshold 5), but vpn.wifi.1.log on 2026-05-01 showed this
+// false-positives badly: a single 10-minute freeze produced 150+ pion
+// errors in the same wake-millisecond, blasting past the threshold and
+// cascading into the 486 quota lockout. Resetting instead lets watchdog
+// Condition 2 (errors >= 5 AND first-error-age > 90s) catch genuinely
+// persistent breakage by observing post-wake error rate.
 func (p *Proxy) WakeHealthCheck() {
 	// Don't interfere with an in-progress captcha flow.
 	if v := p.captchaImageURL.Load(); v != nil {
@@ -715,9 +718,10 @@ func (p *Proxy) WakeHealthCheck() {
 		}
 	}
 	pionErrs := p.pionTransientErrors.Load()
-	if pionErrs >= 5 {
-		log.Printf("proxy: wake check — %d pion permission/binding errors accumulated, forcing urgent reconnect", pionErrs)
-		p.ForceReconnect()
+	if pionErrs > 0 {
+		log.Printf("proxy: wake check — clearing %d accumulated pion errors (likely freeze artifacts)", pionErrs)
+		p.pionTransientErrors.Store(0)
+		p.firstPionErrorTime.Store(0)
 	}
 }
 
@@ -749,10 +753,55 @@ func (p *Proxy) runWatchdog() {
 	defer ticker.Stop()
 
 	var zeroConnSince time.Time // when we first noticed zero connections
+	// Tick-gap detector: if the gap between two ticks far exceeds the 30s
+	// interval, our goroutine was suspended (iOS Network Extension freeze).
+	// During that time we couldn't observe packet receipt, so lastRecvTime
+	// is stale through no fault of the tunnel.
+	//
+	// Without this guard, a 6+ minute iOS freeze (common during overnight
+	// sleep) trips Condition 1 on wake even though all 30 conns are alive
+	// and well — see vpn.lte-wifi.0.log on 2026-04-30: 28 false-positive
+	// ForceReconnects between 01:29 and 04:15, each cascading through 486
+	// quota lockouts on all 4 cred slots for 10 minutes. Same pattern as
+	// the zombie-probe false positive (commit at proxy.go:1385) — timer
+	// goroutine pauses during freeze, and judging stale state on wake is
+	// always wrong because we ourselves were not running.
+	//
+	// Initialize lastTickAt to goroutine-creation time, NOT zero, so the
+	// first tick after a freeze that began before any tick-gap reference
+	// was established still detects the freeze. (Less critical for the
+	// watchdog since it starts once at proxy launch, but keeps the
+	// pattern consistent with the per-conn probe-goroutine fix.)
+	lastTickAt := time.Now()
 
 	for {
 		select {
 		case <-ticker.C:
+			now := time.Now()
+			gap := now.Sub(lastTickAt)
+			if gap > 90*time.Second {
+				log.Printf("proxy: watchdog tick gap %s (freeze detected), resetting lastRecvTime",
+					gap.Round(time.Second))
+				p.lastRecvTime.Store(now.Unix())
+				// Pion errors that hit the counter during freeze are
+				// almost always freeze artifacts: refresh transactions
+				// issued pre-freeze get late responses post-wake (no
+				// matching transaction → counted), and TURN permissions
+				// that expired during the freeze return 400 Bad Request
+				// on the first post-wake refresh attempt. Reset both
+				// counters so Condition 2 only fires on errors that
+				// persist beyond 90s after this freeze ended. Defense
+				// in depth — WakeHealthCheck does the same on the
+				// Swift wake() callback path.
+				if cleared := p.pionTransientErrors.Swap(0); cleared > 0 {
+					log.Printf("proxy: watchdog cleared %d accumulated pion errors", cleared)
+				}
+				p.firstPionErrorTime.Store(0)
+				lastTickAt = now
+				continue
+			}
+			lastTickAt = now
+
 			// Don't force reconnect while captcha is pending — a goroutine is
 			// already waiting for the user to solve it. ForceReconnect would
 			// cancel that wait and start a new cycle that hits the same captcha.
@@ -1382,12 +1431,52 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 		var seq uint64
 		pingPkt := make([]byte, len(probePingMagic)+8)
 		copy(pingPkt[0:len(probePingMagic)], probePingMagic)
+		// Tick-gap detector: if the gap between two consecutive ticks is
+		// much larger than probeInterval, our goroutine was suspended
+		// (iOS Network Extension freeze). During that time we couldn't
+		// send pings, so no pongs could come back, and lastPongTime is
+		// stale by the freeze duration through no fault of the conn.
+		// Reset the pong clock on freeze-wake and skip the zombie check
+		// for one round — the next normal tick will send a fresh ping
+		// and the regular probeStaleThreshold gives the conn a fair
+		// 2-minute window to receive a real pong before being judged.
+		//
+		// Without this guard, after a 5+ minute iOS freeze every conn
+		// observes its lastPongTime as "stale 5m+" and self-cancels —
+		// even though the underlying TURN allocation is still valid.
+		// See vpn.wifi.11.log on 2026-04-30 for the failure mode where
+		// 30 conns went zombie simultaneously on wake, triggering a
+		// 486-cascade that locked all 4 cred slots for 10 minutes.
+		//
+		// Initialize lastTickAt to goroutine-creation time, NOT zero.
+		// Otherwise the first tick after a long freeze that started
+		// just after goroutine creation skips the gap check (the old
+		// `!lastTickAt.IsZero()` guard) and proceeds straight to the
+		// zombie check, which fires because lastPongTime is stale by
+		// the full freeze duration. See vpn.wifi.4.log on 2026-05-01:
+		// conns 41-49 respawned at ~12:15:25, then iOS froze for ~5m54s,
+		// and on wake the first probe tick mistakenly killed all of
+		// them as zombies even though it should have detected the
+		// freeze and reset lastPongTime.
+		lastTickAt := time.Now()
 		for {
 			select {
 			case <-ticker.C:
+				now := time.Now()
+				gap := now.Sub(lastTickAt)
+				if gap > 90*time.Second {
+					log.Printf("proxy: [conn %d] probe tick gap %s (freeze detected), resetting pong clock",
+						connIdx, gap.Round(time.Second))
+					if connIdx >= 0 && connIdx < len(p.lastPongTimes) {
+						p.lastPongTimes[connIdx].Store(now.Unix())
+					}
+					lastTickAt = now
+					continue
+				}
+				lastTickAt = now
 				seq++
 				binary.BigEndian.PutUint64(pingPkt[len(probePingMagic):], seq)
-				dtlsConn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+				dtlsConn.SetWriteDeadline(now.Add(5 * time.Second))
 				if _, err := dtlsConn.Write(pingPkt); err != nil {
 					// Write failure means the conn is already broken.
 					// Other goroutines (DTLS recv timeout, TURN reconnect
@@ -1474,7 +1563,8 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 		defer connCancel()
 		buf := make([]byte, 1600)
 		for {
-			dtlsConn.SetReadDeadline(time.Now().Add(30 * time.Second))
+			deadlineSetAt := time.Now()
+			dtlsConn.SetReadDeadline(deadlineSetAt.Add(30 * time.Second))
 			n, err := dtlsConn.Read(buf)
 			if err != nil {
 				if connCtx.Err() != nil {
@@ -1485,6 +1575,21 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 				// If any connection received a packet in the last 3 minutes,
 				// keep this connection alive too.
 				if strings.Contains(err.Error(), "timeout") || strings.Contains(err.Error(), "deadline exceeded") {
+					// Detect iOS Network Extension freeze: if Read took
+					// much longer than the 30s deadline, our goroutine was
+					// suspended. lastRecvTime is stale by the freeze
+					// duration through no fault of the tunnel — treating
+					// it as "tunnel dead" would be a false positive (see
+					// vpn.lte-wifi.0.log on 2026-04-30 for the cascade
+					// mode this triggers). Reset the global clock and
+					// continue with a fresh deadline.
+					elapsed := time.Since(deadlineSetAt)
+					if elapsed > 90*time.Second {
+						log.Printf("proxy: [conn %d] DTLS read elapsed %s (freeze detected), resetting lastRecvTime",
+							connIdx, elapsed.Round(time.Second))
+						p.lastRecvTime.Store(time.Now().Unix())
+						continue
+					}
 					lastRecv := p.lastRecvTime.Load()
 					if lastRecv > 0 && time.Since(time.Unix(lastRecv, 0)) < 3*time.Minute {
 						// Tunnel alive, this connection just didn't get packets
