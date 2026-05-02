@@ -711,6 +711,21 @@ class TunnelManager: ObservableObject {
     private func observeStatus(_ manager: NETunnelProviderManager) {
         statusObserver.map { NotificationCenter.default.removeObserver($0) }
         status = manager.connection.status
+        // App-relaunch case: the tunnel may already be running in
+        // .connected when we attach. NEVPNStatusDidChange only fires on
+        // future transitions, so the switch below would never run for
+        // this initial state and connectedAt would stay nil — making
+        // StatsView show "Connected" alongside Uptime "—" until the
+        // tunnel happens to bounce. Set connectedAt now so live uptime
+        // starts ticking immediately. The clock origin will be "when
+        // the app re-attached" rather than the actual tunnel start
+        // time (we don't have that — the extension would need to report
+        // it via stats), but for a status box that's fine: the user
+        // mainly cares about the "is it ticking" visual cue, not the
+        // absolute number.
+        if status == .connected && connectedAt == nil {
+            connectedAt = Date()
+        }
 
         statusObserver = NotificationCenter.default.addObserver(
             forName: .NEVPNStatusDidChange,
