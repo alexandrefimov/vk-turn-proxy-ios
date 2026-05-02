@@ -476,8 +476,18 @@ struct StatsView: View {
                     )
                 }
                 StatBox(
+                    // Three numbers: fresh / with-creds / total.
+                    //   fresh: slots usable for new conn allocations.
+                    //   with-creds: slots physically holding a cred,
+                    //               including stale (past expiry buffer)
+                    //               or pending ones — existing conns on
+                    //               those slots are still alive.
+                    //   total: configured pool capacity.
+                    // fresh ≤ with-creds ≤ total. They diverge after
+                    // ~7.5h+ of uptime when slot creds approach their
+                    // VK-side 8-hour expiry.
                     title: "Pool",
-                    value: "\(tunnel.stats.credPoolFilled)/\(tunnel.stats.credPoolSize)",
+                    value: "\(tunnel.stats.credPoolFilled)/\(tunnel.stats.credPoolWithCreds)/\(tunnel.stats.credPoolSize)",
                     sub: nil
                 )
             }

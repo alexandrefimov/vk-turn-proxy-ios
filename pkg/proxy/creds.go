@@ -1568,12 +1568,23 @@ func (cp *credPool) slotAvailableChannel() <-chan struct{} {
 	return cp.slotAvailableCh
 }
 
-// snapshotSize returns (freshCount, totalCapacity) of the pool — used by
-// the stats endpoint so the UI can display "X / Y" pool fullness. Takes
-// the lock briefly; safe to call from any goroutine.
-func (cp *credPool) snapshotSize() (filled int, size int) {
+// snapshotSize returns (freshCount, withCredsCount, totalCapacity) of
+// the pool — used by the stats endpoint so the UI can display
+// "fresh / with-creds / total". Takes the lock briefly; safe to call
+// from any goroutine.
+//
+// fresh counts slots usable for NEW conn allocations (entryIsFresh).
+// withCreds counts slots that physically hold a cred — including ones
+// past their expiry buffer or in pending state — i.e. slots where
+// existing conns may still be alive on a now-stale cred until their
+// VK-side allocation lifetime runs out. The two diverge whenever a
+// slot's username-encoded expiry is within 30 min: the slot drops out
+// of "fresh" (UI shows lower number) while existing conns continue
+// functioning until VK actually invalidates the allocation.
+func (cp *credPool) snapshotSize() (fresh int, withCreds int, size int) {
 	cp.mu.Lock()
-	filled = cp.countFreshLocked()
+	fresh = cp.countFreshLocked()
+	withCreds = cp.countWithCredsLocked()
 	size = cp.size
 	cp.mu.Unlock()
 	return
@@ -1643,6 +1654,23 @@ func (cp *credPool) countFreshLocked() int {
 	n := 0
 	for _, e := range cp.pool {
 		if entryIsFresh(e) {
+			n++
+		}
+	}
+	return n
+}
+
+// countWithCredsLocked assumes cp.mu is held. Counts slots that hold a
+// non-nil cred pointer regardless of expiry — i.e. the same predicate
+// saveToDisk uses to decide what to persist. The Stats UI shows this
+// alongside the fresh count so the user can tell apart "cred is gone"
+// from "cred is still in the slot but past its expiry buffer / pending /
+// saturated" — those latter cases keep existing conns alive on the slot
+// even though pickSlotToFill / get's Phase 1 won't grant new ones.
+func (cp *credPool) countWithCredsLocked() int {
+	n := 0
+	for _, e := range cp.pool {
+		if e.creds != nil {
 			n++
 		}
 	}

@@ -14,6 +14,14 @@ struct TunnelStats: Codable {
     var dtlsHandshakeMs: Double = 0
     var reconnects: Int64 = 0
     var credPoolFilled: Int32 = 0
+    // Slots physically holding a cred — superset of credPoolFilled.
+    // Diverges when a slot's cred crosses its 30-min expiry buffer or
+    // enters a pending/saturated state: drops out of "filled" so new
+    // conns won't pick it, but existing conns on it stay alive until
+    // VK-side allocation actually expires. The StatsView "Pool" box
+    // shows both numbers so the user can tell apart "cred is gone" from
+    // "cred is here but not handing out new allocations right now".
+    var credPoolWithCreds: Int32 = 0
     var credPoolSize: Int32 = 0
     var captchaImageURL: String?
     var captchaSID: String?
@@ -27,6 +35,7 @@ struct TunnelStats: Codable {
         case dtlsHandshakeMs = "dtls_handshake_ms"
         case reconnects
         case credPoolFilled = "cred_pool_filled"
+        case credPoolWithCreds = "cred_pool_with_creds"
         case credPoolSize = "cred_pool_size"
         case captchaImageURL = "captcha_image_url"
         case captchaSID = "captcha_sid"

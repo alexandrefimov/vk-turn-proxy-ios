@@ -61,8 +61,9 @@ type Stats struct {
 	DTLSHandshakeMs  float64 `json:"dtls_handshake_ms"`           // last DTLS handshake time
 	LastHandshakeSec int64   `json:"last_handshake_sec"`          // seconds since last WG handshake
 	Reconnects       int64   `json:"reconnects"`                  // total TURN reconnects
-	CredPoolFilled   int32   `json:"cred_pool_filled"`            // currently fresh slots in cred pool
-	CredPoolSize     int32   `json:"cred_pool_size"`              // total cred pool capacity
+	CredPoolFilled    int32 `json:"cred_pool_filled"`     // slots usable for NEW conns (fresh: cred present, not expiring within 30 min, not pending, not saturated)
+	CredPoolWithCreds int32 `json:"cred_pool_with_creds"` // slots physically holding a cred — superset of CredPoolFilled. Diverges when a cred crosses the 30-min expiry buffer: drops out of "fresh", but existing conns on it stay alive until VK-side allocation expires
+	CredPoolSize      int32 `json:"cred_pool_size"`       // total cred pool capacity
 	CaptchaImageURL  string  `json:"captcha_image_url,omitempty"` // non-empty when captcha is pending
 	CaptchaSID       string  `json:"captcha_sid,omitempty"`       // captcha_sid for the pending captcha
 }
@@ -971,19 +972,20 @@ func (p *Proxy) GetStats() Stats {
 	if v := p.lastCaptchaSID.Load(); v != nil {
 		captchaSID = v.(string)
 	}
-	poolFilled, poolSize := p.credPool.snapshotSize()
+	poolFresh, poolWithCreds, poolSize := p.credPool.snapshotSize()
 	return Stats{
-		TxBytes:         p.txBytes.Load(),
-		RxBytes:         p.rxBytes.Load(),
-		ActiveConns:     p.activeConns.Load(),
-		TotalConns:      p.totalConns.Load(),
-		TurnRTTms:       float64(p.turnRTTns.Load()) / 1e6,
-		DTLSHandshakeMs: float64(p.dtlsHSns.Load()) / 1e6,
-		Reconnects:      p.reconnects.Load(),
-		CredPoolFilled:  int32(poolFilled),
-		CredPoolSize:    int32(poolSize),
-		CaptchaImageURL: captchaURL,
-		CaptchaSID:      captchaSID,
+		TxBytes:           p.txBytes.Load(),
+		RxBytes:           p.rxBytes.Load(),
+		ActiveConns:       p.activeConns.Load(),
+		TotalConns:        p.totalConns.Load(),
+		TurnRTTms:         float64(p.turnRTTns.Load()) / 1e6,
+		DTLSHandshakeMs:   float64(p.dtlsHSns.Load()) / 1e6,
+		Reconnects:        p.reconnects.Load(),
+		CredPoolFilled:    int32(poolFresh),
+		CredPoolWithCreds: int32(poolWithCreds),
+		CredPoolSize:      int32(poolSize),
+		CaptchaImageURL:   captchaURL,
+		CaptchaSID:        captchaSID,
 	}
 }
 
