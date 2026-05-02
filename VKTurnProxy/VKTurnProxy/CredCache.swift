@@ -50,12 +50,40 @@ enum CredCache {
     static let supportedVersion = 2
 
     /// Safety margin before the username-encoded expiry at which we stop
-    /// trusting a cached cred. 60s covers the network round-trip the
-    /// extension would do to seed slot 0 + open the first DTLS+TURN
-    /// session. Independent of the Go-side credExpiryBuffer (30 min) —
-    /// app-side has lower stakes (we'd just fall through to captcha if
-    /// we picked a too-fresh-but-borderline cred).
-    static let expiryGuard: TimeInterval = 60
+    /// trusting a cached cred. Aligned with the Go-side credExpiryBuffer
+    /// (`pkg/proxy/creds.go`, also 30 min) so a cred that passes the
+    /// app-side check is also one the extension will keep using past
+    /// bootstrap.
+    ///
+    /// Earlier this was 60s on the theory that "60s is enough for the
+    /// extension to seed slot 0 and open the first DTLS+TURN session."
+    /// vpn.wifi.7.log on 2026-05-02 showed why that's wrong:
+    ///
+    ///   - User did Disconnect → immediate Connect
+    ///   - All slots loaded from disk were either within their
+    ///     saturation cooldown (recent active conns, ~1m22s ago) or
+    ///     close to expiry. Slot 1 had 6m17s left — passed the old 60s
+    ///     guard, was returned as the seed.
+    ///   - Go side received the seed, but its 30-min expiry buffer
+    ///     rejected the cred as "expiring within 30m0s, skipping". The
+    ///     seeded slot 0 was now non-fresh from get()'s perspective.
+    ///   - First conn fell into Phase 2 fetch (need fresh cred), which
+    ///     surfaced VK's hostile-mode captcha (slider:ERROR).
+    ///   - WebView fallback fired, but `startTunnel` had already
+    ///     transitioned NEVPNStatus to .connecting; iOS preliminary
+    ///     route changes left the WebView with no usable internet
+    ///     (main-app diag: "Internet connection appears to be offline"),
+    ///     captcha never displayed, bootstrap timed out.
+    ///
+    /// With the guard at 30 min, the borderline cred is recognised here
+    /// as unusable; loadValidCred returns nil; TunnelManager.connect
+    /// runs the pre-bootstrap captcha probe in main-app context BEFORE
+    /// startTunnel — and main-app context still has working internet.
+    /// Captcha auto-solves or falls back to a WebView that can actually
+    /// load. Worst case the user solves the captcha manually; either
+    /// way the tunnel comes up with a long-lived cred instead of one
+    /// the extension will throw away in 6 minutes.
+    static let expiryGuard: TimeInterval = 30 * 60
 
     /// Per-slot saturation cooldown. VK allocates at most 10 concurrent
     /// TURN allocations per cred set, with each allocation's server-side
