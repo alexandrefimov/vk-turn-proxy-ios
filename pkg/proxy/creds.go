@@ -723,6 +723,30 @@ type credPool struct {
 	// while still preventing concurrent writers from racing on the .tmp
 	// file before the atomic rename.
 	saveMu sync.Mutex
+
+	// slotAvailableCh is closed-and-replaced whenever a slot transitions
+	// toward usable: a fresh cred is seeded/fetched into a slot
+	// (seedSlot, tryFill, get's Phase 2 fetch), or a conn release lowers
+	// active count below the per-slot cap (release). runConnection's
+	// retry-after-failure select listens on this channel alongside its
+	// fallback timeout, so a conn parked in "no slot available" backoff
+	// — or even in the longer dormancy after 3 short failures — wakes
+	// up within a few milliseconds of any pool-state change instead of
+	// sleeping out its randomised delay.
+	//
+	// The "close on signal, swap in a new chan" pattern gives broadcast
+	// semantics: every conn currently waiting on the channel reference
+	// it captured wakes simultaneously when the old chan closes. A
+	// buffered single-slot channel would only wake one waiter.
+	//
+	// Saturation expiry is time-based with no event hook (saturatedUntil
+	// is just a timestamp checked on the next get()), so this channel
+	// does NOT signal on cooldown countdown — the fallback timeout in
+	// runConnection's select handles that case.
+	//
+	// Reads/writes of the chan field are guarded by cp.mu; close itself
+	// runs after unlock so close-while-locked stalls are impossible.
+	slotAvailableCh chan struct{}
 }
 
 // poolSizeForNumConns derives the cred pool size from the configured
@@ -878,6 +902,11 @@ func (cp *credPool) seedSlot(slot int, addr string, creds *TURNCreds) {
 		}
 	}
 	cp.saveToDisk()
+	// Wake any conn parked in "no slot available" backoff: a fresh seed
+	// just placed a usable cred into the pool. Also covers the dedup-
+	// relocate paths above — even if creds==nil (no-op seed), other
+	// goroutines may benefit from a re-check.
+	cp.broadcastSlotAvailable()
 }
 
 func newCredPool(ctx context.Context, size int, cooldown time.Duration, cachePath string, fetch func(bool) (string, *TURNCreds, error)) *credPool {
@@ -903,6 +932,10 @@ func newCredPool(ctx context.Context, size int, cooldown time.Duration, cachePat
 		// populated slot 0 (cp.pool had len 1, so the loop saw only
 		// the seed-target slot itself). Pre-sizing fixes that.
 		pool: make([]credPoolEntry, size),
+		// Initial channel for the slot-available broadcast. Replaced
+		// (and the old one closed) every time the pool changes in a
+		// way that may unblock a parked conn — see broadcastSlotAvailable.
+		slotAvailableCh: make(chan struct{}),
 	}
 	if cachePath != "" {
 		cp.loadFromDisk()
@@ -1259,6 +1292,11 @@ func (cp *credPool) get(connIdx int, allowCaptchaBlock bool) (string, *TURNCreds
 		log.Printf("credpool: conn %d fetched fresh cred into slot %d (%d/%d slots filled)",
 			connIdx, target, filled, cp.size)
 		cp.saveToDisk()
+		// Inline fetch placed a fresh cred into a previously empty/
+		// stale slot. The current conn took capacity 1/connsPerSlot;
+		// the remaining connsPerSlot-1 slots of capacity are open for
+		// other parked conns that lost the race for ownSlot.
+		cp.broadcastSlotAvailable()
 		return addr, creds, target, nil
 	}
 
@@ -1299,15 +1337,36 @@ func (cp *credPool) release(slot int) {
 		return
 	}
 	cp.mu.Lock()
-	defer cp.mu.Unlock()
 	if slot >= cp.size || slot >= len(cp.pool) {
+		cp.mu.Unlock()
 		return
 	}
+	// Decide whether this release will genuinely open a usable slot for
+	// a parked conn. Three conditions must all hold; if any fails the
+	// broadcast is a thundering-herd waste because get()'s Phase 1 would
+	// skip the slot for the same reason that made the broadcast useless:
+	//
+	//   1. Slot was at the per-slot cap before this release. Otherwise
+	//      it already had room and conns weren't blocked on it.
+	//   2. entryIsFresh — slot's cred isn't expired/expiring/pending.
+	//      Observed in vpn.wifi.5.log: slot 0's cred crossed the 30m
+	//      expiry buffer ~4 min after startup; without this guard, every
+	//      conn dying on that now-stale slot would wake 10 parked conns
+	//      just to have them re-park (slot 0 not fresh → skipped).
+	//   3. Not VK-saturated — get()'s Phase 1 explicitly skips saturated
+	//      slots even when fresh and below cap.
+	slotBecomesUsable := cp.pool[slot].active == connsPerSlot &&
+		entryIsFresh(cp.pool[slot]) &&
+		!time.Now().Before(cp.pool[slot].saturatedUntil)
 	if cp.pool[slot].active > 0 {
 		cp.pool[slot].active--
 		if cp.pool[slot].active == 0 {
 			cp.pool[slot].lastUsedAt = time.Now()
 		}
+	}
+	cp.mu.Unlock()
+	if slotBecomesUsable {
+		cp.broadcastSlotAvailable()
 	}
 }
 
@@ -1380,6 +1439,11 @@ func (cp *credPool) tryFill(slot int, allowCaptchaBlock bool) bool {
 		cp.mu.Unlock()
 		log.Printf("credpool: background filled slot %d (%d/%d slots filled)", slot, filled, cp.size)
 		cp.saveToDisk()
+		// Background grower just turned a non-fresh slot into a fresh
+		// one. Wake conns parked after a cascade ForceReconnect — they
+		// can now acquire the freshly-filled slot instead of waiting
+		// out their randomised retry timer.
+		cp.broadcastSlotAvailable()
 		return true
 	}
 	cp.pool[slot].cooldownUntil = time.Now().Add(cp.cooldown)
@@ -1470,6 +1534,38 @@ func (cp *credPool) invalidateEntry(slot int) {
 	if dropped {
 		cp.saveToDisk()
 	}
+}
+
+// broadcastSlotAvailable wakes every conn currently parked in
+// runConnection's retry select on slotAvailableChannel(). Called from
+// every pool mutation that can transition a slot toward usable: a fresh
+// cred lands in a slot (seedSlot, tryFill success, get's Phase 2 fetch),
+// or a conn release frees per-slot capacity. Saturation expiry is
+// time-based and not signalled here — the fallback timeout in the conn
+// retry select picks up that case.
+//
+// Implementation: close the current channel and swap in a new one. The
+// close acts as a fan-out wake-up — all waiting conns observe the same
+// closed channel and proceed simultaneously. A buffered single-slot
+// channel would only wake one waiter, defeating the broadcast.
+//
+// Spurious calls are harmless: a conn that wakes up only to find no
+// usable slot will fail get() again and re-park on the new channel.
+func (cp *credPool) broadcastSlotAvailable() {
+	cp.mu.Lock()
+	oldCh := cp.slotAvailableCh
+	cp.slotAvailableCh = make(chan struct{})
+	cp.mu.Unlock()
+	close(oldCh)
+}
+
+// slotAvailableChannel returns the channel a conn should select on to
+// receive the next slot-available broadcast. Must be re-read after each
+// wake-up since broadcastSlotAvailable replaces the field.
+func (cp *credPool) slotAvailableChannel() <-chan struct{} {
+	cp.mu.Lock()
+	defer cp.mu.Unlock()
+	return cp.slotAvailableCh
 }
 
 // snapshotSize returns (freshCount, totalCapacity) of the pool — used by

@@ -1216,6 +1216,14 @@ func (p *Proxy) runConnection(sessCtx context.Context, linkID string, readyCh ch
 				// don't try to reconnect simultaneously (which causes Quota Reached).
 				dormantDuration := time.Duration(30+mathrand.Intn(150)) * time.Second
 				log.Printf("proxy: %d consecutive short failures, sleeping %s before retry", shortFailures, dormantDuration.Round(time.Second))
+				// slotAvailableCh wakes the conn early on any pool-state
+				// change that could plausibly let it succeed: a fresh
+				// cred just landed in some slot (background grower or
+				// another conn's Phase 2 fetch), or a release freed
+				// capacity. Without this, "no slot available" failures
+				// — common during cascade reconnects — wait out the
+				// full random dormancy regardless of when slots reopen.
+				slotCh := p.credPool.slotAvailableChannel()
 				select {
 				case <-time.After(dormantDuration):
 					shortFailures = 0 // reset after dormancy
@@ -1227,6 +1235,15 @@ func (p *Proxy) runConnection(sessCtx context.Context, linkID string, readyCh ch
 					// If our retry uses a stale cred and gets a short-lived
 					// session, the per-slot invalidateEntry path (line ~1228)
 					// drops only that bad slot. Other conns keep their creds.
+				case <-slotCh:
+					// Slot-state change happened. Reset the failure
+					// counter — the prior failures were "no slot
+					// available" or quota-driven, and external state
+					// changed in a way that may resolve them. Treat
+					// this as a fresh start instead of letting the
+					// next failure immediately re-trigger dormancy.
+					shortFailures = 0
+					log.Printf("proxy: waking from dormancy on slot-available signal, retrying")
 				case <-sessCtx.Done():
 					return sessCtx.Err()
 				case <-p.ctx.Done():
@@ -1237,9 +1254,14 @@ func (p *Proxy) runConnection(sessCtx context.Context, linkID string, readyCh ch
 
 			// Staggered delay before reconnect: random 2-7s to avoid
 			// all connections hitting TURN server at the same instant.
+			// slotAvailableCh short-circuits the wait when an in-flight
+			// pool-state change makes immediate retry sensible — see
+			// dormancy comment above.
 			delay := time.Duration(2000+mathrand.Intn(5000)) * time.Millisecond
+			slotCh := p.credPool.slotAvailableChannel()
 			select {
 			case <-time.After(delay):
+			case <-slotCh:
 			case <-sessCtx.Done():
 				return sessCtx.Err()
 			case <-p.ctx.Done():
