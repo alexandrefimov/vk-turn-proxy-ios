@@ -23,6 +23,12 @@ struct TunnelStats: Codable {
     // "cred is here but not handing out new allocations right now".
     var credPoolWithCreds: Int32 = 0
     var credPoolSize: Int32 = 0
+    // Seconds since the extension's Proxy was created. Source of truth
+    // for the StatsView Uptime box — see fetchStats where it gets
+    // converted to a Date origin for the live ticker. Authoritative
+    // because the extension survives main-app jetsam/respawn cycles
+    // that reset any locally-stamped origin.
+    var tunnelUptimeSec: Int64 = 0
     var captchaImageURL: String?
     var captchaSID: String?
 
@@ -37,6 +43,7 @@ struct TunnelStats: Codable {
         case credPoolFilled = "cred_pool_filled"
         case credPoolWithCreds = "cred_pool_with_creds"
         case credPoolSize = "cred_pool_size"
+        case tunnelUptimeSec = "tunnel_uptime_sec"
         case captchaImageURL = "captcha_image_url"
         case captchaSID = "captcha_sid"
     }
@@ -863,6 +870,39 @@ class TunnelManager: ObservableObject {
                         self.prevRx = newStats.rxBytes
                         self.prevTime = now
                         self.stats = newStats
+
+                        // Sync connectedAt from extension-reported uptime so
+                        // the StatsView Uptime ticker reflects how long the
+                        // *tunnel* (extension's Proxy instance) has actually
+                        // been running, not how long it's been since the main
+                        // app last attached. Without this, iOS jetsam'ing the
+                        // main app during sleep and re-launching it on next
+                        // foreground used to reset the locally-stamped origin
+                        // — observed in vpn.lte.0.log on 2026-05-03 where two
+                        // "App launched" events at 11:56 and 12:04 collapsed
+                        // a 40+ minute connected session into a "0:07" Uptime
+                        // display.
+                        //
+                        // Only sync when the tunnel is actually .connected
+                        // and the extension reports a positive uptime. The
+                        // observeStatus initial-stamp fallback still seeds
+                        // connectedAt for the brief window before the first
+                        // stats poll responds; this just refines it once the
+                        // authoritative value is available.
+                        if self.status == .connected && newStats.tunnelUptimeSec > 0 {
+                            let originFromExtension = now.addingTimeInterval(-TimeInterval(newStats.tunnelUptimeSec))
+                            // Avoid pointless re-publishes when the value
+                            // doesn't move — drift is at most a few hundred
+                            // milliseconds per poll due to RPC latency, so
+                            // anything <1s is just noise that would force
+                            // SwiftUI to re-render TimelineView dependents.
+                            if let existing = self.connectedAt,
+                               abs(existing.timeIntervalSince(originFromExtension)) < 1 {
+                                // close enough, keep current
+                            } else {
+                                self.connectedAt = originFromExtension
+                            }
+                        }
 
                         // Captcha detection and route restoration logic.
                         //

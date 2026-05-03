@@ -64,6 +64,7 @@ type Stats struct {
 	CredPoolFilled    int32 `json:"cred_pool_filled"`     // slots usable for NEW conns (fresh: cred present, not expiring within 30 min, not pending, not saturated)
 	CredPoolWithCreds int32 `json:"cred_pool_with_creds"` // slots physically holding a cred — superset of CredPoolFilled. Diverges when a cred crosses the 30-min expiry buffer: drops out of "fresh", but existing conns on it stay alive until VK-side allocation expires
 	CredPoolSize      int32 `json:"cred_pool_size"`       // total cred pool capacity
+	TunnelUptimeSec   int64 `json:"tunnel_uptime_sec"`    // seconds since the proxy instance was created — the iOS UI uses this to render Uptime independent of main-app lifecycle (resists jetsam-respawn of the main app while extension keeps running)
 	CaptchaImageURL  string  `json:"captcha_image_url,omitempty"` // non-empty when captcha is pending
 	CaptchaSID       string  `json:"captcha_sid,omitempty"`       // captcha_sid for the pending captcha
 }
@@ -156,6 +157,20 @@ type Proxy struct {
 	dtlsHSns    atomic.Int64 // nanoseconds
 	reconnects  atomic.Int64
 
+	// startedAt is the wall-clock moment NewProxy was called. The Stats
+	// getter computes TunnelUptimeSec relative to this so the iOS UI
+	// can show a tunnel-side uptime that survives main-app process
+	// lifecycle. Without it, the StatsView clock origin had to be
+	// stamped in TunnelManager.observeStatus when the app first
+	// attached, and got reset every time iOS jetsam'd the main app and
+	// re-launched it on next foreground — Uptime would jump back to
+	// "0:07" after a 40-min connected session because that was the
+	// time since the *app* re-attached, not since the tunnel started.
+	// Reporting the real uptime from this side moves the source of
+	// truth into the extension, which has the same lifecycle as the
+	// tunnel itself.
+	startedAt time.Time
+
 	// Per-conn liveness probe. Detects "zombie" conns where the TURN
 	// allocation appears alive (NAT keepalive Binding to VK succeeds,
 	// pion's Refresh succeeds) but actual data path is broken — typically
@@ -213,6 +228,7 @@ func NewProxy(cfg Config) *Proxy {
 		captchaCh:       make(chan string, 1),
 		bootstrapDoneCh: make(chan error, 1),
 		lastPongTimes:   make([]atomic.Int64, cfg.NumConns),
+		startedAt:       time.Now(),
 	}
 	// If no external solver provided, use the built-in channel-based solver
 	// that waits for SolveCaptcha() to be called (e.g. from iOS UI).
@@ -984,6 +1000,7 @@ func (p *Proxy) GetStats() Stats {
 		CredPoolFilled:    int32(poolFresh),
 		CredPoolWithCreds: int32(poolWithCreds),
 		CredPoolSize:      int32(poolSize),
+		TunnelUptimeSec:   int64(time.Since(p.startedAt).Seconds()),
 		CaptchaImageURL:   captchaURL,
 		CaptchaSID:        captchaSID,
 	}
