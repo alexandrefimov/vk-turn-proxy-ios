@@ -211,6 +211,20 @@ type Proxy struct {
 	firstPingAt []atomic.Int64
 	firstPongAt []atomic.Int64
 
+	// Active-probe-on-wake plumbing. WakeHealthCheck() (called from the
+	// Swift extension's wake() override via wgWakeHealthCheck) closes
+	// wakeCh to broadcast to every per-conn probe goroutine; each one
+	// then sends an extra ping out-of-schedule and waits up to 5s for
+	// the echo, killing the conn immediately if no echo arrives. This
+	// short-circuits the 2-minute timer-based zombie detection during
+	// LTE sleep/wake storms (vpn.lte.1.log 2026-05-03 showed cascades
+	// where 7 conns went zombie because their last pong predated 7+
+	// quick wake events). Throttled per-conn at 30s to avoid pinging
+	// 50 conns × N times if the wake events come in rapid succession.
+	wakeMu            sync.RWMutex
+	wakeCh            chan struct{}
+	lastActiveProbeAt []atomic.Int64
+
 	// Bootstrap-ready signaling. Fires exactly once per proxy lifetime, when
 	// either (a) the first conn establishes a live DTLS+TURN session (signaled
 	// with nil from runConnection), or (b) Start() hits a fatal non-captcha
@@ -242,12 +256,14 @@ func NewProxy(cfg Config) *Proxy {
 		sessCancel:      sessCancel,
 		captchaCh:       make(chan string, 1),
 		bootstrapDoneCh: make(chan error, 1),
-		lastPongTimes:   make([]atomic.Int64, cfg.NumConns),
-		lastPingSeq:     make([]atomic.Uint64, cfg.NumConns),
-		lastPongSeq:     make([]atomic.Uint64, cfg.NumConns),
-		firstPingAt:     make([]atomic.Int64, cfg.NumConns),
-		firstPongAt:     make([]atomic.Int64, cfg.NumConns),
-		startedAt:       time.Now(),
+		lastPongTimes:     make([]atomic.Int64, cfg.NumConns),
+		lastPingSeq:       make([]atomic.Uint64, cfg.NumConns),
+		lastPongSeq:       make([]atomic.Uint64, cfg.NumConns),
+		firstPingAt:       make([]atomic.Int64, cfg.NumConns),
+		firstPongAt:       make([]atomic.Int64, cfg.NumConns),
+		lastActiveProbeAt: make([]atomic.Int64, cfg.NumConns),
+		wakeCh:            make(chan struct{}),
+		startedAt:         time.Now(),
 	}
 	// If no external solver provided, use the built-in channel-based solver
 	// that waits for SolveCaptcha() to be called (e.g. from iOS UI).
@@ -812,6 +828,36 @@ func (p *Proxy) WakeHealthCheck() {
 			p.ForceReconnect()
 		}
 	}
+
+	// Wake every per-conn probe goroutine. Each one will (subject to a
+	// 30s throttle) send an out-of-schedule ping and either confirm the
+	// data plane is healthy within 5s or kill the conn — much faster
+	// than waiting for the timer-based zombie detector (120s).
+	p.broadcastWake()
+}
+
+// broadcastWake closes the current wakeCh and replaces it with a fresh
+// one. Per-conn probe goroutines select on wakeChannel(); closing it
+// fans the wake signal out to all of them in one operation. The
+// close-and-replace pattern (same one credPool uses for slot wakeups)
+// means a goroutine that didn't yet enter its select still picks up
+// the next wake — no missed signals.
+func (p *Proxy) broadcastWake() {
+	p.wakeMu.Lock()
+	close(p.wakeCh)
+	p.wakeCh = make(chan struct{})
+	p.wakeMu.Unlock()
+}
+
+// wakeChannel returns the current wake-broadcast channel. Probe
+// goroutines must call this once per select iteration to pick up the
+// channel that's live at that instant; broadcastWake replaces the
+// channel atomically with the close, so a stale captured reference
+// won't fire a second time.
+func (p *Proxy) wakeChannel() <-chan struct{} {
+	p.wakeMu.RLock()
+	defer p.wakeMu.RUnlock()
+	return p.wakeCh
 }
 
 // runWatchdog monitors tunnel health and forces reconnection when dead.
@@ -1573,6 +1619,11 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 		// freeze and reset lastPongTime.
 		lastTickAt := time.Now()
 		for {
+			// Capture the wake channel reference once per iteration. The
+			// channel is replaced (not just signaled) on each broadcast,
+			// so a stale capture would either fire repeatedly on a closed
+			// channel (busy-loop) or miss the next signal entirely.
+			wakeCh := p.wakeChannel()
 			select {
 			case <-ticker.C:
 				now := time.Now()
@@ -1657,6 +1708,96 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 						return
 					}
 				}
+			case <-wakeCh:
+				// iOS wake() event reached us via WakeHealthCheck →
+				// broadcastWake. Fast-path data-plane check: send an
+				// out-of-schedule ping and wait briefly for the echo,
+				// killing the conn immediately if it doesn't come back.
+				// This converts the typical post-wake recovery latency
+				// from ~120s (timer-based zombie threshold) to ~5s.
+				//
+				// Throttle: if we already did an active probe in the
+				// last 30s, skip. LTE sleep/wake storms can deliver 7+
+				// wake events in 18s (vpn.lte.1.log @ 19:48-19:49) and
+				// 50 conns × 7 active probes = 350 redundant DTLS writes
+				// — wasteful and potentially harmful (the first probe's
+				// echo might still be in flight when the second fires).
+				if connIdx < 0 || connIdx >= len(p.lastActiveProbeAt) {
+					continue
+				}
+				lastProbe := p.lastActiveProbeAt[connIdx].Load()
+				if lastProbe > 0 && time.Since(time.Unix(lastProbe, 0)) < 30*time.Second {
+					continue
+				}
+				now := time.Now()
+				p.lastActiveProbeAt[connIdx].Store(now.Unix())
+
+				seq++
+				binary.BigEndian.PutUint64(pingPkt[len(probePingMagic):], seq)
+				dtlsConn.SetWriteDeadline(now.Add(5 * time.Second))
+				if _, err := dtlsConn.Write(pingPkt); err != nil {
+					return
+				}
+				p.lastPingSeq[connIdx].Store(seq)
+				p.firstPingAt[connIdx].CompareAndSwap(0, now.Unix())
+				sentSeq := seq
+
+				// Poll for echo every 100ms up to 30s. Polling beats a
+				// dedicated per-conn pong-notify channel here — the
+				// pong receiver already updates lastPongSeq atomically,
+				// and a 300-iteration tight check is much cheaper than
+				// the channel plumbing it would replace.
+				//
+				// Deadline timeline:
+				//   5s  (build 36): 302 kills / 0 echos in 3.5h
+				//   15s (build 36+): 451 kills / 2198 echos in 6.7h,
+				//                    ratio 4.87, but pool collapsed to
+				//                    3/6/6 because the kill churn drove
+				//                    Phase 2 fetch demand high enough to
+				//                    trip VK's per-cred 486 (Allocation
+				//                    Quota), saturating slots for 10min
+				//                    each (vpn.wifi.1.log 2026-05-04).
+				//   30s: trying to break the positive-feedback loop —
+				//        fewer false-positive kills → less Phase 2
+				//        demand → fewer VK saturations → pool stays
+				//        healthier → fewer "no slot available" loops.
+				//        Still 4× faster than the timer-based 120s
+				//        zombie threshold. Real zombies pay an extra
+				//        15s before recovery starts; that's acceptable.
+				probeStart := time.Now()
+				deadline := probeStart.Add(30 * time.Second)
+				echoed := false
+				for time.Now().Before(deadline) {
+					if p.lastPongSeq[connIdx].Load() >= sentSeq {
+						echoed = true
+						break
+					}
+					select {
+					case <-time.After(100 * time.Millisecond):
+					case <-connCtx.Done():
+						return
+					}
+				}
+				if !echoed {
+					lastPongS := p.lastPongSeq[connIdx].Load()
+					log.Printf("proxy: [conn %d] active probe (post-wake) no echo within 30s (sentSeq=%d lastPongSeq=%d sentSinceLastPong=%d), killing",
+						connIdx, sentSeq, lastPongS, sentSeq-lastPongS)
+					connCancel()
+					return
+				}
+				// Echo arrived — log the round-trip latency so we can
+				// post-hoc compute the kill/echo ratio (a healthy
+				// ratio means the deadline is well-tuned; lots of
+				// kills with no echos means we're killing too eagerly,
+				// lots of echos with few kills means we could shrink
+				// the deadline to recover faster).
+				rtt := time.Since(probeStart).Round(10 * time.Millisecond)
+				log.Printf("proxy: [conn %d] active probe (post-wake) echo received in %s (sentSeq=%d)",
+					connIdx, rtt, sentSeq)
+				// Reset lastTickAt so the regular tick path doesn't
+				// immediately treat the time spent waiting here as a
+				// freeze gap.
+				lastTickAt = time.Now()
 			case <-connCtx.Done():
 				return
 			}
