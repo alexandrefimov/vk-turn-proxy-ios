@@ -31,3 +31,8 @@ AppStoreConnect.env
 # Private local-only notes (design docs for in-progress refactors etc.).
 # Anything placed in this directory is intentionally kept off GitHub.
 .private-notes/
+
+# local scripts
+install.sh
+idev.sh
+
