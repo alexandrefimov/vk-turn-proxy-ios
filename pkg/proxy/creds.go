@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -702,6 +703,16 @@ type credPool struct {
 	size     int             // pool capacity, derived from NumConns via poolSizeForNumConns
 	cooldown time.Duration   // post-failure skip-fetch window (default 5m)
 
+	// authErrors counts pion-reported 401/403 errors per slot since the
+	// slot was last (re)filled. Reset to 0 on seedSlot, tryFill success,
+	// and get's Phase 2 fetch success — i.e. anywhere a fresh cred lands
+	// in the slot. Used by the pre-kill snapshot logging to attribute
+	// mass kill events: if a slot has accumulated several auth errors
+	// shortly before its conns die, the chain is "VK invalidated cred →
+	// pion stops refreshing → allocation expires → conns silent → zombie
+	// killer fires", and the cred should have been invalidated proactively.
+	authErrors []atomic.Int64
+
 	// fetch is the underlying credential fetcher. It must do all the work
 	// previously inlined in resolveTURNAddr: build solver + pending-captcha
 	// params, call GetVKCreds, parse TURN host:port, publish turnServerIP.
@@ -901,12 +912,36 @@ func (cp *credPool) seedSlot(slot int, addr string, creds *TURNCreds) {
 				slot)
 		}
 	}
+	if creds != nil && slot >= 0 && slot < len(cp.authErrors) {
+		// Fresh cred lands in this slot — reset the auth-error tally so
+		// subsequent kill snapshots reflect only this cred's history.
+		cp.authErrors[slot].Store(0)
+	}
 	cp.saveToDisk()
 	// Wake any conn parked in "no slot available" backoff: a fresh seed
 	// just placed a usable cred into the pool. Also covers the dedup-
 	// relocate paths above — even if creds==nil (no-op seed), other
 	// goroutines may benefit from a re-check.
 	cp.broadcastSlotAvailable()
+}
+
+// recordAuthError increments the per-slot auth-error counter. Called from
+// turnLogger.maybeFlagAuthError when pion logs a 401/403 from VK on this
+// slot's allocation. Safe with slot==-1 (no-op).
+func (cp *credPool) recordAuthError(slot int) {
+	if slot < 0 || slot >= len(cp.authErrors) {
+		return
+	}
+	cp.authErrors[slot].Add(1)
+}
+
+// authErrorCount returns the current accumulated auth-error count for the
+// slot since it was last refilled. -1 for invalid slot.
+func (cp *credPool) authErrorCount(slot int) int64 {
+	if slot < 0 || slot >= len(cp.authErrors) {
+		return -1
+	}
+	return cp.authErrors[slot].Load()
 }
 
 func newCredPool(ctx context.Context, size int, cooldown time.Duration, cachePath string, fetch func(bool) (string, *TURNCreds, error)) *credPool {
@@ -931,7 +966,8 @@ func newCredPool(ctx context.Context, size int, cooldown time.Duration, cachePat
 		// no way to find an empty target slot if loadFromDisk only
 		// populated slot 0 (cp.pool had len 1, so the loop saw only
 		// the seed-target slot itself). Pre-sizing fixes that.
-		pool: make([]credPoolEntry, size),
+		pool:       make([]credPoolEntry, size),
+		authErrors: make([]atomic.Int64, size),
 		// Initial channel for the slot-available broadcast. Replaced
 		// (and the old one closed) every time the pool changes in a
 		// way that may unblock a parked conn — see broadcastSlotAvailable.
@@ -1291,6 +1327,9 @@ func (cp *credPool) get(connIdx int, allowCaptchaBlock bool) (string, *TURNCreds
 		cp.mu.Unlock()
 		log.Printf("credpool: conn %d fetched fresh cred into slot %d (%d/%d slots filled)",
 			connIdx, target, filled, cp.size)
+		if target >= 0 && target < len(cp.authErrors) {
+			cp.authErrors[target].Store(0)
+		}
 		cp.saveToDisk()
 		// Inline fetch placed a fresh cred into a previously empty/
 		// stale slot. The current conn took capacity 1/connsPerSlot;
@@ -1438,6 +1477,9 @@ func (cp *credPool) tryFill(slot int, allowCaptchaBlock bool) bool {
 		filled := cp.countFreshLocked()
 		cp.mu.Unlock()
 		log.Printf("credpool: background filled slot %d (%d/%d slots filled)", slot, filled, cp.size)
+		if slot >= 0 && slot < len(cp.authErrors) {
+			cp.authErrors[slot].Store(0)
+		}
 		cp.saveToDisk()
 		// Background grower just turned a non-fresh slot into a fresh
 		// one. Wake conns parked after a cascade ForceReconnect — they

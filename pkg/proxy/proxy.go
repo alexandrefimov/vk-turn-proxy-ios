@@ -1492,7 +1492,7 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 	spawnTURN := func(addr string, c *TURNCreds) chan error {
 		ch := make(chan error, 1)
 		go func() {
-			err := p.runTURN(connCtx, addr, c, conn2, connIdx)
+			err := p.runTURN(connCtx, addr, c, conn2, connIdx, credSlot)
 			ch <- err
 			// Always cancel on TURN exit. Without TURN there's no DTLS
 			// transport, so the conn is dead either way.
@@ -1702,8 +1702,9 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 						if firstPong > 0 {
 							pongHistory = time.Since(time.Unix(firstPong, 0)).Round(time.Second).String() + " ago (first pong)"
 						}
-						log.Printf("proxy: [conn %d] zombie detected (no pong for %s, lastPingSeq=%d lastPongSeq=%d sentSinceLastPong=%d firstPong=%s), killing",
-							connIdx, stale.Round(time.Second), lastPing, lastPongS, sentSinceLastPong, pongHistory)
+						authCount := p.credPool.authErrorCount(credSlot)
+						log.Printf("proxy: [conn %d on slot %d] zombie detected (no pong for %s, lastPingSeq=%d lastPongSeq=%d sentSinceLastPong=%d firstPong=%s, authErrorsOnSlot=%d), killing",
+							connIdx, credSlot, stale.Round(time.Second), lastPing, lastPongS, sentSinceLastPong, pongHistory, authCount)
 						connCancel()
 						return
 					}
@@ -1780,8 +1781,9 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 				}
 				if !echoed {
 					lastPongS := p.lastPongSeq[connIdx].Load()
-					log.Printf("proxy: [conn %d] active probe (post-wake) no echo within 30s (sentSeq=%d lastPongSeq=%d sentSinceLastPong=%d), killing",
-						connIdx, sentSeq, lastPongS, sentSeq-lastPongS)
+					authCount := p.credPool.authErrorCount(credSlot)
+					log.Printf("proxy: [conn %d on slot %d] active probe (post-wake) no echo within 30s (sentSeq=%d lastPongSeq=%d sentSinceLastPong=%d authErrorsOnSlot=%d), killing",
+						connIdx, credSlot, sentSeq, lastPongS, sentSeq-lastPongS, authCount)
 					connCancel()
 					return
 				}
@@ -1985,7 +1987,7 @@ func (p *Proxy) runDirectSession(sessCtx context.Context, linkID string, readyCh
 
 	turnDone := make(chan error, 1)
 	go func() {
-		turnDone <- p.runTURN(connCtx, turnAddr, creds, conn2, -1)
+		turnDone <- p.runTURN(connCtx, turnAddr, creds, conn2, connIdx, credSlot)
 	}()
 
 	if readyCh != nil && !*signaled {
@@ -2044,7 +2046,7 @@ func (p *Proxy) runDirectSession(sessCtx context.Context, linkID string, readyCh
 				log.Printf("proxy: [conn %d, cred %d] starting new direct TURN session", connIdx, credSlot)
 				turnDone = make(chan error, 1)
 				go func() {
-					turnDone <- p.runTURN(connCtx, newAddr, newCreds, conn2, -1)
+					turnDone <- p.runTURN(connCtx, newAddr, newCreds, conn2, connIdx, newSlot)
 				}()
 				break
 			}
@@ -2106,7 +2108,7 @@ func (p *Proxy) runDirectSession(sessCtx context.Context, linkID string, readyCh
 // Runs until the relay fails or ctx is cancelled. No forced lifetime —
 // the pion/turn client handles allocation refresh automatically.
 // conn2's deadline is reset before returning so it can be reused.
-func (p *Proxy) runTURN(ctx context.Context, turnAddr string, creds *TURNCreds, conn2 net.PacketConn, connIdx int) error {
+func (p *Proxy) runTURN(ctx context.Context, turnAddr string, creds *TURNCreds, conn2 net.PacketConn, connIdx int, slotIdx int) error {
 	turnUDPAddr, err := net.ResolveUDPAddr("udp", turnAddr)
 	if err != nil {
 		return fmt.Errorf("resolve TURN: %w", err)
@@ -2148,7 +2150,7 @@ func (p *Proxy) runTURN(ctx context.Context, turnAddr string, creds *TURNCreds, 
 		Username:               creds.Username,
 		Password:               creds.Password,
 		RequestedAddressFamily: addrFamily,
-		LoggerFactory:          &turnLoggerFactory{proxy: p},
+		LoggerFactory:          &turnLoggerFactory{proxy: p, slot: slotIdx},
 	}
 
 	client, err := turn.NewClient(cfg)
@@ -2344,15 +2346,21 @@ func (c *connectedUDPConn) WriteTo(p []byte, _ net.Addr) (int, error) {
 // counter when permission/binding refreshes start failing.
 type turnLoggerFactory struct {
 	proxy *Proxy
+	// slot is the cred-pool slot index whose allocation this factory's
+	// loggers belong to. -1 if not associated with a pool slot (e.g.
+	// runDirectSession path). Loggers inherit it so per-slot auth-error
+	// attribution works when pion logs a 401/403 — see turnLogger.maybeFlagAuthError.
+	slot int
 }
 
 func (f *turnLoggerFactory) NewLogger(scope string) logging.LeveledLogger {
-	return &turnLogger{scope: scope, proxy: f.proxy}
+	return &turnLogger{scope: scope, proxy: f.proxy, slot: f.slot}
 }
 
 type turnLogger struct {
 	scope string
 	proxy *Proxy
+	slot  int
 }
 
 func (l *turnLogger) Trace(msg string)                          {}
@@ -2449,7 +2457,10 @@ func (l *turnLogger) maybeFlagAuthError(msg string) {
 		!strings.Contains(msg, "error 403:") {
 		return
 	}
-	log.Printf("proxy: PION AUTH ERROR DETECTED in %s: %s", l.scope, sanitizeLog(msg))
+	if l.proxy != nil && l.proxy.credPool != nil {
+		l.proxy.credPool.recordAuthError(l.slot)
+	}
+	log.Printf("proxy: PION AUTH ERROR DETECTED on slot %d in %s: %s", l.slot, l.scope, sanitizeLog(msg))
 }
 
 func (l *turnLogger) maybeCountTransientError(msg string) {
