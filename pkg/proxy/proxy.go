@@ -196,6 +196,21 @@ type Proxy struct {
 	serverProbeable atomic.Bool
 	lastPongTimes   []atomic.Int64 // per conn, indexed by connIdx; Unix seconds
 
+	// Diagnostic counters for the probe pipeline. Populated by the per-conn
+	// probe sender / DTLS-recv branch and read at zombie-kill time so the
+	// kill log can attribute the failure: "we sent N pings but got back M
+	// pongs since the last successful echo" lets us tell apart "our sender
+	// stalled" (delta=0) from "server stopped echoing or echoes were
+	// dropped on the return path" (delta>0). firstPingAt/firstPongAt mark
+	// the wall-clock moments of the very first sent ping and very first
+	// received pong for each conn; both stay at 0 until set, and we use
+	// CompareAndSwap so the one-time log fires exactly once per conn.
+	// All four are aligned with len(lastPongTimes) and indexed by connIdx.
+	lastPingSeq []atomic.Uint64
+	lastPongSeq []atomic.Uint64
+	firstPingAt []atomic.Int64
+	firstPongAt []atomic.Int64
+
 	// Bootstrap-ready signaling. Fires exactly once per proxy lifetime, when
 	// either (a) the first conn establishes a live DTLS+TURN session (signaled
 	// with nil from runConnection), or (b) Start() hits a fatal non-captcha
@@ -228,6 +243,10 @@ func NewProxy(cfg Config) *Proxy {
 		captchaCh:       make(chan string, 1),
 		bootstrapDoneCh: make(chan error, 1),
 		lastPongTimes:   make([]atomic.Int64, cfg.NumConns),
+		lastPingSeq:     make([]atomic.Uint64, cfg.NumConns),
+		lastPongSeq:     make([]atomic.Uint64, cfg.NumConns),
+		firstPingAt:     make([]atomic.Int64, cfg.NumConns),
+		firstPongAt:     make([]atomic.Int64, cfg.NumConns),
 		startedAt:       time.Now(),
 	}
 	// If no external solver provided, use the built-in channel-based solver
@@ -1578,6 +1597,16 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 					// stop sending probes.
 					return
 				}
+				// Diagnostic bookkeeping (no per-send log — would be
+				// 50 conns × 30/hr = 1500 lines/hr of noise). Just record
+				// the latest seq so the zombie-kill log can show how many
+				// pings went out without a matching pong, and stamp
+				// firstPingAt the very first time so first-pong logs can
+				// report the round-trip latency to bootstrap.
+				if connIdx >= 0 && connIdx < len(p.lastPingSeq) {
+					p.lastPingSeq[connIdx].Store(seq)
+					p.firstPingAt[connIdx].CompareAndSwap(0, now.Unix())
+				}
 				// Zombie check: if no pong for probeStaleThreshold (default
 				// 120s) AND the server has been observed responding to at
 				// least one probe at some point (serverProbeable), kill
@@ -1606,8 +1635,24 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 					lastPong := time.Unix(p.lastPongTimes[connIdx].Load(), 0)
 					stale := time.Since(lastPong)
 					if stale > probeStaleThreshold {
-						log.Printf("proxy: [conn %d] zombie detected (no pong for %s), killing",
-							connIdx, stale.Round(time.Second))
+						// Attribution data: distinguishes "we stopped sending
+						// pings" (sentSinceLastPong=0) from "server stopped
+						// echoing or echoes were lost on return" (>0). If
+						// firstPongAt is 0 the conn never received a single
+						// pong, which is its own failure mode — typically
+						// means probes never made it through the server at
+						// all (unpatched server, or DTLS pipe broken from
+						// the start).
+						lastPing := p.lastPingSeq[connIdx].Load()
+						lastPongS := p.lastPongSeq[connIdx].Load()
+						sentSinceLastPong := lastPing - lastPongS
+						firstPong := p.firstPongAt[connIdx].Load()
+						pongHistory := "never"
+						if firstPong > 0 {
+							pongHistory = time.Since(time.Unix(firstPong, 0)).Round(time.Second).String() + " ago (first pong)"
+						}
+						log.Printf("proxy: [conn %d] zombie detected (no pong for %s, lastPingSeq=%d lastPongSeq=%d sentSinceLastPong=%d firstPong=%s), killing",
+							connIdx, stale.Round(time.Second), lastPing, lastPongS, sentSinceLastPong, pongHistory)
 						connCancel()
 						return
 					}
@@ -1714,7 +1759,50 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 			if isProbePacket(buf[:n]) {
 				p.serverProbeable.Store(true)
 				if connIdx >= 0 && connIdx < len(p.lastPongTimes) {
-					p.lastPongTimes[connIdx].Store(time.Now().Unix())
+					now := time.Now()
+					nowUnix := now.Unix()
+					// Capture the previous pong timestamp and seq BEFORE
+					// overwriting them — needed to detect long silences
+					// in the echo stream and to attribute them to seqs
+					// (e.g. "the gap straddled seq 17 → 19, so seq 18's
+					// echo was lost"). Useful for "probing was working,
+					// went silent for N seconds, then came back" patterns
+					// that don't trip the zombie killer (which only fires
+					// above probeStaleThreshold).
+					prevPongAt := p.lastPongTimes[connIdx].Load()
+					prevPongSeq := p.lastPongSeq[connIdx].Load()
+					p.lastPongTimes[connIdx].Store(nowUnix)
+					// Pull the seq out of the echoed payload (8 bytes BE
+					// right after the magic). Servers echo verbatim so
+					// it's the same seq we sent.
+					var pongSeq uint64
+					if n >= len(probePingMagic)+8 {
+						pongSeq = binary.BigEndian.Uint64(buf[len(probePingMagic) : len(probePingMagic)+8])
+						p.lastPongSeq[connIdx].Store(pongSeq)
+					}
+					// One-shot first-pong log: shows when end-to-end
+					// probing actually started working for this conn,
+					// and how long we waited from the first ping. CAS
+					// from 0 ensures the log fires exactly once per conn.
+					if p.firstPongAt[connIdx].CompareAndSwap(0, nowUnix) {
+						firstPing := p.firstPingAt[connIdx].Load()
+						bootstrap := "?"
+						if firstPing > 0 {
+							bootstrap = time.Since(time.Unix(firstPing, 0)).Round(100 * time.Millisecond).String()
+						}
+						log.Printf("proxy: [conn %d] first pong received (seq=%d, %s after first ping)",
+							connIdx, pongSeq, bootstrap)
+					} else if prevPongAt > 0 {
+						gap := nowUnix - prevPongAt
+						// Pong gap log: 5 min is well above the normal
+						// 2-min probeInterval (so two missed pongs in a
+						// row trigger it) but well below the 120s zombie
+						// threshold (so it can't fire after a kill).
+						if gap > 300 {
+							log.Printf("proxy: [conn %d] pong gap %ds resolved (prev pongSeq=%d, this pongSeq=%d, missed=%d)",
+								connIdx, gap, prevPongSeq, pongSeq, pongSeq-prevPongSeq-1)
+						}
+					}
 				}
 				continue
 			}
