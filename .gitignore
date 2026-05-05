@@ -2,8 +2,9 @@
 WireGuardBridge/build/
 # Archive + export output (script-generated).
 build_output/
-# Bare-name Go binary produced by `go build .` without -o.
+# Bare-name Go binaries produced by `go build .` without -o.
 /WireGuardBridge/WireGuardBridge
+/turn_bw_test
 
 # Xcode
 *.xcuserdata
