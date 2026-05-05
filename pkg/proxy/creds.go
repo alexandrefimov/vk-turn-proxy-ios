@@ -783,29 +783,47 @@ type credPool struct {
 // was wrong. The pool's previous formula (3 + (n-1)/20, committed in
 // 260d8bc on this same misreading) is reverted here.
 //
-// Correct formula: ceil(n/10) + 1. One cred per 10 conns (matches the
-// hard quota) plus one spare for refresh insurance — when slot K is
-// fetching fresh creds (blocked on captcha for many seconds, sometimes
-// minutes), the spare slot has a fresh cred ready to absorb conns.
+// Formula: ceil(n * 1.5 / 10). One cred per 10 conns (matches VK's hard
+// quota) plus a 50% spare buffer for refresh insurance + cascade recovery.
 //
-// Examples:
-//   n=1..10  → 2 (1 cred for the conns + 1 spare)
-//   n=11..20 → 3
-//   n=21..30 → 4
-//   n=31..40 → 5
-//   n=41..50 → 6
-//   n=51..60 → 7
-//   n=61..64 → 8
+// The +50% buffer (vs the previous "+1 spare") is empirically motivated.
+// The previous "+1" assumed single-slot-at-a-time refresh, but mass-kill
+// events (vpn.wifi-lte-wifi.0.log on 2026-05-04: 38 conns killed near-
+// simultaneously after 1h10m sleep) force many conns through Phase 2
+// fetch concurrently. With only 1 spare slot, the surge of fetch demand
+// trips VK's per-cred 486 (Allocation Quota), saturating slots for 10
+// minutes each and collapsing the pool to 3/6/6 (vpn.wifi.1.log on
+// 2026-05-04 — 24× higher kill rate than baseline). More spare slots
+// give the pool headroom to absorb a kill cascade without falling into
+// a "no slot available" loop while saturation cooldowns drain.
 //
-// The "+1 spare" assumes single-slot-at-a-time refresh. If experience
-// shows multiple concurrent refreshes (e.g. captcha storm invalidating
-// multiple creds at once), the spare count may need to grow — that's an
-// empirical question pending more multi-cred runs.
+// Examples (cred slots → max conns at 10/slot, of which N for live conns,
+//          remainder are spare):
+//   n=1..6   → 2 (would be 0-1 by formula; clamped to 2 for refresh insurance)
+//   n=7..13  → 2
+//   n=14..20 → 3
+//   n=21..26 → 4
+//   n=27..33 → 5
+//   n=34..40 → 6
+//   n=41..46 → 7
+//   n=47..53 → 8 (typical NumConns=50 case: 5 for conns + 3 spare)
+//   n=54..60 → 9
+//   n=61..66 → 10
+//
+// Trade-off: each extra spare slot is one more cred VK needs to issue
+// (PoW + slider, ~20-60 sec), one more cooldown timer to track, and one
+// more allocation-refresh pulse every ~5 min in steady state. We tolerate
+// that overhead in exchange for crash-free cascade recovery.
 func poolSizeForNumConns(n int) int {
 	if n <= 0 {
 		n = 1
 	}
-	return (n+9)/10 + 1 // ceil(n/10) + 1
+	// ceil(n * 1.5 / 10) = ceil(3n / 20) — integer math.
+	size := (3*n + 19) / 20
+	if size < 2 {
+		size = 2
+	}
+	return size
 }
 
 // newCredPool builds a pool sized to `size` conns with post-failure
