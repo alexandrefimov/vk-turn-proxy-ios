@@ -5,6 +5,7 @@ build_output/
 # Bare-name Go binaries produced by `go build .` without -o.
 /WireGuardBridge/WireGuardBridge
 /turn_bw_test
+/turn_bw_server
 
 # Xcode
 *.xcuserdata

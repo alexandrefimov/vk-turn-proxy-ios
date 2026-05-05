@@ -11,8 +11,12 @@
 //     trip an aggregate cap or per-conn throttle).
 //
 // Required setup:
-//   1. On the VPS, run:    nc -u -k -l 9999 | pv -W -b -r -t > /dev/null
-//      (counts received bytes, prints accumulated total + rate)
+//   1. On the VPS, run the matching server:
+//        ./turn_bw_server -port=9999
+//      (per-source rate + final summary; see ./tools/turn_bw_server.)
+//      A `nc -u -k -l 9999 | pv -W -b -r -t > /dev/null` works as a
+//      fallback but aggregates all parallel allocations into one number
+//      and drops to 0 the moment the client stops, so prefer the server.
 //   2. Disconnect the iOS VPN app — its 50 active conns hold quota
 //      against these creds.
 //   3. Export a backup from iOS Settings → Backup & Restore → Export Full
