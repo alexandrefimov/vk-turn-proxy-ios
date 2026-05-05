@@ -92,7 +92,14 @@ enum BackupManager {
             // object(forKey:) to distinguish "set to false" from "unset".
             useDTLS: (d.object(forKey: "useDTLS") as? Bool) ?? true,
             numConnections: (d.object(forKey: "numConnections") as? Int) ?? 30,
-            credPoolCooldownSeconds: (d.object(forKey: "credPoolCooldownSeconds") as? Int) ?? 150
+            credPoolCooldownSeconds: (d.object(forKey: "credPoolCooldownSeconds") as? Int) ?? 150,
+            // WRAP defaults match SettingsView's @AppStorage defaults
+            // (false / empty). Same object(forKey:) trick as useDTLS to
+            // distinguish "explicitly set false" from "never set" — though
+            // for a default of false the difference is invisible, the
+            // pattern stays consistent with surrounding code.
+            useWrap: (d.object(forKey: "useWrap") as? Bool) ?? false,
+            wrapKeyHex: d.string(forKey: "wrapKeyHex") ?? ""
         )
 
         var turnPool: CredCacheFile? = nil
@@ -203,8 +210,14 @@ enum BackupManager {
         d.set(s.useDTLS, forKey: "useDTLS")
         d.set(s.numConnections, forKey: "numConnections")
         d.set(s.credPoolCooldownSeconds, forKey: "credPoolCooldownSeconds")
+        // WRAP fields: nil → leave UserDefaults alone so the AppStorage
+        // default kicks in, matching the behaviour for an older backup
+        // that never had these keys. Non-nil → write through, including
+        // false / empty if the user explicitly set them that way.
+        if let v = s.useWrap { d.set(v, forKey: "useWrap") }
+        if let v = s.wrapKeyHex { d.set(v, forKey: "wrapKeyHex") }
 
-        SharedLogger.shared.log("[AppDebug] Backup: applied settings (numConnections=\(s.numConnections), cooldown=\(s.credPoolCooldownSeconds)s, useDTLS=\(s.useDTLS))")
+        SharedLogger.shared.log("[AppDebug] Backup: applied settings (numConnections=\(s.numConnections), cooldown=\(s.credPoolCooldownSeconds)s, useDTLS=\(s.useDTLS), useWrap=\(s.useWrap ?? false))")
 
         // creds-pool.json: write only if backup contained one. If the
         // backup has nil turnPool (e.g. user exported on a fresh install

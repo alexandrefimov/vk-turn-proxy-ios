@@ -50,6 +50,13 @@ struct AppConfig: Codable {
 /// Mirrors every @AppStorage in ContentView.swift / SettingsView. Keep
 /// JSON keys identical to the AppStorage keys so a future "edit the
 /// backup file in a text editor" workflow has obvious field names.
+///
+/// Newer fields (added after the v1 schema shipped) are declared
+/// Optional so loading an older backup that doesn't contain them
+/// still decodes — Codable's synthesised init treats absent Optional
+/// keys as nil. The corresponding apply step in BackupManager uses
+/// the AppStorage default when nil. Each addition documents which
+/// build introduced it for traceability.
 struct AppSettings: Codable {
     let privateKey: String
     let peerPublicKey: String
@@ -62,4 +69,11 @@ struct AppSettings: Codable {
     let useDTLS: Bool
     let numConnections: Int
     let credPoolCooldownSeconds: Int
+    /// WRAP layer (ChaCha20-XOR ChannelData payload obfuscation, see
+    /// vk-turn-proxy-ios commit 1c1edc1 / branch add-client-wrap-layer).
+    /// Optional for back-compat with backups exported before WRAP shipped.
+    let useWrap: Bool?
+    /// 64-character hex encoding of the 32-byte WRAP shared key. Must
+    /// match the server's -wrap-key. Optional for back-compat.
+    let wrapKeyHex: String?
 }
