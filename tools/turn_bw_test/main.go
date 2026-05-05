@@ -283,7 +283,17 @@ func main() {
 	var totalPkts int64
 	var totalErrs int64
 	var maxElapsed time.Duration
+	var failedCount int
 	for _, s := range stats {
+		// Workers whose Allocate failed never reached the send loop, so
+		// startTime is the zero value and time.Since(zero) yields a
+		// nonsensical 290000-year duration. Print them on their own line
+		// and skip them from totals so the aggregate isn't polluted.
+		if !s.allocOK.Load() {
+			fmt.Printf("  %s: ALLOCATE FAILED — no data sent\n", s.label(*allocsPerCred))
+			failedCount++
+			continue
+		}
 		bs := s.bytesSent.Load()
 		pk := s.pktsSent.Load()
 		er := s.sendErrs.Load()
@@ -299,11 +309,19 @@ func main() {
 			s.label(*allocsPerCred), humanBytes(bs), pk, er,
 			dur.Round(10*time.Millisecond), humanRate(bps))
 	}
-	totalBps := float64(totalBytes) * 8 / maxElapsed.Seconds()
 	fmt.Printf("  ---\n")
-	fmt.Printf("  TOTAL:  %s sent (%d pkts, %d errs) over ~%s = %s\n",
-		humanBytes(totalBytes), totalPkts, totalErrs,
-		maxElapsed.Round(10*time.Millisecond), humanRate(totalBps))
+	if maxElapsed > 0 {
+		totalBps := float64(totalBytes) * 8 / maxElapsed.Seconds()
+		fmt.Printf("  TOTAL:  %s sent (%d pkts, %d errs) over ~%s = %s",
+			humanBytes(totalBytes), totalPkts, totalErrs,
+			maxElapsed.Round(10*time.Millisecond), humanRate(totalBps))
+	} else {
+		fmt.Printf("  TOTAL:  no successful allocations")
+	}
+	if failedCount > 0 {
+		fmt.Printf(" (%d/%d worker(s) failed Allocate)", failedCount, len(specs))
+	}
+	fmt.Printf("\n")
 	fmt.Printf("\nNote: client-side rate is what the kernel buffered; the\n")
 	fmt.Printf("      true network throughput is what your VPS pv showed.\n")
 	fmt.Printf("      Compare both numbers — for UDP they often diverge.\n")
