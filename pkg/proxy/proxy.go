@@ -1453,7 +1453,18 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 	// (own slot / fresh fetch) or some other slot's index (fallback).
 	// We track it so a short-lived session can invalidate the slot that
 	// actually carried the bad cred, not this conn's nominal slot.
-	turnAddr, creds, credSlot, err := p.resolveTURNAddr(connIdx, *signaled)
+	//
+	// allowCaptchaBlock=false unconditionally: post-bootstrap conn-driven
+	// fetches must NEVER block on captcha because the extension can't show
+	// a WebView, so the captcha solver would just sit forever waiting for
+	// a SolveCaptcha() call that never comes (jetsam may have killed the
+	// main app long ago). Blocking accumulates waiters that all keep
+	// captchaImageURL set, which in turn paralyses the background grower
+	// (vpn.wifi.1.log on 2026-05-05 showed grower stuck for 5+ hours after
+	// the first such waiter started in mid-session). Bootstrap captcha is
+	// handled separately at runConnection's level via waitCaptchaAndRestart
+	// + captchaWaiterActive guard, before we ever reach this code.
+	turnAddr, creds, credSlot, err := p.resolveTURNAddr(connIdx, false)
 	if err != nil {
 		return err
 	}
@@ -1978,7 +1989,8 @@ func (p *Proxy) runDirectSession(sessCtx context.Context, linkID string, readyCh
 		conn1.Close()
 	})
 
-	turnAddr, creds, credSlot, err := p.resolveTURNAddr(connIdx, *signaled)
+	// allowCaptchaBlock=false — see runDTLSSession's matching comment.
+	turnAddr, creds, credSlot, err := p.resolveTURNAddr(connIdx, false)
 	if err != nil {
 		return err
 	}
@@ -2031,7 +2043,8 @@ func (p *Proxy) runDirectSession(sessCtx context.Context, linkID string, readyCh
 				if connCtx.Err() != nil {
 					return
 				}
-				newAddr, newCreds, newSlot, err := p.resolveTURNAddr(connIdx, true)
+				// allowCaptchaBlock=false — see runDTLSSession's matching comment.
+				newAddr, newCreds, newSlot, err := p.resolveTURNAddr(connIdx, false)
 				if err != nil {
 					retries++
 					select {
