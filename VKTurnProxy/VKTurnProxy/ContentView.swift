@@ -19,6 +19,8 @@ struct ContentView: View {
     @AppStorage("vkLink") private var vkLink = ""
     @AppStorage("peerAddress") private var peerAddress = ""
     @AppStorage("useDTLS") private var useDTLS = true
+    @AppStorage("useWrap") private var useWrap = false
+    @AppStorage("wrapKeyHex") private var wrapKeyHex = ""
     @AppStorage("numConnections") private var numConnections = 30
     @AppStorage("credPoolCooldownSeconds") private var credPoolCooldownSeconds = 150
 
@@ -71,6 +73,8 @@ struct ContentView: View {
                                 vkLink: vkLink,
                                 peerAddress: peerAddress,
                                 useDTLS: useDTLS,
+                                useWrap: useWrap,
+                                wrapKeyHex: wrapKeyHex,
                                 numConnections: numConnections,
                                 credPoolCooldownSeconds: credPoolCooldownSeconds
                             )
@@ -190,6 +194,8 @@ struct SettingsView: View {
     @AppStorage("vkLink") private var vkLink = ""
     @AppStorage("peerAddress") private var peerAddress = ""
     @AppStorage("useDTLS") private var useDTLS = true
+    @AppStorage("useWrap") private var useWrap = false
+    @AppStorage("wrapKeyHex") private var wrapKeyHex = ""
     @AppStorage("numConnections") private var numConnections = 30
     @AppStorage("credPoolCooldownSeconds") private var credPoolCooldownSeconds = 150
 
@@ -225,6 +231,22 @@ struct SettingsView: View {
                     .disableAutocorrection(true)
 
                 Toggle("DTLS Obfuscation", isOn: $useDTLS)
+
+                // WRAP layer: ChaCha20-XOR every UDP packet between DTLS
+                // and TURN ChannelData so VK's TURN-relay payload classifier
+                // can't recognise DTLS+WG and tag the destination endpoint.
+                // The endpoint configured above (Proxy Server) MUST be a
+                // server running with matching -wrap and -wrap-key from the
+                // upstream cacggghp/vk-turn-proxy WRAP-aware build —
+                // without that, the DTLS handshake fails because the
+                // server-side raw bytes get XOR'd by our wrapping.
+                Toggle("Use WRAP (peer must be WRAP-aware)", isOn: $useWrap)
+
+                if useWrap {
+                    SecureField("WRAP key (64 hex chars)", text: $wrapKeyHex)
+                        .autocapitalization(.none)
+                        .disableAutocorrection(true)
+                }
 
                 Stepper("Connections: \(numConnections)", value: $numConnections, in: 1...64)
 

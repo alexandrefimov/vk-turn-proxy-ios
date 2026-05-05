@@ -28,6 +28,7 @@ static void go_os_log(const char *msg) {
 import "C"
 
 import (
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -60,6 +61,29 @@ var (
 	nextID    int32 = 1
 )
 
+// decodeWrapKey parses the hex string the user typed in Settings into
+// the 32-byte key proxy.Config.WrapKey expects. Returns (nil, nil) when
+// WRAP isn't requested so the typical no-WRAP setup hits no error path
+// at all. Any non-empty error from the operator's input is logged and
+// disables WRAP for the session — surfacing that in the extension log
+// rather than failing silently inside proxy startup.
+func decodeWrapKey(useWrap bool, hexStr string) ([]byte, error) {
+	if !useWrap {
+		return nil, nil
+	}
+	if hexStr == "" {
+		return nil, fmt.Errorf("WRAP enabled but wrap_key_hex is empty")
+	}
+	key, err := hex.DecodeString(hexStr)
+	if err != nil {
+		return nil, fmt.Errorf("wrap_key_hex not valid hex: %w", err)
+	}
+	if len(key) != 32 {
+		return nil, fmt.Errorf("wrap_key_hex decodes to %d bytes (need 32)", len(key))
+	}
+	return key, nil
+}
+
 // ProxyConfig is the JSON config passed from Swift.
 type ProxyConfig struct {
 	VKLink              string            `json:"vk_link"`
@@ -68,6 +92,15 @@ type ProxyConfig struct {
 	TurnPort            string            `json:"turn_port,omitempty"`
 	UseDTLS             bool              `json:"use_dtls"`
 	UseUDP              bool              `json:"use_udp"`
+	// UseWrap enables the WRAP layer between DTLS and TURN ChannelData
+	// (see proxy.Config.UseWrap and pkg/proxy/wrap.go). Requires the
+	// peer server to be running cacggghp/vk-turn-proxy with matching
+	// -wrap and -wrap-key flags (the upstream WRAP-aware build).
+	UseWrap             bool              `json:"use_wrap"`
+	// WrapKeyHex is the 64-character hex encoding of the 32-byte
+	// ChaCha20 shared key. Required when UseWrap is true and must
+	// match the server's -wrap-key value exactly.
+	WrapKeyHex          string            `json:"wrap_key_hex"`
 	NumConns                int `json:"num_conns,omitempty"`
 	CredPoolCooldownSeconds int `json:"cred_pool_cooldown_seconds,omitempty"`
 	// VKHostIPs is a hostname→[]IP map pre-resolved by the main app
@@ -120,6 +153,11 @@ func wgTurnOnWithTURN(settings *C.char, tunFd C.int32_t, proxyConfigJSON *C.char
 	}
 
 	// Create proxy
+	wrapKey, wrapErr := decodeWrapKey(pcfg.UseWrap, pcfg.WrapKeyHex)
+	if wrapErr != nil {
+		log.Printf("wgTurnOnWithTURN: WRAP key invalid: %s — disabling WRAP", wrapErr)
+		pcfg.UseWrap = false
+	}
 	p := proxy.NewProxy(proxy.Config{
 		PeerAddr:         pcfg.PeerAddr,
 		TurnServer:       pcfg.TurnServer,
@@ -127,6 +165,8 @@ func wgTurnOnWithTURN(settings *C.char, tunFd C.int32_t, proxyConfigJSON *C.char
 		VKLink:           pcfg.VKLink,
 		UseDTLS:          pcfg.UseDTLS,
 		UseUDP:           pcfg.UseUDP,
+		UseWrap:          pcfg.UseWrap,
+		WrapKey:          wrapKey,
 		NumConns:         pcfg.NumConns,
 		CredPoolCooldown: time.Duration(pcfg.CredPoolCooldownSeconds) * time.Second,
 	})
@@ -247,6 +287,11 @@ func wgStartVKBootstrap(proxyConfigJSON *C.char) C.int32_t {
 		credCachePath = filepath.Join(filepath.Dir(logFilePath), "creds-pool.json")
 	}
 
+	wrapKey, wrapErr := decodeWrapKey(pcfg.UseWrap, pcfg.WrapKeyHex)
+	if wrapErr != nil {
+		log.Printf("wgStartVKBootstrap: WRAP key invalid: %s — disabling WRAP", wrapErr)
+		pcfg.UseWrap = false
+	}
 	p := proxy.NewProxy(proxy.Config{
 		PeerAddr:         pcfg.PeerAddr,
 		TurnServer:       pcfg.TurnServer,
@@ -254,6 +299,8 @@ func wgStartVKBootstrap(proxyConfigJSON *C.char) C.int32_t {
 		VKLink:           pcfg.VKLink,
 		UseDTLS:          pcfg.UseDTLS,
 		UseUDP:           pcfg.UseUDP,
+		UseWrap:          pcfg.UseWrap,
+		WrapKey:          wrapKey,
 		NumConns:         pcfg.NumConns,
 		CredPoolCooldown: time.Duration(pcfg.CredPoolCooldownSeconds) * time.Second,
 		SeededTURN:       seededTURN,

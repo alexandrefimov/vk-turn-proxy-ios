@@ -1112,6 +1112,8 @@ class TunnelManager: ObservableObject {
             "peer_addr": config.peerAddress,
             "use_dtls": config.useDTLS,
             "use_udp": config.useUDP,
+            "use_wrap": config.useWrap,
+            "wrap_key_hex": config.wrapKeyHex,
             "num_conns": config.numConnections,
             "cred_pool_cooldown_seconds": config.credPoolCooldownSeconds,
             "turn_server": config.turnServerOverride ?? "",
@@ -1392,6 +1394,16 @@ struct TunnelConfig {
     var vkLink: String = ""
     var peerAddress: String = ""  // vk-turn-proxy server host:port
     var useDTLS: Bool = true
+    // WRAP layer: ChaCha20-XOR every UDP packet between DTLS and TURN
+    // ChannelData so VK's payload classifier can't recognise DTLS+WG
+    // and tag the destination endpoint. Requires the configured
+    // peerAddress to be a server running cacggghp/vk-turn-proxy with
+    // matching -wrap and -wrap-key — without that, DTLS handshake
+    // fails (server XOR's plain bytes, garbage hits DTLS state machine).
+    var useWrap: Bool = false
+    // 32-byte ChaCha20 key as 64 hex chars; required when useWrap=true,
+    // must match the server's -wrap-key value exactly.
+    var wrapKeyHex: String = ""
     var useUDP: Bool = true
     var numConnections: Int = 30 // configurable from Settings; VK allows ~10 simultaneous TURN allocations per cred set, so 30 conns spreads over ceil(N/10) = 3 cred sets plus a "+1 reserve" (4 total slots). 30 strikes a useful balance: enough parallelism for high-throughput single sessions, few enough to avoid overwhelming VK's per-IP rate-limit on cred refresh.
     // Per-slot cooldown after a failed fetch (typically captcha required).

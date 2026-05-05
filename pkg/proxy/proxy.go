@@ -49,6 +49,21 @@ type Config struct {
 	// (user toggling VPN, iOS killing the extension and respawning) but
 	// expires naturally on its own clock without active cleanup.
 	CredCachePath string
+
+	// UseWrap enables the WRAP obfuscation layer between DTLS and TURN
+	// ChannelData (see pkg/proxy/wrap.go). When true, every packet on
+	// the wire becomes [nonce][ChaCha20-XOR(WrapKey, nonce, dtls_bytes)],
+	// hiding the recognisable DTLS+WireGuard signature that VK's TURN
+	// relays use to tag and throttle (peer_ip, peer_port) endpoints.
+	// Server side must run with the matching -wrap and -wrap-key flags
+	// from the upstream cacggghp/vk-turn-proxy WRAP-aware build —
+	// without that, the DTLS handshake fails because the server-side
+	// raw bytes get XOR'd by VK-relay-clean-but-WRAP-confused server.
+	UseWrap bool
+	// WrapKey is the 32-byte ChaCha20 shared key, identical on client
+	// and server, required when UseWrap is true. Wrong/short keys are
+	// caught at proxy startup so the operator gets a clear error.
+	WrapKey []byte
 }
 
 // Stats holds live tunnel statistics.
@@ -240,6 +255,20 @@ type Proxy struct {
 func NewProxy(cfg Config) *Proxy {
 	if cfg.NumConns <= 0 {
 		cfg.NumConns = 1
+	}
+	if cfg.UseWrap {
+		// Catch wrong key length up front so the operator gets a clear
+		// error before any TURN allocation happens. Wrong key would
+		// otherwise surface much later as a confusing DTLS handshake
+		// timeout (server XOR's our wrapped ClientHello with a different
+		// key, garbage hits the DTLS state machine, hangs the whole conn).
+		if len(cfg.WrapKey) != wrapKeyLen {
+			log.Printf("proxy: WARN UseWrap=true but WrapKey is %d bytes (need %d) — disabling WRAP for this session",
+				len(cfg.WrapKey), wrapKeyLen)
+			cfg.UseWrap = false
+		} else {
+			log.Printf("proxy: WRAP layer enabled (server must run with matching -wrap and -wrap-key)")
+		}
 	}
 	// Fresh global session — clear any leftover pion-degradation counters.
 	// (atomic.Int64 zero values are fine for a brand-new struct, but explicit
@@ -2235,6 +2264,16 @@ func (p *Proxy) runTURN(ctx context.Context, turnAddr string, creds *TURNCreds, 
 
 	var peerAddr atomic.Value
 
+	// WRAP layer (see pkg/proxy/wrap.go): when enabled, every byte that
+	// crosses the conn2 ↔ relay boundary in this bridge is XOR'd with a
+	// ChaCha20 keystream so VK's TURN-relay payload classifier sees random
+	// bytes instead of a recognisable DTLS+WG signature. Both directions
+	// MUST be symmetric — a one-sided wrap means the DTLS state machine on
+	// the other end sees garbage and stalls. Server must be running with
+	// matching -wrap and -wrap-key (cacggghp/vk-turn-proxy WRAP-aware build).
+	useWrap := p.config.UseWrap
+	wrapKey := p.config.WrapKey
+
 	// conn2 → relay
 	// No select{default} polling — context cancellation is handled via deadline
 	// set in context.AfterFunc above, which unblocks ReadFrom.
@@ -2251,7 +2290,16 @@ func (p *Proxy) runTURN(ctx context.Context, turnAddr string, creds *TURNCreds, 
 				return
 			}
 			peerAddr.Store(addr)
-			if _, err = relayConn.WriteTo(buf[:n], p.peer); err != nil {
+			out := buf[:n]
+			if useWrap {
+				wrapped, werr := wrapPacket(wrapKey, out)
+				if werr != nil {
+					log.Printf("proxy: [conn %d] runTURN conn2→relay: wrap error: %v", connIdx, werr)
+					return
+				}
+				out = wrapped
+			}
+			if _, err = relayConn.WriteTo(out, p.peer); err != nil {
 				if ctx.Err() == nil {
 					log.Printf("proxy: [conn %d] runTURN conn2→relay: WriteTo error: %v (ctx=%v)", connIdx, err, ctx.Err())
 				}
@@ -2264,7 +2312,17 @@ func (p *Proxy) runTURN(ctx context.Context, turnAddr string, creds *TURNCreds, 
 	go func() {
 		defer wg.Done()
 		defer turnCancel()
-		buf := make([]byte, 1600)
+		// Read into a slightly larger buffer when WRAP is on so we have
+		// room for the nonce prefix on top of the worst-case 1600-byte
+		// DTLS payload we forward to conn2.
+		readBufLen := 1600
+		if useWrap {
+			readBufLen += wrapNonceLen
+		}
+		buf := make([]byte, readBufLen)
+		// Plaintext destination buffer for unwrap. Sized for the same
+		// 1600-byte upper bound conn2 expects to see.
+		plain := make([]byte, 1600)
 		for {
 			n, _, err := relayConn.ReadFrom(buf)
 			if err != nil {
@@ -2273,12 +2331,24 @@ func (p *Proxy) runTURN(ctx context.Context, turnAddr string, creds *TURNCreds, 
 				}
 				return
 			}
+			payload := buf[:n]
+			if useWrap {
+				m, werr := unwrapPacket(wrapKey, buf[:n], plain)
+				if werr != nil {
+					log.Printf("proxy: [conn %d] runTURN relay→conn2: unwrap error: %v (n=%d)", connIdx, werr, n)
+					// Drop and continue rather than tearing down the TURN
+					// session for one bad packet — typically just a stray
+					// from before the WRAP-side server (or wrong key) was up.
+					continue
+				}
+				payload = plain[:m]
+			}
 			addr, ok := peerAddr.Load().(net.Addr)
 			if !ok {
 				log.Printf("proxy: [conn %d] runTURN relay→conn2: peerAddr not set, exiting", connIdx)
 				return
 			}
-			if _, err = conn2.WriteTo(buf[:n], addr); err != nil {
+			if _, err = conn2.WriteTo(payload, addr); err != nil {
 				if ctx.Err() == nil {
 					log.Printf("proxy: [conn %d] runTURN relay→conn2: WriteTo error: %v (ctx=%v)", connIdx, err, ctx.Err())
 				}
