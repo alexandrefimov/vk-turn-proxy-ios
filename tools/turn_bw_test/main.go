@@ -33,7 +33,10 @@
 //   go run ./tools/turn_bw_test -creds=backup.json -parallel=5 \
 //       -dst-ip=217.168.246.242 -dst-port=9999 \
 //       -transport=udp -duration=30s
-//   (slot=0 ignored when parallel>1; uses slots 0..parallel-1)
+//   (-slot ignored when -parallel>1; the first N creds present in the
+//   backup are used, sorted by slot index — the pool routinely has
+//   gaps, e.g. slots [0,1,2,4,6], and we don't care which exact
+//   indices we get as long as they're distinct creds.)
 
 package main
 
@@ -46,6 +49,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -117,7 +121,12 @@ func main() {
 		log.Fatal("-parallel must be >= 1")
 	}
 
-	// Pre-load all creds we'll need, fail fast if any slot missing.
+	// Pre-load all creds we'll need, fail fast if anything's missing.
+	// Single-allocation mode honours -slot directly. Parallel mode takes
+	// the first N creds present in the backup sorted by slot index — the
+	// pool can have gaps (e.g. [0,1,2,4,6]) because some slots are still
+	// in saturation cooldown or never got filled, and there's no reason
+	// to require slot indices to be contiguous from zero.
 	var creds []*backupCred
 	if *parallel == 1 {
 		c, err := loadCred(*credsPath, *slot)
@@ -126,13 +135,19 @@ func main() {
 		}
 		creds = []*backupCred{c}
 	} else {
-		for i := 0; i < *parallel; i++ {
-			c, err := loadCred(*credsPath, i)
-			if err != nil {
-				log.Fatalf("need slot %d for parallel=%d: %v", i, *parallel, err)
-			}
-			creds = append(creds, c)
+		all, err := loadAllCreds(*credsPath)
+		if err != nil {
+			log.Fatalf("load creds: %v", err)
 		}
+		if len(all) < *parallel {
+			avail := make([]int, len(all))
+			for i, c := range all {
+				avail[i] = c.Slot
+			}
+			log.Fatalf("need %d allocations but backup has only %d cred(s) (slots %v)",
+				*parallel, len(all), avail)
+		}
+		creds = all[:*parallel]
 	}
 
 	dstAddr := &net.UDPAddr{IP: net.ParseIP(*dstIP), Port: *dstPort}
@@ -467,6 +482,27 @@ func loadCred(path string, slot int) (*backupCred, error) {
 		}
 	}
 	return nil, fmt.Errorf("no cred for slot %d in %s", slot, path)
+}
+
+// loadAllCreds returns every cred in the backup, sorted by slot index.
+// The slot indices may have gaps — that's fine, callers just want a list
+// of distinct creds, not contiguous indices.
+func loadAllCreds(path string) ([]*backupCred, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var bf backupFile
+	if err := json.Unmarshal(data, &bf); err != nil {
+		return nil, fmt.Errorf("parse backup JSON: %w", err)
+	}
+	out := make([]*backupCred, len(bf.TurnPool.Creds))
+	for i := range bf.TurnPool.Creds {
+		c := bf.TurnPool.Creds[i]
+		out[i] = &c
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Slot < out[j].Slot })
+	return out, nil
 }
 
 func slotsOf(creds []*backupCred) []int {
