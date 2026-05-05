@@ -1,14 +1,23 @@
 // turn_bw_test — measures TURN allocation throughput against a VK relay.
 //
-// Two modes:
-//   - Single allocation (default, -parallel=1): one TURN allocation, one
-//     long-running send loop, prints rate every 2s and final summary.
-//   - Parallel allocations (-parallel=N): spawns N independent allocations
-//     using slots 0..N-1 from the backup, each with its own TURN client
-//     and its own send loop, all writing to the same destination. Used
-//     to detect VK shaping that triggers on parallel-allocation patterns
-//     (single allocation may slip under the radar; many parallel may
-//     trip an aggregate cap or per-conn throttle).
+// Modes:
+//   - Single allocation (default, -parallel=1 -allocs-per-cred=1): one
+//     TURN allocation, one long-running send loop, prints rate every 2s
+//     and final summary.
+//   - Parallel allocations from distinct creds (-parallel=N): spawns N
+//     independent allocations using N creds from the backup, each with
+//     its own TURN client and send loop, all writing to the same dst.
+//   - Multiple allocations per cred (-allocs-per-cred=K): each cred
+//     supports up to K simultaneous allocations against VK's per-cred
+//     quota of 10. Combined with -parallel=N this gives N*K total
+//     allocations from N creds — the only way to drive worker counts
+//     above what your backup has creds for. Example: 5 creds with K=10
+//     gives 50 simultaneous allocations (matches the production app's
+//     conn count) without needing 50 distinct creds in the backup.
+//
+// Used to detect VK shaping behaviour at varying parallelism: per-
+// allocation cap, aggregate cap, per-cred cap, abusive-pattern
+// classification, etc.
 //
 // Required setup:
 //   1. On the VPS, run the matching server:
@@ -73,10 +82,13 @@ type backupFile struct {
 	} `json:"turn_pool"`
 }
 
-// workerStats holds per-conn live counters used by the aggregate printer
-// and end-of-test summary.
+// workerStats holds per-allocation live counters used by the aggregate
+// printer and end-of-test summary. With -allocs-per-cred=K several
+// workerStats can share the same `slot` value; subIdx (0..K-1) makes
+// them distinguishable in logs and aggregation.
 type workerStats struct {
 	slot      int
+	subIdx    int // index within same-slot allocations; 0 when K==1
 	bytesSent atomic.Int64
 	pktsSent  atomic.Int64
 	sendErrs  atomic.Int64
@@ -85,6 +97,17 @@ type workerStats struct {
 	allocDur  time.Duration
 	relayed   string
 	startTime time.Time
+}
+
+// label returns a short human-readable identifier for this worker —
+// "slot 0" when there's one allocation per cred, "slot 0/a3" when
+// multiple. Used in stdout for the live ticker, allocate-OK lines,
+// and the final RESULT block.
+func (s *workerStats) label(allocsPerCred int) string {
+	if allocsPerCred <= 1 {
+		return fmt.Sprintf("slot %d", s.slot)
+	}
+	return fmt.Sprintf("slot %d/a%d", s.slot, s.subIdx)
 }
 
 func main() {
@@ -101,6 +124,12 @@ func main() {
 		"use RFC 6062 TCP allocation (relay↔peer also TCP, not UDP). "+
 			"VPS must have TCP listener on -dst-port instead of UDP. "+
 			"Forces -transport=tcp.")
+	allocsPerCred := flag.Int("allocs-per-cred", 1,
+		"spawn this many independent TURN allocations per cred. Each "+
+			"uses a fresh UDP socket and gets its own relayed transport "+
+			"address on the relay. Total worker count = parallel * "+
+			"allocs-per-cred. VK's per-cred quota is 10 — values above "+
+			"that will produce 486 Allocation Quota Reached errors.")
 	flag.Parse()
 
 	if *credsPath == "" {
@@ -119,6 +148,13 @@ func main() {
 	}
 	if *parallel < 1 {
 		log.Fatal("-parallel must be >= 1")
+	}
+	if *allocsPerCred < 1 {
+		log.Fatal("-allocs-per-cred must be >= 1")
+	}
+	if *allocsPerCred > 10 {
+		log.Printf("warning: -allocs-per-cred=%d exceeds VK's per-cred quota of 10; expect 486 Allocation Quota Reached errors",
+			*allocsPerCred)
 	}
 
 	// Pre-load all creds we'll need, fail fast if anything's missing.
@@ -152,9 +188,29 @@ func main() {
 
 	dstAddr := &net.UDPAddr{IP: net.ParseIP(*dstIP), Port: *dstPort}
 
+	// Expand creds × allocs-per-cred into a flat list of workers. Each
+	// entry pairs a cred with its sub-index (0..K-1) so multiple workers
+	// sharing the same cred can be told apart in logs and live output.
+	type workerSpec struct {
+		cred   *backupCred
+		subIdx int
+	}
+	specs := make([]workerSpec, 0, len(creds)*(*allocsPerCred))
+	for _, c := range creds {
+		for j := 0; j < *allocsPerCred; j++ {
+			specs = append(specs, workerSpec{cred: c, subIdx: j})
+		}
+	}
+
 	fmt.Printf("=== TURN bandwidth test ===\n")
 	fmt.Printf("Transport:    %s\n", *transport)
-	fmt.Printf("Parallel:     %d allocation(s) (slots %v)\n", *parallel, slotsOf(creds))
+	if *allocsPerCred > 1 {
+		fmt.Printf("Parallel:     %d cred(s) × %d alloc/cred = %d total allocations (slots %v)\n",
+			len(creds), *allocsPerCred, len(specs), slotsOf(creds))
+	} else {
+		fmt.Printf("Parallel:     %d allocation(s) (slots %v)\n",
+			len(creds), slotsOf(creds))
+	}
 	fmt.Printf("TURN relay:   %s\n", creds[0].Address)
 	fmt.Printf("Destination:  %s\n", dstAddr)
 	fmt.Printf("Duration:     %s, payload: %d bytes\n\n", *duration, *pktSize)
@@ -166,58 +222,63 @@ func main() {
 		loggerFactory.DefaultLogLevel = logging.LogLevelWarn
 	}
 
-	// Spawn N workers, run them concurrently, aggregate live + final.
-	stats := make([]*workerStats, len(creds))
-	for i := range creds {
-		stats[i] = &workerStats{slot: creds[i].Slot}
+	// Spawn N*K workers, run them concurrently, aggregate live + final.
+	stats := make([]*workerStats, len(specs))
+	for i, sp := range specs {
+		stats[i] = &workerStats{slot: sp.cred.Slot, subIdx: sp.subIdx}
 	}
 	var wg sync.WaitGroup
 	startBarrier := make(chan struct{}) // released once all workers have allocated
-	allocReady := make(chan int, len(creds))
+	allocReady := make(chan int, len(specs))
 
-	for i, c := range creds {
+	for i, sp := range specs {
 		wg.Add(1)
 		go func(idx int, cred *backupCred) {
 			defer wg.Done()
 			runWorker(idx, cred, dstAddr, *transport, *tcpAllocation, *pktSize, *duration,
-				loggerFactory, stats[idx], allocReady, startBarrier)
-		}(i, c)
+				*allocsPerCred, loggerFactory, stats[idx], allocReady, startBarrier)
+		}(i, sp.cred)
 	}
 
 	// Wait for all allocations or fail-fast on any error.
 	allocCount := 0
 	allocStart := time.Now()
-	for allocCount < len(creds) {
+	for allocCount < len(specs) {
 		select {
 		case idx := <-allocReady:
 			allocCount++
 			s := stats[idx]
 			if s.allocOK.Load() {
-				fmt.Printf("[slot %d] Allocate OK in %s, relayed %s\n",
-					s.slot, s.allocDur.Round(time.Millisecond), s.relayed)
+				fmt.Printf("[%s] Allocate OK in %s, relayed %s\n",
+					s.label(*allocsPerCred), s.allocDur.Round(time.Millisecond), s.relayed)
 			} else {
-				fmt.Printf("[slot %d] Allocate FAILED — see worker error\n", s.slot)
+				fmt.Printf("[%s] Allocate FAILED — see worker error\n",
+					s.label(*allocsPerCred))
 			}
 		case <-time.After(30 * time.Second):
 			fmt.Printf("!! timeout waiting for all allocations after %s; only %d/%d ready\n",
-				time.Since(allocStart).Round(time.Millisecond), allocCount, len(creds))
+				time.Since(allocStart).Round(time.Millisecond), allocCount, len(specs))
 			os.Exit(1)
 		}
 	}
 	fmt.Printf("All %d allocations ready in %s, releasing send barrier\n\n",
-		len(creds), time.Since(allocStart).Round(time.Millisecond))
+		len(specs), time.Since(allocStart).Round(time.Millisecond))
 	close(startBarrier)
 
-	// Aggregate live tick — every 2s print per-conn + total rate.
+	// Aggregate live tick — every 2s print per-worker + total rate. With
+	// allocs-per-cred>1 the live ticker collapses workers down to a per-
+	// slot summary to keep the output readable at high N (50 workers ×
+	// every 2s = a wall of text otherwise).
 	doneCh := make(chan struct{})
-	go aggregatePrinter(stats, doneCh)
+	go aggregatePrinter(stats, *allocsPerCred, doneCh)
 
 	wg.Wait()
 	close(doneCh)
 	time.Sleep(100 * time.Millisecond) // let last printer line flush
 
 	// Final summary.
-	fmt.Printf("\n=== RESULT (transport=%s, parallel=%d) ===\n", *transport, len(creds))
+	fmt.Printf("\n=== RESULT (transport=%s, parallel=%d, allocs-per-cred=%d, workers=%d) ===\n",
+		*transport, len(creds), *allocsPerCred, len(specs))
 	var totalBytes int64
 	var totalPkts int64
 	var totalErrs int64
@@ -234,9 +295,9 @@ func main() {
 			maxElapsed = dur
 		}
 		bps := float64(bs) * 8 / dur.Seconds()
-		fmt.Printf("  slot %d: %s sent (%d pkts, %d errs) in %s = %s\n",
-			s.slot, humanBytes(bs), pk, er, dur.Round(10*time.Millisecond),
-			humanRate(bps))
+		fmt.Printf("  %s: %s sent (%d pkts, %d errs) in %s = %s\n",
+			s.label(*allocsPerCred), humanBytes(bs), pk, er,
+			dur.Round(10*time.Millisecond), humanRate(bps))
 	}
 	totalBps := float64(totalBytes) * 8 / maxElapsed.Seconds()
 	fmt.Printf("  ---\n")
@@ -252,10 +313,11 @@ func main() {
 // signal ready, wait for barrier, send for duration, log into stats.
 func runWorker(idx int, cred *backupCred, dstAddr *net.UDPAddr,
 	transport string, tcpAllocation bool, pktSize int, duration time.Duration,
-	loggerFactory *logging.DefaultLoggerFactory, stats *workerStats,
-	allocReady chan<- int, startBarrier <-chan struct{},
+	allocsPerCred int, loggerFactory *logging.DefaultLoggerFactory,
+	stats *workerStats, allocReady chan<- int, startBarrier <-chan struct{},
 ) {
 	turnAddr := cred.Address
+	tag := stats.label(allocsPerCred)
 
 	// Build the connection that pion/turn runs over.
 	var conn net.PacketConn
@@ -267,7 +329,7 @@ func runWorker(idx int, cred *backupCred, dstAddr *net.UDPAddr,
 		// which VK silently drops.
 		c, err := net.ListenPacket("udp4", "0.0.0.0:0")
 		if err != nil {
-			fmt.Printf("[slot %d] listen udp: %v\n", cred.Slot, err)
+			fmt.Printf("[%s] listen udp: %v\n", tag, err)
 			allocReady <- idx
 			return
 		}
@@ -276,7 +338,7 @@ func runWorker(idx int, cred *backupCred, dstAddr *net.UDPAddr,
 		dialer := net.Dialer{Timeout: 5 * time.Second}
 		tcp, err := dialer.Dial("tcp", turnAddr)
 		if err != nil {
-			fmt.Printf("[slot %d] dial tcp: %v\n", cred.Slot, err)
+			fmt.Printf("[%s] dial tcp: %v\n", tag, err)
 			allocReady <- idx
 			return
 		}
@@ -297,14 +359,14 @@ func runWorker(idx int, cred *backupCred, dstAddr *net.UDPAddr,
 	}
 	client, err := turn.NewClient(cfg)
 	if err != nil {
-		fmt.Printf("[slot %d] turn.NewClient: %v\n", cred.Slot, err)
+		fmt.Printf("[%s] turn.NewClient: %v\n", tag, err)
 		allocReady <- idx
 		return
 	}
 	defer client.Close()
 
 	if err := client.Listen(); err != nil {
-		fmt.Printf("[slot %d] client.Listen: %v\n", cred.Slot, err)
+		fmt.Printf("[%s] client.Listen: %v\n", tag, err)
 		allocReady <- idx
 		return
 	}
@@ -328,7 +390,7 @@ func runWorker(idx int, cred *backupCred, dstAddr *net.UDPAddr,
 	if tcpAllocation {
 		alloc, err := client.AllocateTCP()
 		if err != nil {
-			fmt.Printf("[slot %d] AllocateTCP: %v\n", cred.Slot, err)
+			fmt.Printf("[%s] AllocateTCP: %v\n", tag, err)
 			allocReady <- idx
 			return
 		}
@@ -343,7 +405,7 @@ func runWorker(idx int, cred *backupCred, dstAddr *net.UDPAddr,
 		// matches the default IPv4 server.
 		dataConn, err := alloc.Dial("tcp", dstStr)
 		if err != nil {
-			fmt.Printf("[slot %d] alloc.Dial(%s): %v\n", cred.Slot, dstStr, err)
+			fmt.Printf("[%s] alloc.Dial(%s): %v\n", tag, dstStr, err)
 			allocReady <- idx
 			return
 		}
@@ -355,7 +417,7 @@ func runWorker(idx int, cred *backupCred, dstAddr *net.UDPAddr,
 	} else {
 		relayConn, err := client.Allocate()
 		if err != nil {
-			fmt.Printf("[slot %d] Allocate: %v\n", cred.Slot, err)
+			fmt.Printf("[%s] Allocate: %v\n", tag, err)
 			allocReady <- idx
 			return
 		}
@@ -402,7 +464,7 @@ func runWorker(idx int, cred *backupCred, dstAddr *net.UDPAddr,
 
 	payload := make([]byte, pktSize)
 	if _, err := rand.Read(payload); err != nil {
-		fmt.Printf("[slot %d] rand: %v\n", cred.Slot, err)
+		fmt.Printf("[%s] rand: %v\n", tag, err)
 		return
 	}
 
@@ -425,8 +487,10 @@ func runWorker(idx int, cred *backupCred, dstAddr *net.UDPAddr,
 	}
 }
 
-// aggregatePrinter ticks every 2s and prints per-slot + total rate.
-func aggregatePrinter(stats []*workerStats, doneCh <-chan struct{}) {
+// aggregatePrinter ticks every 2s and prints per-worker (or per-slot,
+// when allocs-per-cred>1) + total rate. Per-slot collapse keeps the
+// output readable when there are 50 workers behind 5 creds.
+func aggregatePrinter(stats []*workerStats, allocsPerCred int, doneCh <-chan struct{}) {
 	type snap struct {
 		t     time.Time
 		bytes int64
@@ -436,6 +500,18 @@ func aggregatePrinter(stats []*workerStats, doneCh <-chan struct{}) {
 		prev[i] = snap{t: time.Now(), bytes: s.bytesSent.Load()}
 	}
 
+	// When collapsing to per-slot, we need a deterministic order. Walk
+	// stats in order and remember which slot each bucket index belongs
+	// to so labels stay stable across ticks.
+	var slotOrder []int            // distinct slot indices, in first-seen order
+	slotIdxByValue := map[int]int{} // slot value → index into slotOrder/buckets
+	for _, s := range stats {
+		if _, seen := slotIdxByValue[s.slot]; !seen {
+			slotIdxByValue[s.slot] = len(slotOrder)
+			slotOrder = append(slotOrder, s.slot)
+		}
+	}
+
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 	for {
@@ -443,20 +519,37 @@ func aggregatePrinter(stats []*workerStats, doneCh <-chan struct{}) {
 		case <-doneCh:
 			return
 		case t := <-ticker.C:
-			parts := []string{}
 			var total int64
+			// Per-worker deltas this tick.
+			deltas := make([]int64, len(stats))
 			for i, s := range stats {
 				cur := s.bytesSent.Load()
-				dt := t.Sub(prev[i].t).Seconds()
-				if dt <= 0 {
-					dt = 1
-				}
-				rate := float64(cur-prev[i].bytes) * 8 / dt
-				total += cur - prev[i].bytes
-				parts = append(parts, fmt.Sprintf("[s%d]%s",
-					s.slot, humanRate(rate)))
+				deltas[i] = cur - prev[i].bytes
+				total += deltas[i]
 				prev[i] = snap{t: t, bytes: cur}
 			}
+
+			parts := []string{}
+			if allocsPerCred <= 1 {
+				// Per-worker line, current behaviour.
+				for i, s := range stats {
+					rate := float64(deltas[i]) * 8 / 2.0
+					parts = append(parts, fmt.Sprintf("[s%d]%s",
+						s.slot, humanRate(rate)))
+				}
+			} else {
+				// Collapse: sum deltas per slot.
+				slotSum := make([]int64, len(slotOrder))
+				for i, s := range stats {
+					slotSum[slotIdxByValue[s.slot]] += deltas[i]
+				}
+				for i, slot := range slotOrder {
+					rate := float64(slotSum[i]) * 8 / 2.0
+					parts = append(parts, fmt.Sprintf("[s%d×%d]%s",
+						slot, allocsPerCred, humanRate(rate)))
+				}
+			}
+
 			totalRate := float64(total) * 8 / 2.0
 			fmt.Printf("  %s   %s   TOTAL=%s\n",
 				time.Now().Format("15:04:05"),
