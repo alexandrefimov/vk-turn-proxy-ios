@@ -154,6 +154,17 @@ type Proxy struct {
 	// minute outage of the user's network.
 	lastWakeTxBytes atomic.Int64
 
+	// Snapshot of txBytes at the previous watchdog tick. Used to gate
+	// Condition 1 ("no DTLS RX for 2m+ with active conns → reconnect")
+	// on actual user activity: without this gate, a phone sitting idle
+	// on the lock screen with WireGuard keepalives flowing but no real
+	// traffic looks identical to a broken tunnel. vpn.wifi.5.log on
+	// 2026-05-06 reproduced this — 1h+ idle on stable wifi triggered
+	// one spurious ForceReconnect at 20:14 because lastRecvTime hadn't
+	// updated in 2m14s while the user wasn't sending anything either.
+	// Mirrors the txDelta gate in WakeHealthCheck (line 909-920).
+	lastWatchdogTxBytes atomic.Int64
+
 	// Guard against multiple concurrent waitCaptchaAndRestart goroutines.
 	// Only one should be running at a time; extras just compete on captchaCh.
 	captchaWaiterActive atomic.Bool
@@ -1040,12 +1051,28 @@ func (p *Proxy) runWatchdog() {
 			lastRecv := p.lastRecvTime.Load()
 			active := p.activeConns.Load()
 
-			// Condition 1: No packets despite active connections → dead tunnel
-			if lastRecv > 0 && active > 0 {
+			// Condition 1: User is sending but the tunnel isn't returning
+			// anything → dead tunnel. The TX-delta gate is critical: without
+			// it, a genuinely idle phone (lock-screen, no app traffic, just
+			// WireGuard keepalives at ~2 B/s) trips this every ~2 minutes
+			// because lastRecvTime — which only updates on DTLS-decrypted
+			// payload arrival, NOT on TURN refreshes — naturally goes stale
+			// when there's nothing to receive. Reproduced in vpn.wifi.5.log
+			// 2026-05-06: 1h+ stable wifi, no movement, one spurious
+			// ForceReconnect at 20:14 after 2 minutes of idle.
+			//
+			// 4 KB threshold and 2-minute RX-stale window match the equivalent
+			// gate in WakeHealthCheck (line 905-920). Below the threshold the
+			// user isn't meaningfully using the tunnel and a forced reconnect
+			// only buys churn (incl. fresh 486 cascade risk) without any
+			// observable improvement to user-perceived connectivity.
+			txNow := p.txBytes.Load()
+			txDelta := txNow - p.lastWatchdogTxBytes.Swap(txNow)
+			if txDelta > 4096 && lastRecv > 0 && active > 0 {
 				elapsed := time.Since(time.Unix(lastRecv, 0))
 				if elapsed > 2*time.Minute {
-					log.Printf("proxy: watchdog — no packets for %s with %d active conns, forcing reconnect",
-						elapsed.Round(time.Second), active)
+					log.Printf("proxy: watchdog — %d bytes TX in last tick but no DTLS RX for %s with %d active conns, forcing reconnect",
+						txDelta, elapsed.Round(time.Second), active)
 					p.ForceReconnect()
 					continue
 				}
