@@ -34,6 +34,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -812,6 +813,38 @@ func init() {
 	log.SetOutput(osLogWriter{})
 	// Use no flags — we add our own timestamp with local timezone in osLogWriter
 	log.SetFlags(0)
+
+	// Soft cap on Go runtime memory footprint to defend against the iOS
+	// NetworkExtension ~50 MB jetsam limit (Type E in
+	// failure_patterns_taxonomy.md).
+	//
+	// The limit covers everything Go has mapped from the OS except
+	// goroutine stacks: heap + MSpan/MCache/BuckHash + GC bookkeeping +
+	// the runtime's own scratch. As the live footprint approaches the
+	// limit, Go's GC runs more aggressively AND returns idle pages to
+	// the OS more eagerly — directly addressing the "sys gets stuck at
+	// the high-water mark" pattern observed in vpn.wifi.3 (after a
+	// transient allocation burst at 14:48 took sys from 37 → 46 MB,
+	// heap-alloc fell back to baseline within one GC cycle but sys
+	// stayed at 46 MB for the rest of the session — Go's lazy default
+	// release behaviour was leaving us 4 MB from jetsam after a single
+	// spike).
+	//
+	// 40 MB chosen from the observed baseline of ~37 MB sys at NumConns=50
+	// (steady state with no traffic burst). Stack memory was ~6 MB on top
+	// (excluded from this limit), and Swift / iOS system libraries add
+	// another ~5-10 MB to the process RSS. Total expected RSS at the
+	// limit ≈ 40 + 6 + 7 ≈ 53 MB — uncomfortably close to jetsam, but
+	// the 40-MB cap is on Go's *peak* footprint, not its working set,
+	// so in practice we should sit a few MB below the limit most of the
+	// time and only flirt with it during spikes.
+	//
+	// If this turns out to cost too much in GC CPU (Go thrashing to stay
+	// below the limit), bumping to 45 MB is the safe direction; if it's
+	// not enough to prevent jetsam, dropping NumConns is a stronger
+	// lever than dropping this further.
+	debug.SetMemoryLimit(40 << 20)
+	log.Printf("bridge: GOMEMLIMIT set to 40 MB (soft cap for jetsam defence)")
 }
 
 func main() {}
