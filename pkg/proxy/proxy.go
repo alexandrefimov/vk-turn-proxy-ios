@@ -2539,6 +2539,22 @@ func (p *Proxy) dumpConnStats(prevTx, prevRx []int64, prevTime time.Time, label 
 		humanBytes(int64(float64(rows[0].rx)/dur)))
 }
 
+// PhysFootprintFn, if set by the embedding application, returns the
+// process's current phys_footprint in bytes — the SAME number iOS jetsam
+// evaluates against the NetworkExtension memory budget. On iOS this is
+// wired up via the C bridge calling task_info(TASK_VM_INFO).
+//
+// runtime.MemStats.Sys reports the bytes Go has *mapped* from the OS,
+// which on Darwin overstates the resident footprint: madvise(MADV_FREE_
+// REUSABLE) marks pages reclaimable but doesn't immediately reduce RSS,
+// so Sys can stay at a high-water mark indefinitely while the kernel-
+// visible footprint is much lower. phys_footprint cuts through that
+// ambiguity by reporting what jetsam actually sees.
+//
+// Set to nil = unavailable, in which case the memstats logger writes
+// "rss=n/a". No global lock — set once at startup before the loop runs.
+var PhysFootprintFn func() uint64
+
 // logMemStatsLoop ticks every 60s and emits one runtime.MemStats line
 // per tick. Diagnostic for the Type E "silent extension kill" failure
 // mode where iOS jetsam terminates the NetworkExtension without
@@ -2546,26 +2562,37 @@ func (p *Proxy) dumpConnStats(prevTx, prevRx []int64, prevTime time.Time, label 
 //
 // Output format (one line per tick):
 //
-//	memstats sys=24.5 MB heap-alloc=12.1 MB heap-inuse=14.2 MB
-//	  stack=2.1 MB heap-objects=24813 goroutines=312 numGC=42
+//	memstats rss=23.4 MB sys=46.1 MB heap-alloc=12.1 MB heap-inuse=14.2 MB
+//	  heap-idle=22.3 MB heap-released=18.0 MB stack=6.0 MB
+//	  heap-objects=24813 goroutines=312 numGC=42
 //
 // What to look for:
-//   - sys:           bytes obtained from OS (= what iOS jetsam sees as
-//                    the process's resident footprint). Linear growth
-//                    over hours = leak; flat-but-high (~30+ MB) on a
-//                    50-conn pool = structurally near the limit.
-//   - heap-alloc:    bytes of currently-live heap objects.
-//   - heap-inuse:    in-use spans (>= heap-alloc; gap is fragmentation /
-//                    retained-but-not-live pages).
-//   - stack:         total stack memory (with thousands of goroutines
-//                    and 8 KB initial stacks each, this can grow into
-//                    the MB range).
-//   - heap-objects:  count of live objects (rises with allocation
-//                    leaks even when alloc bytes look stable).
-//   - goroutines:    leak indicator; should stabilise at roughly
-//                    NumConns × small-constant once startup settles.
-//   - numGC:         GC cycle count; high deltas between ticks mean
-//                    heavy alloc churn even if heap-alloc is steady.
+//   - rss:            phys_footprint via Mach task_info — what iOS
+//                     jetsam actually evaluates. The headline number;
+//                     "n/a" if PhysFootprintFn isn't wired up.
+//   - sys:            bytes Go mapped from the OS. Useful as a ceiling,
+//                     but on Darwin can overstate by 10-20 MB because
+//                     released pages stay in the address space until
+//                     pressure forces reclaim.
+//   - heap-alloc:     bytes of currently-live heap objects.
+//   - heap-inuse:     in-use spans (>= heap-alloc; gap is fragmentation
+//                     or retained-but-not-live within active spans).
+//   - heap-idle:      bytes in idle (unused) spans, candidates for
+//                     return-to-OS.
+//   - heap-released:  bytes Go has explicitly released to the OS via
+//                     madvise. If rss << sys, this is where the
+//                     difference lives. heap-released growing alongside
+//                     allocation churn = scavenger working; heap-released
+//                     stuck at zero while sys climbs = scavenger lazy.
+//   - stack:          total stack memory (with hundreds of goroutines
+//                     and 8 KB initial stacks each, this is in the MB
+//                     range and not affected by GOMEMLIMIT).
+//   - heap-objects:   count of live objects (rises with allocation
+//                     leaks even when alloc bytes look stable).
+//   - goroutines:     leak indicator; should stabilise at roughly
+//                     NumConns × small-constant once startup settles.
+//   - numGC:          GC cycle count; high deltas between ticks mean
+//                     heavy alloc churn even if heap-alloc is steady.
 //
 // Final dump on shutdown captures the moment-of-death snapshot in
 // the same place — useful when comparing pre-kill state across
@@ -2579,11 +2606,20 @@ func (p *Proxy) logMemStatsLoop(ctx context.Context) {
 	dump := func(label string) {
 		var ms runtime.MemStats
 		runtime.ReadMemStats(&ms)
-		log.Printf("proxy: memstats %s sys=%s heap-alloc=%s heap-inuse=%s stack=%s heap-objects=%d goroutines=%d numGC=%d",
+		rssStr := "n/a"
+		if PhysFootprintFn != nil {
+			if rss := PhysFootprintFn(); rss > 0 {
+				rssStr = humanBytes(int64(rss))
+			}
+		}
+		log.Printf("proxy: memstats %s rss=%s sys=%s heap-alloc=%s heap-inuse=%s heap-idle=%s heap-released=%s stack=%s heap-objects=%d goroutines=%d numGC=%d",
 			label,
+			rssStr,
 			humanBytes(int64(ms.Sys)),
 			humanBytes(int64(ms.HeapAlloc)),
 			humanBytes(int64(ms.HeapInuse)),
+			humanBytes(int64(ms.HeapIdle)),
+			humanBytes(int64(ms.HeapReleased)),
 			humanBytes(int64(ms.StackInuse)),
 			ms.HeapObjects,
 			runtime.NumGoroutine(),

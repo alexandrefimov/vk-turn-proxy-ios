@@ -4,6 +4,8 @@ package main
 #include <stdint.h>
 #include <stdlib.h>
 #include <os/log.h>
+#include <mach/mach.h>
+#include <mach/task_info.h>
 
 // Set GODEBUG=asyncpreemptoff=1 BEFORE Go runtime initializes.
 // This prevents "fatal error: non-Go code disabled sigaltstack"
@@ -23,6 +25,22 @@ static void callLogger(void *fn, int level, const char *msg) {
 static void go_os_log(const char *msg) {
 	os_log_t log = os_log_create("com.vkturnproxy.tunnel", "go");
 	os_log(log, "%{public}s", msg);
+}
+
+// Read this process's phys_footprint via the Mach task_info API.
+// phys_footprint is the SAME number iOS jetsam evaluates against the
+// extension memory budget — much more reliable than runtime.MemStats.Sys
+// (which is virtual address space mapped) for predicting jetsam.
+// Returns 0 on failure (caller treats as "unknown" / skips logging).
+static uint64_t go_get_phys_footprint(void) {
+	task_vm_info_data_t info;
+	mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+	kern_return_t kr = task_info(mach_task_self(), TASK_VM_INFO,
+	                             (task_info_t)&info, &count);
+	if (kr != KERN_SUCCESS) {
+		return 0;
+	}
+	return (uint64_t)info.phys_footprint;
 }
 */
 import "C"
@@ -845,6 +863,18 @@ func init() {
 	// lever than dropping this further.
 	debug.SetMemoryLimit(40 << 20)
 	log.Printf("bridge: GOMEMLIMIT set to 40 MB (soft cap for jetsam defence)")
+
+	// Wire the proxy's memstats logger to read this process's
+	// phys_footprint via Mach task_info (see go_get_phys_footprint
+	// in the cgo preamble). On iOS, jetsam evaluates phys_footprint
+	// against the extension memory budget — runtime.MemStats.Sys
+	// alone overstates the resident footprint because Go-released
+	// pages stay in the address space until the kernel reclaims
+	// them under pressure. Without this hook the memstats line shows
+	// "rss=n/a"; with it, we can see the actual jetsam input number.
+	proxy.PhysFootprintFn = func() uint64 {
+		return uint64(C.go_get_phys_footprint())
+	}
 }
 
 func main() {}
