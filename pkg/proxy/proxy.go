@@ -1853,6 +1853,22 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 				// This converts the typical post-wake recovery latency
 				// from ~120s (timer-based zombie threshold) to ~5s.
 				//
+				// Server-echo gate: same logic as the timer-based killer
+				// above (line ~1821). If we've never observed a single
+				// pong on this Proxy instance, the server isn't echoing
+				// our probes — typically it's running an unpatched build
+				// without the PR #168 probe-echo capability (e.g.
+				// vk-turn-proxy add-server-wrap-layer branch ships WRAP
+				// but not probe-echo). Without an echo path, EVERY
+				// active probe will fail the 30s wait below and kill
+				// the conn unconditionally — observed in vpn.wifi.6.log
+				// 2026-05-06 21:52:21: all 50 conns killed at once
+				// after a wake burst, 0 echos received over 70 minutes
+				// (sentSeq=113-119 per conn, lastPongSeq=0 across the
+				// board). Skip the probe entirely until we see a pong.
+				if !p.serverProbeable.Load() {
+					continue
+				}
 				// Throttle: if we already did an active probe in the
 				// last 30s, skip. LTE sleep/wake storms can deliver 7+
 				// wake events in 18s (vpn.lte.1.log @ 19:48-19:49) and
