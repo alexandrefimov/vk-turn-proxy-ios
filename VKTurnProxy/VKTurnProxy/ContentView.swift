@@ -96,7 +96,7 @@ struct ContentView: View {
 
                     // Logs & Settings links
                     HStack(spacing: 24) {
-                        NavigationLink(destination: LogsView()) {
+                        NavigationLink(destination: LogsView(tunnel: tunnel)) {
                             Label("Logs", systemImage: "doc.text")
                         }
                         NavigationLink(destination: SettingsView()) {
@@ -913,9 +913,11 @@ struct CaptchaWKWebView: UIViewRepresentable {
 // MARK: - Logs View
 
 struct LogsView: View {
+    @ObservedObject var tunnel: TunnelManager
     @State private var logText = ""
     @State private var autoScroll = true
     @State private var showShareSheet = false
+    @State private var usingOSLogFallback = false
     private let timer = Timer.publish(every: 2, on: .main, in: .common).autoconnect()
 
     /// Maximum characters to display — keeps UI responsive.
@@ -958,8 +960,11 @@ struct LogsView: View {
         .sheet(isPresented: $showShareSheet) {
             // Export the COMBINED log (archive .1 + current) as a single
             // temp file so the user gets the full history, not just the
-            // tail since the last rotation.
-            if let url = SharedLogger.shared.exportSnapshotURL(),
+            // tail since the last rotation. If SharedLogger is empty
+            // (App Group unavailable), Share the os_log fallback text
+            // by writing it to a temp file first so the user can still
+            // attach a log file to a bug report.
+            if let url = exportShareableLogURL(),
                FileManager.default.fileExists(atPath: url.path) {
                 ShareSheet(activityItems: [url])
             }
@@ -967,15 +972,66 @@ struct LogsView: View {
     }
 
     private func loadLogs() {
-        var text = SharedLogger.shared.readLogs()
-        if text.isEmpty {
-            text = "No logs yet"
-        } else if text.count > maxDisplayChars {
-            // Show only the tail so the most recent logs are visible
-            let startIndex = text.index(text.endIndex, offsetBy: -maxDisplayChars)
-            text = "… (truncated)\n" + String(text[startIndex...])
+        let fileText = SharedLogger.shared.readLogs()
+        if !fileText.isEmpty {
+            usingOSLogFallback = false
+            logText = truncated(fileText)
+            return
         }
-        logText = text
+        // SharedLogger empty — App Group container is probably unreachable
+        // (this happens on improperly-resigned sideloaded IPAs and has
+        // also been reported on TestFlight builds, github issues #7/#8).
+        // Fall back to per-process os_log: main app reads its own ring
+        // buffer synchronously, then we ask the extension to read its
+        // own and ferry the text back via providerMessage. Surface a
+        // banner so the user understands the source and limitations.
+        usingOSLogFallback = true
+        let mainAppLogs = OSLogReader.readOwnLogs(maxAge: 1800)
+        Task {
+            let extensionLogs = await tunnel.fetchExtensionOSLogs() ?? ""
+            await MainActor.run {
+                var combined = mainAppLogs + extensionLogs
+                if combined.isEmpty {
+                    combined = "No logs available.\n\n" +
+                        "The on-disk log file is empty (App Group container " +
+                        "unreachable) and the os_log fallback also returned " +
+                        "nothing — likely the extension was just (re)started " +
+                        "and hasn't logged anything since. Try again in a few " +
+                        "seconds, or reconnect the tunnel."
+                } else {
+                    combined = "⚠️ App Group container unavailable — showing " +
+                        "os_log fallback (recent ~30 min only, " +
+                        "may be incomplete and out of order).\n\n" +
+                        combined
+                }
+                logText = truncated(combined)
+            }
+        }
+    }
+
+    private func truncated(_ text: String) -> String {
+        guard text.count > maxDisplayChars else { return text }
+        let startIndex = text.index(text.endIndex, offsetBy: -maxDisplayChars)
+        return "… (truncated)\n" + String(text[startIndex...])
+    }
+
+    /// Decide what URL to hand to the Share sheet. Default path: the
+    /// file-backed export (archive + current). Fallback path: write
+    /// the current `logText` (which is the os_log fallback view) to
+    /// a temp file so the user can still attach a log to a bug report
+    /// even when the App Group file is empty.
+    private func exportShareableLogURL() -> URL? {
+        if let url = SharedLogger.shared.exportSnapshotURL(),
+           let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
+           let size = attrs[.size] as? Int, size > 0 {
+            return url
+        }
+        // SharedLogger empty — write the on-screen fallback text to a
+        // temp file so Share has something to attach.
+        let tmp = FileManager.default.temporaryDirectory
+            .appendingPathComponent("vpn-export-oslog.log")
+        try? logText.write(to: tmp, atomically: true, encoding: .utf8)
+        return FileManager.default.fileExists(atPath: tmp.path) ? tmp : nil
     }
 }
 

@@ -253,6 +253,20 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             } else {
                 completionHandler?(nil)
             }
+        } else if msg == "get_logs" {
+            // Recovery path for the in-app Logs UI when SharedLogger's
+            // App Group file is unavailable (improper code signing,
+            // iOS-version-specific behaviour, etc): main app sends
+            // "get_logs", extension reads its OWN os_log ring buffer
+            // (per-process, can't be done from main app on its behalf)
+            // and returns the formatted text. Main app concatenates
+            // with its own OSLogReader output. Last ~30 minutes of
+            // entries — enough to cover what just happened before the
+            // user tapped Logs without overflowing providerMessage.
+            // Independent of tunnelHandle: works even before
+            // wgStartVKBootstrap completes.
+            let text = OSLogReader.readOwnLogs(maxAge: 1800)
+            completionHandler?(text.data(using: .utf8))
         } else if msg.hasPrefix("solve_captcha:") {
             let answer = String(msg.dropFirst("solve_captcha:".count))
             logMsg("handleAppMessage: captcha answer received (\(answer.count) chars)")

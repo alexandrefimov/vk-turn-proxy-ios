@@ -852,6 +852,30 @@ class TunnelManager: ObservableObject {
 
     private var pingCounter: Int = 0
 
+    /// Ask the extension to dump its own os_log ring buffer, used as a
+    /// fallback by the in-app Logs UI when SharedLogger's App Group
+    /// file is unreachable. Per-process os_log entries can only be
+    /// read by their own process (iOS sandbox), so we ferry the
+    /// extension's tail across via providerMessage. Returns nil on
+    /// any RPC error; empty string on RPC success with no entries.
+    func fetchExtensionOSLogs() async -> String? {
+        guard let session = manager?.connection as? NETunnelProviderSession else { return nil }
+        guard let msg = "get_logs".data(using: .utf8) else { return nil }
+        return await withCheckedContinuation { continuation in
+            do {
+                try session.sendProviderMessage(msg) { response in
+                    if let data = response, let str = String(data: data, encoding: .utf8) {
+                        continuation.resume(returning: str)
+                    } else {
+                        continuation.resume(returning: "")
+                    }
+                }
+            } catch {
+                continuation.resume(returning: nil)
+            }
+        }
+    }
+
     private func fetchStats() {
         guard let session = manager?.connection as? NETunnelProviderSession else { return }
         guard let msg = "get_stats".data(using: .utf8) else { return }
