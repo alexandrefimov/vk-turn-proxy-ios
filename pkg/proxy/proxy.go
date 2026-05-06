@@ -14,6 +14,7 @@ import (
 	neturl "net/url"
 	"net/http"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -240,6 +241,19 @@ type Proxy struct {
 	wakeCh            chan struct{}
 	lastActiveProbeAt []atomic.Int64
 
+	// Per-conn byte counters for diagnostic of throughput asymmetry.
+	// Incremented in runTURN's bridge: connTxBytes counts the DTLS-record
+	// bytes sent into the TURN ChannelData layer (pre-WRAP), connRxBytes
+	// counts what came back. Counters are cumulative across the conn's
+	// whole tunnel uptime (NOT reset per session-respawn) so the periodic
+	// dump shows how each conn-slot is performing over time. Sized by
+	// NumConns; safe to read concurrently with the bridge writers thanks
+	// to atomic. The dump goroutine (logConnStatsLoop) runs every 60s
+	// and emits one log block listing per-conn delta + cumulative; same
+	// dump fires on Stop() so a final snapshot lands before shutdown.
+	connTxBytes []atomic.Int64
+	connRxBytes []atomic.Int64
+
 	// Bootstrap-ready signaling. Fires exactly once per proxy lifetime, when
 	// either (a) the first conn establishes a live DTLS+TURN session (signaled
 	// with nil from runConnection), or (b) Start() hits a fatal non-captcha
@@ -291,6 +305,8 @@ func NewProxy(cfg Config) *Proxy {
 		firstPingAt:       make([]atomic.Int64, cfg.NumConns),
 		firstPongAt:       make([]atomic.Int64, cfg.NumConns),
 		lastActiveProbeAt: make([]atomic.Int64, cfg.NumConns),
+		connTxBytes:       make([]atomic.Int64, cfg.NumConns),
+		connRxBytes:       make([]atomic.Int64, cfg.NumConns),
 		wakeCh:            make(chan struct{}),
 		startedAt:         time.Now(),
 	}
@@ -413,6 +429,13 @@ func (p *Proxy) Start() error {
 	// slots are fresh; the grower backfills pool[1..N-1] slowly so the
 	// pool eventually reaches full insurance coverage.
 	go p.growCredPool(p.ctx)
+
+	// Per-conn byte-counter dump goroutine. Runs every 60s and emits a
+	// log block listing each conn's TX/RX delta + cumulative. Purely
+	// diagnostic — used to investigate per-conn throughput asymmetry
+	// (e.g. when total speedtest result drops but mechanism unclear).
+	// See logConnStatsTick comment for output format.
+	go p.logConnStatsLoop(p.ctx)
 
 	err = p.startConnections()
 	if err != nil {
@@ -2305,6 +2328,14 @@ func (p *Proxy) runTURN(ctx context.Context, turnAddr string, creds *TURNCreds, 
 				}
 				return
 			}
+			// Per-conn TX byte counter for diagnostic — count the
+			// pre-WRAP application-layer bytes (DTLS records that came
+			// out of conn2), not the wire bytes including nonce. This
+			// matches what an external observer counting WireGuard
+			// throughput would see.
+			if connIdx >= 0 && connIdx < len(p.connTxBytes) {
+				p.connTxBytes[connIdx].Add(int64(n))
+			}
 		}
 	}()
 
@@ -2354,6 +2385,12 @@ func (p *Proxy) runTURN(ctx context.Context, turnAddr string, creds *TURNCreds, 
 				}
 				return
 			}
+			// Per-conn RX byte counter for diagnostic — count the
+			// post-UNWRAP application-layer bytes (DTLS records being
+			// handed back to conn2), symmetric with the TX direction.
+			if connIdx >= 0 && connIdx < len(p.connRxBytes) {
+				p.connRxBytes[connIdx].Add(int64(len(payload)))
+			}
 		}
 	}()
 
@@ -2365,6 +2402,137 @@ func (p *Proxy) runTURN(ctx context.Context, turnAddr string, creds *TURNCreds, 
 }
 
 // dialDTLS establishes a DTLS connection using the given PacketConn as transport.
+// logConnStatsLoop ticks every 60s and emits a per-conn TX/RX byte
+// breakdown to the log. Diagnostic-only; meant to surface throughput
+// asymmetry across the conn pool that a global TxBytes/RxBytes can't
+// show. For example, if 5 of 50 conns are stuck in a partially-shaped
+// VK relay state and contribute almost nothing to a speedtest, the
+// dump makes it obvious which connIdx values are the slow ones.
+//
+// Output format (one block per tick) includes per-conn lines sorted by
+// total throughput in the interval, plus a summary line listing the
+// number of "idle" conns (combined <1 KB in interval) so post-hoc
+// grep can quickly count them. Final dump on tunnel shutdown captures
+// session totals in one place.
+//
+// Approximately 50 lines per minute at NumConns=50 — noisy compared to
+// stability metrics but a tiny fraction of the pion debug volume (which
+// can produce hundreds of lines per second under churn). Acceptable for
+// always-on diagnostic.
+func (p *Proxy) logConnStatsLoop(ctx context.Context) {
+	const interval = 60 * time.Second
+
+	// Snapshot of the previous tick's cumulative counters, used to
+	// compute deltas. Zero-initialised so the first tick reports
+	// since-spawn totals as the delta — consistent with subsequent
+	// per-interval semantics.
+	n := len(p.connTxBytes)
+	prevTx := make([]int64, n)
+	prevRx := make([]int64, n)
+	prevTime := time.Now()
+
+	tick := time.NewTicker(interval)
+	defer tick.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			// Final dump on shutdown — captures whatever fragment of
+			// interval was in progress so the last data point isn't
+			// lost. Computes against the same prevTime so the rate
+			// number stays meaningful even for a partial interval.
+			p.dumpConnStats(prevTx, prevRx, prevTime, "final")
+			return
+		case t := <-tick.C:
+			p.dumpConnStats(prevTx, prevRx, prevTime, "tick")
+			// Refresh snapshot for next tick.
+			for i := 0; i < n; i++ {
+				prevTx[i] = p.connTxBytes[i].Load()
+				prevRx[i] = p.connRxBytes[i].Load()
+			}
+			prevTime = t
+		}
+	}
+}
+
+// dumpConnStats emits one log block. Format:
+//
+//	conn-stats <label> over Xs (NumConns=N):
+//	  conn  3:  TX  256.0 KB/s ( 15.4 MB cum)  RX 1.20 MB/s ( 72.0 MB cum)
+//	  conn  7:  TX  ...
+//	  ...
+//	  summary: <K idle> (combined <1KB in interval), top conn TX <X>, RX <Y>
+//
+// Idle threshold of 1 KB combined catches stuck-mode (~9 KB/s × 60s =
+// 540 KB) as not-idle, which is intentional — we want to see those in
+// the per-conn list, not bucket them away.
+func (p *Proxy) dumpConnStats(prevTx, prevRx []int64, prevTime time.Time, label string) {
+	n := len(p.connTxBytes)
+	if n == 0 {
+		return
+	}
+	now := time.Now()
+	dur := now.Sub(prevTime).Seconds()
+	if dur < 0.1 {
+		dur = 0.1 // avoid divide-by-zero / nonsensical rates on instant final dump
+	}
+
+	type row struct {
+		idx        int
+		tx, rx     int64 // delta in interval
+		txCum, rxCum int64
+	}
+	rows := make([]row, n)
+	idle := 0
+	for i := 0; i < n; i++ {
+		txCum := p.connTxBytes[i].Load()
+		rxCum := p.connRxBytes[i].Load()
+		dTx := txCum - prevTx[i]
+		dRx := rxCum - prevRx[i]
+		rows[i] = row{idx: i, tx: dTx, rx: dRx, txCum: txCum, rxCum: rxCum}
+		if dTx+dRx < 1024 {
+			idle++
+		}
+	}
+	// Sort descending by combined delta — the busy conns surface at top.
+	sort.Slice(rows, func(i, j int) bool {
+		return (rows[i].tx + rows[i].rx) > (rows[j].tx + rows[j].rx)
+	})
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "proxy: conn-stats %s over %.1fs (NumConns=%d):\n", label, dur, n)
+	for _, r := range rows {
+		fmt.Fprintf(&b, "  conn %2d:  TX %s/s (%s cum)  RX %s/s (%s cum)\n",
+			r.idx,
+			humanBytes(int64(float64(r.tx)/dur)),
+			humanBytes(r.txCum),
+			humanBytes(int64(float64(r.rx)/dur)),
+			humanBytes(r.rxCum))
+	}
+	fmt.Fprintf(&b, "  summary: %d idle (combined <1KB in interval), top TX %s/s, top RX %s/s",
+		idle,
+		humanBytes(int64(float64(rows[0].tx)/dur)),
+		humanBytes(int64(float64(rows[0].rx)/dur)))
+	log.Print(b.String())
+}
+
+// humanBytes renders a byte count with binary units (K / M / G).
+// Tuned for the conn-stats dump; same formatting convention as the
+// turn_bw_test/turn_bw_server tools so output composes well in
+// side-by-side analysis.
+func humanBytes(n int64) string {
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%d B", n)
+	}
+	div, exp := int64(unit), 0
+	for n2 := n / unit; n2 >= unit; n2 /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %cB", float64(n)/float64(div), "KMGT"[exp])
+}
+
 func dialDTLS(ctx context.Context, transport net.PacketConn, peer *net.UDPAddr) (net.Conn, error) {
 	certificate, err := selfsign.GenerateSelfSigned()
 	if err != nil {
