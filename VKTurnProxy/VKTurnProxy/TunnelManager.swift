@@ -499,12 +499,37 @@ class TunnelManager: ObservableObject {
         try? session.sendProviderMessage(msg) { _ in }
     }
 
-    /// Route captcha-WebView log messages into the same vpn.log stream used
-    /// by the extension. The WKWebView lives in the main-app process and has
-    /// no direct access to the shared App Group log file, so we tunnel the
-    /// string through the provider-session IPC — same mechanism debugLog
-    /// uses for TunnelManager's own events.
+    /// Route captcha-WebView log messages into the vpn.log stream.
+    ///
+    /// We use TWO paths in parallel because they fail in different
+    /// situations:
+    ///
+    ///  1. `SharedLogger.shared.log(...)` — writes directly to the App
+    ///     Group `vpn.log` from the main-app process. The original
+    ///     comment for this method claimed main-app has no direct
+    ///     access; that's incorrect — both targets have the
+    ///     `group.com.vkturnproxy.app` App Group entitlement, and
+    ///     `[AppDebug]` lines from TunnelManager have always worked
+    ///     this way. This path is critical during PRE-BOOTSTRAP
+    ///     captcha (extension not yet running, sendProviderMessage
+    ///     can't deliver), which is exactly the case for issue #5
+    ///     "blank captcha" reports — vpn.from.github.log on
+    ///     2026-05-07 had `pre-bootstrap: captcha required` followed
+    ///     by `pre-bootstrap: user dismissed captcha — aborting` 13.6
+    ///     seconds later with ZERO `[captcha-view]` events between
+    ///     them, masking what the WebView actually did.
+    ///
+    ///  2. `debugLog(...)` (via sendProviderMessage to extension) —
+    ///     redundant once path 1 is in place, kept for symmetry with
+    ///     other diagnostic events that go through it. Cost is one
+    ///     extra log line per event during mid-session captcha when
+    ///     both paths reach the file. Acceptable for diagnostic.
+    ///
+    /// If we ever drop path 2, drop here. Until then duplicate lines
+    /// in the log are accepted as the price of always-visible
+    /// captcha-view events.
     func logFromCaptchaView(_ message: String) {
+        SharedLogger.shared.log("[captcha-view] \(message)")
         debugLog("[captcha-view] \(message)")
     }
 
