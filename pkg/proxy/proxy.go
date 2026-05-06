@@ -254,6 +254,18 @@ type Proxy struct {
 	connTxBytes []atomic.Int64
 	connRxBytes []atomic.Int64
 
+	// Per-conn current local IP as observed at TURN allocation time.
+	// Stored as host string (no port) so the pathstats logger can compare
+	// against the OS default-route IP without parsing. Set by runTURN
+	// when "TURN relay allocated" fires; cleared (set to "") when the
+	// session ends. The value reflects the bind moment — if iOS later
+	// rebinds the underlying socket on a path change (we observed this
+	// 2026-05-06 wifi→cellular→wifi: 30 sockets had their reported
+	// LocalAddr silently shift), this stored value lags reality, which
+	// is the WHOLE POINT: the gap between this and the live os-default
+	// is exactly the diagnostic signal we want to see.
+	connLocalIPs []atomic.Value // string
+
 	// Bootstrap-ready signaling. Fires exactly once per proxy lifetime, when
 	// either (a) the first conn establishes a live DTLS+TURN session (signaled
 	// with nil from runConnection), or (b) Start() hits a fatal non-captcha
@@ -307,6 +319,7 @@ func NewProxy(cfg Config) *Proxy {
 		lastActiveProbeAt: make([]atomic.Int64, cfg.NumConns),
 		connTxBytes:       make([]atomic.Int64, cfg.NumConns),
 		connRxBytes:       make([]atomic.Int64, cfg.NumConns),
+		connLocalIPs:      make([]atomic.Value, cfg.NumConns),
 		wakeCh:            make(chan struct{}),
 		startedAt:         time.Now(),
 	}
@@ -448,6 +461,19 @@ func (p *Proxy) Start() error {
 	// the limit is structurally tight at NumConns=50 and we should
 	// consider proactive self-restart or a smaller pool.
 	go p.logMemStatsLoop(p.ctx)
+
+	// Path-stats dump goroutine. Runs every 60s and emits one line
+	// reporting (a) the OS default-route source IP right now, sampled
+	// via a fresh dial, and (b) how many of our conns are still bound
+	// to that same IP vs lagging on a stale one. Diagnostic for the
+	// silent-rebind pattern surfaced 2026-05-06 wifi→cellular→wifi:
+	// 30 sockets allocated on 10.101.39.17 had their reported
+	// LocalAddr quietly become 192.168.4.21 with NO [PathMonitor]
+	// event between the allocation and the failure, masking the fact
+	// that the conns were already on a doomed source IP. The level-
+	// triggered snapshot complements the existing edge-triggered
+	// [PathMonitor] log lines.
+	go p.logPathStatsLoop(p.ctx)
 
 	err = p.startConnections()
 	if err != nil {
@@ -2261,8 +2287,21 @@ func (p *Proxy) runTURN(ctx context.Context, turnAddr string, creds *TURNCreds, 
 	// the Network Extension is using (cellular CGNAT like 10.x.x.x vs WiFi
 	// local range like 192.168.x.x), which is otherwise invisible and
 	// critically affects which source IP VK TURN sees.
+	localAddrStr := turnConn.LocalAddr().String()
 	log.Printf("proxy: [conn %d] TURN relay allocated: %s (RTT %dms, local=%s)",
-		connIdx, relayConn.LocalAddr(), time.Since(allocStart).Milliseconds(), turnConn.LocalAddr())
+		connIdx, relayConn.LocalAddr(), time.Since(allocStart).Milliseconds(), localAddrStr)
+
+	// Stash the local IP (without port) so logPathStatsLoop can compare
+	// per-conn allocation-time IPs against the current OS default route
+	// once a minute. Discrepancy = iOS routing has shifted under us
+	// without any [PathMonitor] event firing. Cleared on this conn's
+	// runTURN exit (success or failure path) so pathstats only counts
+	// currently-allocated conns.
+	if localHost, _, splitErr := net.SplitHostPort(localAddrStr); splitErr == nil &&
+		connIdx >= 0 && connIdx < len(p.connLocalIPs) {
+		p.connLocalIPs[connIdx].Store(localHost)
+		defer p.connLocalIPs[connIdx].Store("")
+	}
 
 	// NAT keepalive — send a STUN Binding request every 25 seconds on the
 	// underlying TURN socket. This prevents WiFi router NAT mapping expiry
@@ -2629,6 +2668,121 @@ func (p *Proxy) logMemStatsLoop(ctx context.Context) {
 	// Emit once at startup so we have a baseline anchor for later
 	// growth-rate calculations even if the extension is killed before
 	// the first tick.
+	dump("startup")
+
+	for {
+		select {
+		case <-ctx.Done():
+			dump("final")
+			return
+		case <-tick.C:
+			dump("tick")
+		}
+	}
+}
+
+// pathSnapshotOSDefault returns the OS's current default-route source IP
+// for outbound UDP. Implementation: net.Dial("udp", "1.1.1.1:53") doesn't
+// actually transmit anything (UDP "connect" just sets the kernel's remote
+// for the socket), but it forces the kernel to pick a route and bind a
+// local address. We read that, close the socket, and report the IP.
+//
+// 1.1.1.1:53 is chosen as a stable public IPv4 anycast that exists in any
+// routable network (cellular, home wifi, office wifi, captive portal pre-
+// auth). We don't care if the actual server responds — we only need the
+// route lookup, which happens during connect() in the kernel.
+//
+// Returns "n/a" if no usable network is up at all (rare on iOS where
+// there's almost always at least cellular).
+func pathSnapshotOSDefault() string {
+	conn, err := net.Dial("udp", "1.1.1.1:53")
+	if err != nil {
+		return "n/a"
+	}
+	defer conn.Close()
+	addr, ok := conn.LocalAddr().(*net.UDPAddr)
+	if !ok {
+		return "n/a"
+	}
+	return addr.IP.String()
+}
+
+// logPathStatsLoop ticks every 60s and emits one path-state snapshot
+// per tick. Diagnostic for silent iOS routing changes that don't fire
+// a [PathMonitor] event but DO change which interface our existing UDP
+// sockets are pinned to (or, more often, which interface a freshly-
+// opened UDP socket gets pinned to — at which point our running
+// allocations are stranded on a stale path until they fail).
+//
+// Output format (one line per tick):
+//
+//	pathstats os-default=192.168.4.21 in-sync=42/50 stale=[10.101.39.17 (8)]
+//
+// What to look for:
+//   - os-default:  current OS-picked source IP for new outbound UDP.
+//                  Compare across ticks to spot rebinds that didn't
+//                  fire a [PathMonitor] event.
+//   - in-sync:     count of currently-allocated conns whose
+//                  allocation-time local IP matches os-default. In
+//                  steady state this should be NumConns/NumConns once
+//                  bootstrap finishes.
+//   - stale:       any local IPs (and conn counts) that don't match
+//                  os-default. Non-zero stale = some allocations are
+//                  living on a doomed interface. Empty list if none
+//                  (omitted from log to keep the line short).
+//
+// Conns whose connLocalIPs entry is empty (not currently allocated —
+// dormant, bootstrap-pending, or just torn down) are excluded from
+// both buckets so the in-sync count reflects active state, not history.
+func (p *Proxy) logPathStatsLoop(ctx context.Context) {
+	const interval = 60 * time.Second
+
+	tick := time.NewTicker(interval)
+	defer tick.Stop()
+
+	dump := func(label string) {
+		osDefault := pathSnapshotOSDefault()
+
+		inSync := 0
+		stale := map[string]int{}
+		active := 0
+		for i := range p.connLocalIPs {
+			v, _ := p.connLocalIPs[i].Load().(string)
+			if v == "" {
+				continue // not currently allocated
+			}
+			active++
+			if v == osDefault {
+				inSync++
+			} else {
+				stale[v]++
+			}
+		}
+
+		if len(stale) == 0 {
+			log.Printf("proxy: pathstats %s os-default=%s in-sync=%d/%d",
+				label, osDefault, inSync, active)
+		} else {
+			// Format stale buckets as [ip1 (n), ip2 (m), ...] — sorted by
+			// count desc so the dominant stale IP surfaces first.
+			type bucket struct {
+				ip    string
+				count int
+			}
+			rows := make([]bucket, 0, len(stale))
+			for ip, c := range stale {
+				rows = append(rows, bucket{ip, c})
+			}
+			sort.Slice(rows, func(i, j int) bool { return rows[i].count > rows[j].count })
+			parts := make([]string, len(rows))
+			for i, r := range rows {
+				parts[i] = fmt.Sprintf("%s (%d)", r.ip, r.count)
+			}
+			log.Printf("proxy: pathstats %s os-default=%s in-sync=%d/%d stale=[%s]",
+				label, osDefault, inSync, active, strings.Join(parts, ", "))
+		}
+	}
+
 	dump("startup")
 
 	for {
