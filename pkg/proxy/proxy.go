@@ -2499,21 +2499,24 @@ func (p *Proxy) dumpConnStats(prevTx, prevRx []int64, prevTime time.Time, label 
 		return (rows[i].tx + rows[i].rx) > (rows[j].tx + rows[j].rx)
 	})
 
-	var b strings.Builder
-	fmt.Fprintf(&b, "proxy: conn-stats %s over %.1fs (NumConns=%d):\n", label, dur, n)
+	// Emit one log entry per line, not one big buffer. iOS os_log /
+	// idevicesyslog truncates entries past ~1 KB, which silently loses
+	// most of a 50-conn block when buffered into a single Write. The
+	// underlying async file writer (logChan, buffered 512) handles 50+
+	// rapid writes per tick without back-pressure.
+	log.Printf("proxy: conn-stats %s over %.1fs (NumConns=%d):", label, dur, n)
 	for _, r := range rows {
-		fmt.Fprintf(&b, "  conn %2d:  TX %s/s (%s cum)  RX %s/s (%s cum)\n",
+		log.Printf("  conn %2d:  TX %s/s (%s cum)  RX %s/s (%s cum)",
 			r.idx,
 			humanBytes(int64(float64(r.tx)/dur)),
 			humanBytes(r.txCum),
 			humanBytes(int64(float64(r.rx)/dur)),
 			humanBytes(r.rxCum))
 	}
-	fmt.Fprintf(&b, "  summary: %d idle (combined <1KB in interval), top TX %s/s, top RX %s/s",
+	log.Printf("  summary: %d idle (combined <1KB in interval), top TX %s/s, top RX %s/s",
 		idle,
 		humanBytes(int64(float64(rows[0].tx)/dur)),
 		humanBytes(int64(float64(rows[0].rx)/dur)))
-	log.Print(b.String())
 }
 
 // humanBytes renders a byte count with binary units (K / M / G).
