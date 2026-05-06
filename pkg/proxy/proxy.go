@@ -437,6 +437,18 @@ func (p *Proxy) Start() error {
 	// See logConnStatsTick comment for output format.
 	go p.logConnStatsLoop(p.ctx)
 
+	// Memory-stats dump goroutine. Runs every 60s and emits one line
+	// from runtime.MemStats — Sys (what iOS jetsam looks at), heap
+	// usage, goroutine count, GC count. Diagnostic for the Type E
+	// silent-extension-kill failure mode (vpn.wifi.2.restart.log on
+	// 2026-05-06: extension dropped after 3h 23m of normal operation,
+	// no errors, no PathMonitor event — classic memory-pressure
+	// jetsam against the NetworkExtension's ~50 MB hard limit).
+	// Linear growth in Sys identifies a leak; flat-but-high Sys says
+	// the limit is structurally tight at NumConns=50 and we should
+	// consider proactive self-restart or a smaller pool.
+	go p.logMemStatsLoop(p.ctx)
+
 	err = p.startConnections()
 	if err != nil {
 		// Fatal failure before any conn came up — wake any bootstrap waiters
@@ -2525,6 +2537,73 @@ func (p *Proxy) dumpConnStats(prevTx, prevRx []int64, prevTime time.Time, label 
 		idle,
 		humanBytes(int64(float64(rows[0].tx)/dur)),
 		humanBytes(int64(float64(rows[0].rx)/dur)))
+}
+
+// logMemStatsLoop ticks every 60s and emits one runtime.MemStats line
+// per tick. Diagnostic for the Type E "silent extension kill" failure
+// mode where iOS jetsam terminates the NetworkExtension without
+// warning when the process approaches the ~50 MB hard memory budget.
+//
+// Output format (one line per tick):
+//
+//	memstats sys=24.5 MB heap-alloc=12.1 MB heap-inuse=14.2 MB
+//	  stack=2.1 MB heap-objects=24813 goroutines=312 numGC=42
+//
+// What to look for:
+//   - sys:           bytes obtained from OS (= what iOS jetsam sees as
+//                    the process's resident footprint). Linear growth
+//                    over hours = leak; flat-but-high (~30+ MB) on a
+//                    50-conn pool = structurally near the limit.
+//   - heap-alloc:    bytes of currently-live heap objects.
+//   - heap-inuse:    in-use spans (>= heap-alloc; gap is fragmentation /
+//                    retained-but-not-live pages).
+//   - stack:         total stack memory (with thousands of goroutines
+//                    and 8 KB initial stacks each, this can grow into
+//                    the MB range).
+//   - heap-objects:  count of live objects (rises with allocation
+//                    leaks even when alloc bytes look stable).
+//   - goroutines:    leak indicator; should stabilise at roughly
+//                    NumConns × small-constant once startup settles.
+//   - numGC:         GC cycle count; high deltas between ticks mean
+//                    heavy alloc churn even if heap-alloc is steady.
+//
+// Final dump on shutdown captures the moment-of-death snapshot in
+// the same place — useful when comparing pre-kill state across
+// multiple Type E incidents.
+func (p *Proxy) logMemStatsLoop(ctx context.Context) {
+	const interval = 60 * time.Second
+
+	tick := time.NewTicker(interval)
+	defer tick.Stop()
+
+	dump := func(label string) {
+		var ms runtime.MemStats
+		runtime.ReadMemStats(&ms)
+		log.Printf("proxy: memstats %s sys=%s heap-alloc=%s heap-inuse=%s stack=%s heap-objects=%d goroutines=%d numGC=%d",
+			label,
+			humanBytes(int64(ms.Sys)),
+			humanBytes(int64(ms.HeapAlloc)),
+			humanBytes(int64(ms.HeapInuse)),
+			humanBytes(int64(ms.StackInuse)),
+			ms.HeapObjects,
+			runtime.NumGoroutine(),
+			ms.NumGC)
+	}
+
+	// Emit once at startup so we have a baseline anchor for later
+	// growth-rate calculations even if the extension is killed before
+	// the first tick.
+	dump("startup")
+
+	for {
+		select {
+		case <-ctx.Done():
+			dump("final")
+			return
+		case <-tick.C:
+			dump("tick")
+		}
+	}
 }
 
 // humanBytes renders a byte count with binary units (K / M / G).
