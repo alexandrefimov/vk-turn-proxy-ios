@@ -931,7 +931,8 @@ func (p *Proxy) wakeChannel() <-chan struct{} {
 // for 5 min → reconnect". Designed for the post-sleep/wake quota cascade,
 // where most conns were stuck dormant. Now obsolete:
 //   - Stuck conns get killed by the zombie probe in 2 min, not 5+
-//   - markSaturated handles 486-cascade with a 10m cooldown
+//   - markSaturated handles 486-cascade with a 3m cooldown that wakes
+//     parked conns the moment it expires (broadcastSlotAvailable hook)
 //   - Captcha-triggered slow ramp-up commonly leaves us at "10/30 active
 //     for 5+ min" while VK rate-limits PoW for our IP. Forcing reconnect
 //     in that state killed 10 working conns and didn't help unstick VK.
@@ -1048,7 +1049,8 @@ func (p *Proxy) runWatchdog() {
 			// minutes if the cred pool needs to fetch through captcha)
 			// finishes without us spuriously retrying it. After that,
 			// firing every 5 minutes gives saturated slots time to
-			// recover (10-minute markSaturated cooldown) between
+			// recover (3-minute markSaturated cooldown plus parked-conn
+			// wake-on-expiry, see broadcastSlotAvailable) between
 			// attempts and gives the cred-pool grower a window to fill
 			// new slots.
 			if active == 0 {
@@ -1580,9 +1582,15 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 				// startConnections would burn its 4-attempt budget retrying
 				// the same saturated slot.
 				if isQuotaError(turnErr) {
-					p.credPool.markSaturated(credSlot, 10*time.Minute)
-					log.Printf("proxy: [conn %d] bootstrap quota error on slot %d, marked VK-saturated for 10m",
-						connIdx, credSlot)
+					// vkSaturationCooldown (3m) is short enough that the
+					// parked conns wake within one user-perceptible gap
+					// once the slot recovers, paired with the
+					// broadcastSlotAvailable hook in markSaturated that
+					// signals the moment the cooldown expires. See the
+					// constant's doc for the full rationale.
+					p.credPool.markSaturated(credSlot, vkSaturationCooldown)
+					log.Printf("proxy: [conn %d] bootstrap quota error on slot %d, marked VK-saturated for %s",
+						connIdx, credSlot, vkSaturationCooldown.Round(time.Second))
 				} else if isAuthError(turnErr) {
 					p.credPool.invalidateEntry(credSlot)
 					log.Printf("proxy: [conn %d] bootstrap auth error on slot %d, invalidated",

@@ -607,6 +607,18 @@ type credPoolEntry struct {
 	// backs off. Cleared automatically when the slot is replaced via
 	// fresh fetch (since the new cred has a clean VK quota).
 	saturatedUntil time.Time
+
+	// saturationTimer fires broadcastSlotAvailable when saturatedUntil
+	// passes, waking any conn currently parked in runConnection's
+	// "no slot available" backoff so it can immediately retry on the
+	// just-recovered slot. Without this, parked conns sleep through
+	// their randomised 30s-3min dormancy regardless of when the
+	// saturation actually expires — vpn.wifi.2.log on 2026-05-06
+	// showed conn 0 idling 5 minutes past slot 0's expiry before its
+	// next retry naturally fired. Set/Stopped+replaced by markSaturated;
+	// nil for never-saturated slots and harmlessly-leaked-then-GC'd for
+	// slots whose entry gets replaced before the timer fires.
+	saturationTimer *time.Timer
 }
 
 // credCacheVersion is the on-disk JSON schema version. Loaders that find
@@ -651,6 +663,24 @@ const credSaturationCooldown = 10 * time.Minute
 // would mistakenly mark all slots as safe even though their
 // allocations were still live until the kill moment.
 const credPeriodicSaveInterval = 60 * time.Second
+
+// vkSaturationCooldown is the duration a slot stays marked as
+// 486-saturated after a runTURN/bootstrap quota error. Was 10 min
+// originally — matched VK's full ~600s default TURN allocation lifetime,
+// the worst-case time for ghost allocations on a fully-used cred to
+// expire server-side. In practice the median ghost expiry is much
+// shorter (most "stale" allocations were single-channel and idle), and
+// the cost of marking too short is small: on the next attempt we either
+// succeed (recovered early) or 486 again and re-mark for another window.
+//
+// The cost of marking too LONG was demonstrated 2026-05-06 in
+// vpn.wifi.2.log: a path-change cascade saturated 5 slots at 11:18:33,
+// the only previously-ok conn entered its 30s-3min "no slot available"
+// dormancy, and the slot recovered at 11:28:33 — but the conn slept on
+// past expiry for another 5 minutes before re-trying. 3m here, paired
+// with markSaturated's broadcastSlotAvailable on expiry, lets parked
+// conns retry within milliseconds of the slot becoming usable again.
+const vkSaturationCooldown = 3 * time.Minute
 
 // credCacheFile is the JSON-on-disk shape persisted to App Group container.
 // One file per pool. Contents are non-secret: VK TURN creds are session
@@ -750,10 +780,13 @@ type credPool struct {
 	// it captured wakes simultaneously when the old chan closes. A
 	// buffered single-slot channel would only wake one waiter.
 	//
-	// Saturation expiry is time-based with no event hook (saturatedUntil
-	// is just a timestamp checked on the next get()), so this channel
-	// does NOT signal on cooldown countdown — the fallback timeout in
-	// runConnection's select handles that case.
+	// Saturation expiry is also signalled here: markSaturated arms a
+	// time.AfterFunc that calls broadcastSlotAvailable when the
+	// saturation window passes, so a parked conn wakes within ms of
+	// the slot becoming usable again instead of sleeping through its
+	// randomised 30s-3min dormancy. (Before this, vpn.wifi.2.log on
+	// 2026-05-06 showed conn 0 idling 5+ min past slot 0's 11:28
+	// expiry before its own backoff naturally fired.)
 	//
 	// Reads/writes of the chan field are guarded by cp.mu; close itself
 	// runs after unlock so close-while-locked stalls are impossible.
@@ -1433,10 +1466,18 @@ func (cp *credPool) release(slot int) {
 // allocations from before that prevent us from acquiring new ones.
 //
 // Called by the proxy's reconnect path when runTURN fails with 486
-// Allocation Quota Reached. The 10-minute window matches VK's default
-// TURN allocation lifetime: after that, VK's leftover allocations
-// expire server-side and the cred becomes usable again. If we're still
-// hitting 486 after the saturation expires, the next call will re-mark.
+// Allocation Quota Reached. The duration is typically vkSaturationCooldown
+// (3m) — long enough to let most ghost allocations time out server-side,
+// short enough to retry well within VK's full ~600s TURN lifetime. If
+// we're still hitting 486 after the cooldown, the next failure re-marks.
+//
+// Schedules a timer that calls broadcastSlotAvailable on expiry so any
+// conn currently parked in runConnection's dormancy select wakes up the
+// instant the slot recovers, instead of sleeping through the rest of its
+// randomised 30s-3min back-off (which observably wasted 5+ min in
+// vpn.wifi.2.log on 2026-05-06). Re-arming a still-pending timer Stops
+// the old one first; spurious fires from already-replaced entries are
+// harmless (broadcastSlotAvailable tolerates them by design).
 //
 // Idempotent for invalid slot indices.
 func (cp *credPool) markSaturated(slot int, duration time.Duration) {
@@ -1448,7 +1489,11 @@ func (cp *credPool) markSaturated(slot int, duration time.Duration) {
 	if slot >= cp.size || slot >= len(cp.pool) {
 		return
 	}
+	if cp.pool[slot].saturationTimer != nil {
+		cp.pool[slot].saturationTimer.Stop()
+	}
 	cp.pool[slot].saturatedUntil = time.Now().Add(duration)
+	cp.pool[slot].saturationTimer = time.AfterFunc(duration, cp.broadcastSlotAvailable)
 }
 
 // tryFill is called by the background grower (see Proxy.growCredPool) to
@@ -1600,9 +1645,11 @@ func (cp *credPool) invalidateEntry(slot int) {
 // runConnection's retry select on slotAvailableChannel(). Called from
 // every pool mutation that can transition a slot toward usable: a fresh
 // cred lands in a slot (seedSlot, tryFill success, get's Phase 2 fetch),
-// or a conn release frees per-slot capacity. Saturation expiry is
-// time-based and not signalled here — the fallback timeout in the conn
-// retry select picks up that case.
+// a conn release frees per-slot capacity, or a saturation cooldown
+// expires (via markSaturated's AfterFunc). The cooldown-expiry hook
+// matters during 486-cascades: parked conns in their long randomised
+// dormancy would otherwise miss the moment the slot becomes usable
+// again and waste minutes sleeping past it.
 //
 // Implementation: close the current channel and swap in a new one. The
 // close acts as a fan-out wake-up — all waiting conns observe the same
