@@ -91,10 +91,23 @@ func (e *CaptchaRequiredError) Error() string {
 }
 
 // TURNCreds holds TURN server credentials.
+//
+// Address vs Addresses: VK's vchat.joinConversationByLink response includes
+// a turn_server.urls array — typically 2 endpoints on different /24 subnets
+// (e.g. 91.231.135.146:19302 and 95.163.34.164:19302), confirmed by build
+// 53 logging. Until then we took only urls[0]. We now parse all of them
+// into Addresses for diagnostics and possible future failover. We do NOT
+// rotate per-conn: iOS includeAllNetworks=true allows only one exempt
+// host (NEVPNProtocol.serverAddress), and routing the second TURN
+// endpoint through the tunnel collapses throughput to ~0.5 Mbps via
+// recursive routing (observed in TunnelManager.swift:355 history).
+// Address stays populated as Addresses[0] for back-compat with code that
+// reads the singular field (cred caches, log strings, JSON marshaling).
 type TURNCreds struct {
-	Username string
-	Password string
-	Address  string // host:port
+	Username  string
+	Password  string
+	Address   string   // host:port — primary address (= Addresses[0])
+	Addresses []string // all VK-returned TURN endpoints, len >= 1
 }
 
 // isTransientNetworkError reports whether err looks like a transient network
@@ -490,18 +503,32 @@ func getVKCredsWithClientID(linkID string, vc vkCredentials, captchaSolver Captc
 	if !ok || len(urls) == 0 {
 		return nil, fmt.Errorf("step4: turn_server.urls empty")
 	}
-	turnURL, ok := urls[0].(string)
-	if !ok {
-		return nil, fmt.Errorf("step4: turn_server.urls[0] not string")
+	// VK's vchat.joinConversationByLink returns a turn_server.urls array —
+	// confirmed in vpn.wifi.7.log (build 53) to contain 2 distinct endpoints
+	// on different /24 subnets. Extract them all for downstream rotation
+	// (proxy.resolveTURNAddr distributes conns round-robin).
+	log.Printf("vk: turn_server.urls count=%d", len(urls))
+	var addresses []string
+	for i, u := range urls {
+		s, ok := u.(string)
+		if !ok {
+			log.Printf("vk: turn_server.urls[%d]=<non-string %T> — skipping", i, u)
+			continue
+		}
+		clean := strings.Split(s, "?")[0]
+		addr := strings.TrimPrefix(strings.TrimPrefix(clean, "turn:"), "turns:")
+		log.Printf("vk: turn_server.urls[%d]=%s", i, addr)
+		addresses = append(addresses, addr)
+	}
+	if len(addresses) == 0 {
+		return nil, fmt.Errorf("step4: no usable turn_server.urls (all non-string?)")
 	}
 
-	clean := strings.Split(turnURL, "?")[0]
-	address := strings.TrimPrefix(strings.TrimPrefix(clean, "turn:"), "turns:")
-
 	return &TURNCreds{
-		Username: user,
-		Password: pass,
-		Address:  address,
+		Username:  user,
+		Password:  pass,
+		Address:   addresses[0],
+		Addresses: addresses,
 	}, nil
 }
 

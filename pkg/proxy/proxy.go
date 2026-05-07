@@ -1485,6 +1485,18 @@ func (p *Proxy) runConnection(sessCtx context.Context, linkID string, readyCh ch
 // fetcher may block a CaptchaSolver waiting on user input; when false,
 // captcha surfaces as CaptchaRequiredError (which the pool may swallow
 // via fallback).
+//
+// Note: VK's vchat.joinConversationByLink returns multiple TURN endpoints
+// (≥2, confirmed in build 53). We parse them all into creds.Addresses for
+// future use (logging, possible failover) but DO NOT rotate per-conn:
+// only Addresses[0] is exempt from iOS includeAllNetworks=true via
+// Swift TunnelManager.serverAddress. Conns assigned to Addresses[1+]
+// would have their TURN UDP routed back through the tunnel — recursive
+// routing observed empirically (TunnelManager.swift:355) caused
+// throughput collapse to ~0.5 Mbps. Setting serverAddress to a
+// hostname that resolves to multiple IPs is unreliable too: WireGuard
+// iOS' DNSResolver.swift takes only the first IPv4, and Apple has not
+// documented multi-IP exemption behavior in any forum or doc.
 func (p *Proxy) resolveTURNAddr(connIdx int, allowCaptchaBlock bool) (string, *TURNCreds, int, error) {
 	return p.credPool.get(connIdx, allowCaptchaBlock)
 }
@@ -1537,18 +1549,30 @@ func (p *Proxy) fetchFreshCreds(allowCaptchaBlock bool) (string, *TURNCreds, err
 	if err != nil {
 		return "", nil, fmt.Errorf("get VK creds: %w", err)
 	}
-	turnHost, turnPort, err := net.SplitHostPort(creds.Address)
-	if err != nil {
-		return "", nil, fmt.Errorf("parse TURN address: %w", err)
+	// Apply TurnServer/TurnPort overrides (test/dev only — empty in
+	// production) to every VK-returned address. Today we use only
+	// Addresses[0] (see resolveTURNAddr — no per-conn rotation under
+	// includeAllNetworks=true single-exempt-host limitation), but
+	// keeping all entries uniformly overridden means a future failover
+	// or rotation experiment doesn't have to redo the override pass.
+	// Addresses must be non-empty (getVKCredsWithClientID guarantees ≥1).
+	for i, vkAddr := range creds.Addresses {
+		h, pport, perr := net.SplitHostPort(vkAddr)
+		if perr != nil {
+			return "", nil, fmt.Errorf("parse TURN address %q: %w", vkAddr, perr)
+		}
+		if p.config.TurnServer != "" {
+			h = p.config.TurnServer
+		}
+		if p.config.TurnPort != "" {
+			pport = p.config.TurnPort
+		}
+		creds.Addresses[i] = net.JoinHostPort(h, pport)
 	}
-	if p.config.TurnServer != "" {
-		turnHost = p.config.TurnServer
-	}
-	if p.config.TurnPort != "" {
-		turnPort = p.config.TurnPort
-	}
-	p.turnServerIP.Store(turnHost)
-	return net.JoinHostPort(turnHost, turnPort), creds, nil
+	creds.Address = creds.Addresses[0]
+	firstHost, _, _ := net.SplitHostPort(creds.Addresses[0])
+	p.turnServerIP.Store(firstHost)
+	return creds.Addresses[0], creds, nil
 }
 
 // runDTLSSession runs a long-lived DTLS session.
