@@ -1003,7 +1003,20 @@ struct LogsView: View {
     @State private var autoScroll = true
     @State private var showShareSheet = false
     @State private var usingOSLogFallback = false
+    // Cached fallback content + last-fetch timestamp + in-flight guard.
+    // Without these the fallback path (OSLogReader.readOwnLogs +
+    // sendProviderMessage) ran on EVERY 2-second timer tick whenever the
+    // file was empty, blocking the main thread on the synchronous
+    // OSLogStore query for hundreds of milliseconds-to-seconds depending
+    // on ring-buffer size. Symptom: tapping "Clear" emptied the file,
+    // then the UI lagged badly because every tick re-ran the heavy
+    // fallback query. With caching: query runs at most once per
+    // fallbackTTL seconds, off the main thread.
+    @State private var fallbackText: String = ""
+    @State private var fallbackFetchedAt: Date = .distantPast
+    @State private var fallbackInFlight = false
     private let timer = Timer.publish(every: 2, on: .main, in: .common).autoconnect()
+    private let fallbackTTL: TimeInterval = 4.0
 
     /// Maximum characters to display — keeps UI responsive.
     /// The full file is still available via Share.
@@ -1025,6 +1038,13 @@ struct LogsView: View {
 
                 Button(action: {
                     SharedLogger.shared.clearLogs()
+                    // Wipe the fallback cache too — otherwise after
+                    // clearing the on-disk log the next loadLogs() tick
+                    // would still show the stale cached fallback content
+                    // until the TTL elapses, which looks like Clear
+                    // didn't work.
+                    fallbackText = ""
+                    fallbackFetchedAt = .distantPast
                     logText = ""
                 }) {
                     Label("Clear", systemImage: "trash")
@@ -1067,29 +1087,61 @@ struct LogsView: View {
         // (this happens on improperly-resigned sideloaded IPAs and has
         // also been reported on TestFlight builds, github issues #7/#8).
         // Fall back to per-process os_log: main app reads its own ring
-        // buffer synchronously, then we ask the extension to read its
-        // own and ferry the text back via providerMessage. Surface a
-        // banner so the user understands the source and limitations.
+        // buffer, then we ask the extension to read its own and ferry the
+        // text back via providerMessage. Surface a banner so the user
+        // understands the source and limitations.
+        //
+        // Both the OSLogStore query and the providerMessage round-trip
+        // can take hundreds of milliseconds each — running them on every
+        // 2-second timer tick on the main thread caused noticeable UI
+        // lag (especially after Clear, which keeps the file empty and
+        // forces this path). So: cache the result for `fallbackTTL`
+        // seconds, refresh in a background task, and only one fetch may
+        // be in flight at a time.
         usingOSLogFallback = true
-        let mainAppLogs = OSLogReader.readOwnLogs(maxAge: 1800)
-        Task {
+
+        // Show last-cached content immediately if we have any; otherwise
+        // a minimal placeholder so the user knows fetching is in progress.
+        if !fallbackText.isEmpty {
+            logText = truncated(fallbackText)
+        } else if logText.isEmpty {
+            logText = "Loading os_log fallback…"
+        }
+
+        let cacheStale = Date().timeIntervalSince(fallbackFetchedAt) > fallbackTTL
+        guard !fallbackInFlight && cacheStale else { return }
+        fallbackInFlight = true
+
+        Task.detached(priority: .userInitiated) {
+            // OSLogReader.readOwnLogs is the heavy synchronous call —
+            // running it on a detached task moves it off the main thread.
+            // Subsequent awaits (providerMessage, MainActor.run) come
+            // back to MainActor naturally because tunnel is @MainActor.
+            let mainAppLogs = OSLogReader.readOwnLogs(maxAge: 1800)
             let extensionLogs = await tunnel.fetchExtensionOSLogs() ?? ""
+
+            var combined = mainAppLogs + extensionLogs
+            if combined.isEmpty {
+                combined = "No logs available.\n\n" +
+                    "The on-disk log file is empty (App Group container " +
+                    "unreachable) and the os_log fallback also returned " +
+                    "nothing — likely the extension was just (re)started " +
+                    "and hasn't logged anything since. Try again in a few " +
+                    "seconds, or reconnect the tunnel."
+            } else {
+                combined = "⚠️ App Group container unavailable — showing " +
+                    "os_log fallback (recent ~30 min only, " +
+                    "may be incomplete and out of order).\n\n" +
+                    combined
+            }
+
             await MainActor.run {
-                var combined = mainAppLogs + extensionLogs
-                if combined.isEmpty {
-                    combined = "No logs available.\n\n" +
-                        "The on-disk log file is empty (App Group container " +
-                        "unreachable) and the os_log fallback also returned " +
-                        "nothing — likely the extension was just (re)started " +
-                        "and hasn't logged anything since. Try again in a few " +
-                        "seconds, or reconnect the tunnel."
-                } else {
-                    combined = "⚠️ App Group container unavailable — showing " +
-                        "os_log fallback (recent ~30 min only, " +
-                        "may be incomplete and out of order).\n\n" +
-                        combined
+                fallbackText = combined
+                fallbackFetchedAt = Date()
+                fallbackInFlight = false
+                if usingOSLogFallback {
+                    logText = truncated(combined)
                 }
-                logText = truncated(combined)
             }
         }
     }
