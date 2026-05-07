@@ -86,10 +86,24 @@ var (
 // at all. Any non-empty error from the operator's input is logged and
 // disables WRAP for the session — surfacing that in the extension log
 // rather than failing silently inside proxy startup.
+//
+// Strips ALL whitespace from the input before hex decoding. Users
+// frequently paste keys with a leading/trailing space (clipboard
+// noise) or with internal spaces grouping the hex digits for
+// readability. Both used to fail decoding with "encoding/hex: invalid
+// byte: U+0020 ' '" — observed 2026-05-07. Any whitespace inside a
+// hex key is unambiguously noise (no legitimate hex digit is whitespace),
+// so silently stripping it is safe and correct.
 func decodeWrapKey(useWrap bool, hexStr string) ([]byte, error) {
 	if !useWrap {
 		return nil, nil
 	}
+	hexStr = strings.Map(func(r rune) rune {
+		if r == ' ' || r == '\t' || r == '\n' || r == '\r' {
+			return -1
+		}
+		return r
+	}, hexStr)
 	if hexStr == "" {
 		return nil, fmt.Errorf("WRAP enabled but wrap_key_hex is empty")
 	}

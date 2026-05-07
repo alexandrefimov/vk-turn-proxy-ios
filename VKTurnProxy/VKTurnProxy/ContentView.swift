@@ -246,6 +246,25 @@ struct SettingsView: View {
                     SecureField("WRAP key (64 hex chars)", text: $wrapKeyHex)
                         .autocapitalization(.none)
                         .disableAutocorrection(true)
+                        // Strip whitespace as the user types / pastes — paste
+                        // from clipboard often picks up leading/trailing
+                        // spaces or newlines, and a hex key has no legitimate
+                        // use for spaces inside, so silently cleaning is
+                        // safe. Without this, a stray space caused the Go
+                        // bridge to fail decoding with
+                        // "encoding/hex: invalid byte: U+0020 ' '" and
+                        // disable WRAP for the session — observed in user
+                        // report 2026-05-07. The Go bridge also strips
+                        // whitespace defensively as a backstop, but doing
+                        // it here keeps the stored value clean and avoids
+                        // a confusing reopen-Settings experience where
+                        // the SecureField has hidden whitespace inside.
+                        .onChange(of: wrapKeyHex) { newValue in
+                            let cleaned = newValue.filter { !$0.isWhitespace }
+                            if cleaned != newValue {
+                                wrapKeyHex = cleaned
+                            }
+                        }
                 }
 
                 Stepper("Connections: \(numConnections)", value: $numConnections, in: 1...64)
