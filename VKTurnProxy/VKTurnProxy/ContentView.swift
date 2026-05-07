@@ -768,6 +768,44 @@ struct CaptchaWKWebView: UIViewRepresentable {
             } else {
                 window.addEventListener('DOMContentLoaded', scheduleInitialDetection);
             }
+
+            // Diagnostic heartbeat: every 1s while page hasn't reached
+            // 'complete', post readyState + content sizes. Diagnoses the
+            // "white captcha" symptom from issue #5 — when WKWebView
+            // navigates but no didFinish/didFail fires, we need to know
+            // whether DOM is stuck in 'loading', sitting empty in
+            // 'interactive', or what. Stops itself on 'complete' or after
+            // 60s (whichever first) so it can't spam the log indefinitely.
+            (function() {
+                var startTime = Date.now();
+                var heartbeatId = setInterval(function() {
+                    var elapsed = Date.now() - startTime;
+                    var ready = document.readyState || 'null';
+                    var bodyLen = (document.body && document.body.innerHTML.length) || 0;
+                    var titleLen = (document.title || '').length;
+                    var url = (location && location.href || '').substring(0, 80);
+                    h.postMessage('heartbeat:elapsed=' + elapsed + 'ms readyState=' + ready
+                        + ' body=' + bodyLen + ' title=' + titleLen + ' url=' + url);
+                    if (ready === 'complete' || elapsed > 60000) {
+                        clearInterval(heartbeatId);
+                    }
+                }, 1000);
+            })();
+
+            // Catch JS errors and unhandled promise rejections so we can
+            // see if the page is failing on its own scripts (e.g. a
+            // sub-resource referenced by VK's captcha JS that the
+            // network blocks).
+            window.addEventListener('error', function(e) {
+                var src = (e.filename || '?');
+                if (src.length > 80) src = src.substring(0, 80) + '…';
+                h.postMessage('js-error:' + (e.message || 'unknown')
+                    + ' at ' + src + ':' + (e.lineno || '?'));
+            });
+            window.addEventListener('unhandledrejection', function(e) {
+                var reason = e.reason ? String(e.reason).substring(0, 200) : 'unknown';
+                h.postMessage('js-rejection:' + reason);
+            });
         })();
         """
         let userScript = WKUserScript(source: js, injectionTime: .atDocumentStart, forMainFrameOnly: false)
@@ -896,12 +934,40 @@ struct CaptchaWKWebView: UIViewRepresentable {
             decisionHandler(.allow)
         }
 
+        // Diagnostic: confirms the request was actually sent to the server
+        // (between Nav (decision) and didStartProvisional (sent on the wire)
+        // there's a window where iOS could drop the request without firing
+        // any other event). Added 2026-05-07 for issue #5 "white captcha"
+        // diagnosis — vpn.from.github.1.log on build 48 had Nav fire then
+        // 7.4s of silence with no Loaded / didFail. Need to know which
+        // network-layer stage hangs.
+        func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
+            log("StartProvisional: request sent on wire")
+        }
+
+        // Diagnostic: HTTP redirect mid-navigation. Logged so we can see if
+        // VK is sending us through some redirect chain that hangs.
+        func webView(_ webView: WKWebView, didReceiveServerRedirectForProvisionalNavigation navigation: WKNavigation!) {
+            log("Redirect: \(String((webView.url?.absoluteString ?? "nil").prefix(200)))")
+        }
+
+        // Diagnostic: response headers received, body about to start. If
+        // didCommit fires but didFinish doesn't, the body load is hanging
+        // (server stops sending / TLS issue / sub-resource block). If
+        // didCommit doesn't fire at all, the request is stuck before
+        // headers arrived (TCP / TLS handshake / server unresponsive).
+        func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
+            log("Commit: response headers received")
+        }
+
         func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
-            log("FAIL: \(error.localizedDescription)")
+            let nsErr = error as NSError
+            log("FAIL: \(error.localizedDescription) (domain=\(nsErr.domain) code=\(nsErr.code))")
         }
 
         func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
-            log("FAIL provisional: \(error.localizedDescription)")
+            let nsErr = error as NSError
+            log("FAIL provisional: \(error.localizedDescription) (domain=\(nsErr.domain) code=\(nsErr.code))")
         }
 
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
