@@ -21,7 +21,7 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.vkturnproxy.app
         CODE_SIGN_ENTITLEMENTS: VKTurnProxy/VKTurnProxy.entitlements
         MARKETING_VERSION: "1.0"
-        CURRENT_PROJECT_VERSION: 52
+        CURRENT_PROJECT_VERSION: 54
         GENERATE_INFOPLIST_FILE: YES
         INFOPLIST_KEY_CFBundleDisplayName: "VK Turn Proxy"
         # Declare that we don't use non-exempt encryption — only standard
@@ -92,7 +92,7 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.vkturnproxy.app.tunnel
         CODE_SIGN_ENTITLEMENTS: PacketTunnel/PacketTunnel.entitlements
         MARKETING_VERSION: "1.0"
-        CURRENT_PROJECT_VERSION: 52
+        CURRENT_PROJECT_VERSION: 54
         SKIP_INSTALL: YES
         SWIFT_OBJC_BRIDGING_HEADER: PacketTunnel/BridgeHeader.h
         OTHER_LDFLAGS:
