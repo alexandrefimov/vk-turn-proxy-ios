@@ -601,6 +601,18 @@ struct CaptchaWebView: View {
     let onLog: (String) -> Void
     @ObservedObject var tunnel: TunnelManager
 
+    // First-content-visible overlay state. Replaces the blank white WebView
+    // that the user stares at while the captcha page is parsing <head> and
+    // hasn't put any bytes in <body> yet — observed up to 86s on cold cache
+    // in 2026-05-07 vpn-export-megafon.log (issue #5). Signal: JS heartbeat
+    // posts body=N; transitioning from N==0 to N>0 means DOM has rendered
+    // something. We also drop the overlay when didFinish fires, as a
+    // fallback in case JS hooks didn't install.
+    @State private var pageHasContent: Bool = false
+    @State private var loadingStartedAt: Date = .init()
+    @State private var elapsedSec: Int = 0
+    private let tickTimer = Timer.publish(every: 1.0, on: .main, in: .common).autoconnect()
+
     var body: some View {
         VStack(spacing: 0) {
             HStack {
@@ -618,8 +630,37 @@ struct CaptchaWebView: View {
                     onTokenCaptured: onSolved,
                     onLimitDetected: onLimitDetected,
                     onCaptchaReady: onCaptchaReady,
-                    onLog: onLog
+                    onLog: onLog,
+                    onPageLoadStarted: {
+                        pageHasContent = false
+                        loadingStartedAt = Date()
+                        elapsedSec = 0
+                    },
+                    onPageContentVisible: {
+                        pageHasContent = true
+                    }
                 )
+
+                // Loading overlay: shown while the WebView's body is still
+                // empty (cold-cache subresource fetch hangs the parser).
+                // Hides as soon as DOM renders any content. Without this
+                // the user just sees a blank white square for up to 90s
+                // and assumes the app is broken.
+                if !pageHasContent {
+                    VStack(spacing: 16) {
+                        ProgressView().scaleEffect(1.3)
+                        Text("Loading captcha…")
+                            .font(.headline)
+                        Text("\(elapsedSec)s")
+                            .font(.subheadline)
+                            .foregroundColor(.secondary)
+                            .monospacedDigit()
+                    }
+                    .padding(32)
+                    .background(Color(.systemBackground).opacity(0.97))
+                    .cornerRadius(16)
+                    .shadow(radius: 12)
+                }
 
                 // Overlay shown ONLY while auto-refresh is hunting for a fresh
                 // captcha after JS detected "Attempt limit reached". Goes away
@@ -641,6 +682,11 @@ struct CaptchaWebView: View {
                     .shadow(radius: 12)
                 }
             }
+            .onReceive(tickTimer) { _ in
+                if !pageHasContent {
+                    elapsedSec = Int(Date().timeIntervalSince(loadingStartedAt))
+                }
+            }
         }
     }
 }
@@ -660,13 +706,23 @@ struct CaptchaWKWebView: UIViewRepresentable {
     // state-transition diagnostics land in the same log file as the
     // extension's output instead of only in os_log / Console.app.
     let onLog: (String) -> Void
+    // Called when a fresh main-frame navigation starts (didStartProvisional).
+    // Parent uses this to reset its loading-overlay state — show the
+    // "Loading captcha…" spinner and start counting elapsed time.
+    let onPageLoadStarted: () -> Void
+    // Called once per navigation, the first moment we observe non-empty body
+    // content (heartbeat reports body>0) or didFinish fires. Parent hides
+    // the loading overlay on this signal.
+    let onPageContentVisible: () -> Void
 
     func makeCoordinator() -> Coordinator {
         Coordinator(
             onTokenCaptured: onTokenCaptured,
             onLimitDetected: onLimitDetected,
             onCaptchaReady: onCaptchaReady,
-            onLog: onLog
+            onLog: onLog,
+            onPageLoadStarted: onPageLoadStarted,
+            onPageContentVisible: onPageContentVisible
         )
     }
 
@@ -794,7 +850,10 @@ struct CaptchaWKWebView: UIViewRepresentable {
             // navigates but no didFinish/didFail fires, we need to know
             // whether DOM is stuck in 'loading', sitting empty in
             // 'interactive', or what. Stops itself on 'complete' or after
-            // 60s (whichever first) so it can't spam the log indefinitely.
+            // 180s (whichever first) so it can't spam the log indefinitely.
+            // The 180s cap covers the worst observed cold-cache load
+            // (86s on issue #5 vpn-export-megafon.log, build 49) with
+            // headroom — earlier 60s cap cut visibility short.
             (function() {
                 var startTime = Date.now();
                 var heartbeatId = setInterval(function() {
@@ -805,11 +864,59 @@ struct CaptchaWKWebView: UIViewRepresentable {
                     var url = (location && location.href || '').substring(0, 80);
                     h.postMessage('heartbeat:elapsed=' + elapsed + 'ms readyState=' + ready
                         + ' body=' + bodyLen + ' title=' + titleLen + ' url=' + url);
-                    if (ready === 'complete' || elapsed > 60000) {
+                    if (ready === 'complete' || elapsed > 180000) {
                         clearInterval(heartbeatId);
                     }
                 }, 1000);
             })();
+
+            // Diagnostic: log per-resource timing as it completes. Reveals
+            // exactly which subresource(s) hang during cold-cache slow
+            // first-load (issue #5 — body=0 for 60-86s while parser is
+            // blocked on a synchronous <script src>). Each fetched
+            // resource gets one log line with DNS / TCP / TLS / TTFB /
+            // body-bytes phases broken out — so we can tell whether the
+            // bottleneck is name resolution, connection setup, or actual
+            // bytes flowing slow. Stays on for the lifetime of the page;
+            // overhead is one postMessage per resource (~10-30 per
+            // captcha load, manageable). Query strings stripped from
+            // names for log brevity, names truncated at 120 chars.
+            if (typeof PerformanceObserver !== 'undefined') {
+                try {
+                    var po = new PerformanceObserver(function(list) {
+                        list.getEntries().forEach(function(entry) {
+                            if (entry.entryType !== 'resource') return;
+                            var name = entry.name || '';
+                            var qIdx = name.indexOf('?');
+                            if (qIdx > 0) name = name.substring(0, qIdx);
+                            if (name.length > 120) name = name.substring(0, 120) + '...';
+                            var dns = Math.round(entry.domainLookupEnd - entry.domainLookupStart);
+                            var tcp = Math.round(entry.connectEnd - entry.connectStart);
+                            var tls = entry.secureConnectionStart > 0
+                                ? Math.round(entry.connectEnd - entry.secureConnectionStart)
+                                : 0;
+                            var ttfb = Math.round(entry.responseStart - entry.requestStart);
+                            var bodyMs = Math.round(entry.responseEnd - entry.responseStart);
+                            var total = Math.round(entry.duration);
+                            var size = entry.transferSize || 0;
+                            h.postMessage('perf:' + (entry.initiatorType || '?')
+                                + ' total=' + total + 'ms'
+                                + ' dns=' + dns + 'ms'
+                                + ' tcp=' + tcp + 'ms'
+                                + ' tls=' + tls + 'ms'
+                                + ' ttfb=' + ttfb + 'ms'
+                                + ' bodyMs=' + bodyMs + 'ms'
+                                + ' size=' + size + 'B'
+                                + ' name=' + name);
+                        });
+                    });
+                    po.observe({entryTypes: ['resource']});
+                } catch (e) {
+                    h.postMessage('perf-err:' + e.message);
+                }
+            } else {
+                h.postMessage('perf-err:PerformanceObserver unavailable');
+            }
 
             // Catch JS errors and unhandled promise rejections so we can
             // see if the page is failing on its own scripts (e.g. a
@@ -864,7 +971,13 @@ struct CaptchaWKWebView: UIViewRepresentable {
         let onLimitDetected: () -> Void
         let onCaptchaReady: () -> Void
         let onLog: (String) -> Void
+        let onPageLoadStarted: () -> Void
+        let onPageContentVisible: () -> Void
         private var solved = false
+        // One-shot guard for onPageContentVisible — first heartbeat with
+        // body>0 (or didFinish, whichever first) fires it; subsequent
+        // heartbeats stay quiet. Reset on every fresh navigation.
+        private var contentVisibleFired = false
         weak var webView: WKWebView?
         // Tracks which URL we last handed to `webView.load(...)`. Used by
         // updateUIView to detect real URL changes vs. SwiftUI re-renders with
@@ -875,12 +988,16 @@ struct CaptchaWKWebView: UIViewRepresentable {
             onTokenCaptured: @escaping (String) -> Void,
             onLimitDetected: @escaping () -> Void,
             onCaptchaReady: @escaping () -> Void,
-            onLog: @escaping (String) -> Void
+            onLog: @escaping (String) -> Void,
+            onPageLoadStarted: @escaping () -> Void,
+            onPageContentVisible: @escaping () -> Void
         ) {
             self.onTokenCaptured = onTokenCaptured
             self.onLimitDetected = onLimitDetected
             self.onCaptchaReady = onCaptchaReady
             self.onLog = onLog
+            self.onPageLoadStarted = onPageLoadStarted
+            self.onPageContentVisible = onPageContentVisible
         }
 
         func log(_ msg: String) {
@@ -897,14 +1014,31 @@ struct CaptchaWKWebView: UIViewRepresentable {
         // (VK rejected a success_token and Go fetched a fresh captcha).
         // Resets the one-shot `solved` guard so the next success_token from
         // the new page is forwarded to the tunnel — otherwise the guard would
-        // silently swallow every token after the first.
+        // silently swallow every token after the first. Also resets the
+        // contentVisibleFired guard so the loading overlay shows again
+        // for the new page.
         func resetForNewCaptcha() {
             solved = false
+            contentVisibleFired = false
         }
 
         func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
             guard let body = message.body as? String else { return }
             log("JS: \(String(body.prefix(400)))")
+
+            // First non-empty body in a heartbeat fires onPageContentVisible
+            // exactly once per navigation, dropping the loading overlay.
+            // Heartbeat format: "heartbeat:elapsed=Xms readyState=Y body=N title=M url=..."
+            if !contentVisibleFired && body.hasPrefix("heartbeat:") {
+                if let r = body.range(of: "body=") {
+                    let after = body[r.upperBound...]
+                    let digits = after.prefix(while: { $0.isNumber })
+                    if let n = Int(digits), n > 0 {
+                        contentVisibleFired = true
+                        DispatchQueue.main.async { self.onPageContentVisible() }
+                    }
+                }
+            }
 
             if body.hasPrefix("token:") {
                 let token = String(body.dropFirst(6))
@@ -962,6 +1096,12 @@ struct CaptchaWKWebView: UIViewRepresentable {
         // network-layer stage hangs.
         func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
             log("StartProvisional: request sent on wire")
+            // Fresh main-frame navigation — reset the loading overlay state
+            // so the parent view shows the spinner again for this attempt.
+            // Iframe / subresource navigations don't fire this delegate
+            // method, so this fires exactly once per top-level captcha load.
+            contentVisibleFired = false
+            DispatchQueue.main.async { self.onPageLoadStarted() }
         }
 
         // Diagnostic: HTTP redirect mid-navigation. Logged so we can see if
@@ -991,6 +1131,13 @@ struct CaptchaWKWebView: UIViewRepresentable {
 
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
             log("Loaded: \(String((webView.url?.absoluteString ?? "nil").prefix(150)))")
+            // Fallback: if heartbeat never reported body>0 (e.g. JS hooks
+            // failed to install for some reason), at least drop the
+            // loading overlay when the page fully loads.
+            if !contentVisibleFired {
+                contentVisibleFired = true
+                DispatchQueue.main.async { self.onPageContentVisible() }
+            }
         }
     }
 }
