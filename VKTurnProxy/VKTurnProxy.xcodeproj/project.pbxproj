@@ -21,6 +21,7 @@
 		9FC59D2A14AA5E66C86F6C95 /* OSLogReader.swift in Sources */ = {isa = PBXBuildFile; fileRef = B579DDFDDB7800E681CAC9C4 /* OSLogReader.swift */; };
 		B1B5B221672B08CCCC35BE51 /* PacketTunnelProvider.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4D06132B25271A4E9DA8F0C6 /* PacketTunnelProvider.swift */; };
 		CBF9B6203060C546C778DABA /* AppConfig.swift in Sources */ = {isa = PBXBuildFile; fileRef = AD358E048E7135E1596359E1 /* AppConfig.swift */; };
+		E1250E1BF6D8FBFBCCFB25BF /* VKProfileCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = 48CEB6CB28E1CC064B6D8C79 /* VKProfileCache.swift */; };
 		F32EA8BA9CCC4E95BD4DFA12 /* NetworkExtension.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 605ED1D89D0F1886A8414767 /* NetworkExtension.framework */; };
 		F5781EB3D4D7E0467DC2A5F5 /* SharedLogger.swift in Sources */ = {isa = PBXBuildFile; fileRef = A648919F90B0D8CBE826BC6E /* SharedLogger.swift */; };
 		FD1864DD0B5915A3945CE086 /* BackupManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4D13B015BF30B930DDDB8BBF /* BackupManager.swift */; };
@@ -53,6 +54,7 @@
 /* Begin PBXFileReference section */
 		00AF3235469FAE0005F97B29 /* BridgeHeader.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = BridgeHeader.h; sourceTree = "<group>"; };
 		12A7A42ADDB7D021CA9C8352 /* VKTurnProxy.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = VKTurnProxy.entitlements; sourceTree = "<group>"; };
+		48CEB6CB28E1CC064B6D8C79 /* VKProfileCache.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VKProfileCache.swift; sourceTree = "<group>"; };
 		4D06132B25271A4E9DA8F0C6 /* PacketTunnelProvider.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PacketTunnelProvider.swift; sourceTree = "<group>"; };
 		4D13B015BF30B930DDDB8BBF /* BackupManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackupManager.swift; sourceTree = "<group>"; };
 		50685ED014984982ABF8CF0C /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
@@ -136,6 +138,7 @@
 				B579DDFDDB7800E681CAC9C4 /* OSLogReader.swift */,
 				A648919F90B0D8CBE826BC6E /* SharedLogger.swift */,
 				E74B178DC212A229BC8565F4 /* TunnelManager.swift */,
+				48CEB6CB28E1CC064B6D8C79 /* VKProfileCache.swift */,
 				12A7A42ADDB7D021CA9C8352 /* VKTurnProxy.entitlements */,
 				FDE10D4B4A2BE32E0DD5E3D4 /* VKTurnProxyApp.swift */,
 			);
@@ -265,6 +268,7 @@
 				9FC59D2A14AA5E66C86F6C95 /* OSLogReader.swift in Sources */,
 				F5781EB3D4D7E0467DC2A5F5 /* SharedLogger.swift in Sources */,
 				118478458E595AEBEEA20266 /* TunnelManager.swift in Sources */,
+				E1250E1BF6D8FBFBCCFB25BF /* VKProfileCache.swift in Sources */,
 				5BFFE56605C7A3D0A4672924 /* VKTurnProxyApp.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -284,7 +288,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CODE_SIGN_ENTITLEMENTS = PacketTunnel/PacketTunnel.entitlements;
-				CURRENT_PROJECT_VERSION = 54;
+				CURRENT_PROJECT_VERSION = 57;
 				FRAMEWORK_SEARCH_PATHS = (
 					"$(inherited)",
 					"$(PROJECT_DIR)/../WireGuardBridge/build",
@@ -314,7 +318,7 @@
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_ENTITLEMENTS = VKTurnProxy/VKTurnProxy.entitlements;
 				CODE_SIGN_IDENTITY = "iPhone Developer";
-				CURRENT_PROJECT_VERSION = 54;
+				CURRENT_PROJECT_VERSION = 57;
 				FRAMEWORK_SEARCH_PATHS = (
 					"$(inherited)",
 					"$(PROJECT_DIR)/../WireGuardBridge/build",
@@ -347,7 +351,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CODE_SIGN_ENTITLEMENTS = PacketTunnel/PacketTunnel.entitlements;
-				CURRENT_PROJECT_VERSION = 54;
+				CURRENT_PROJECT_VERSION = 57;
 				FRAMEWORK_SEARCH_PATHS = (
 					"$(inherited)",
 					"$(PROJECT_DIR)/../WireGuardBridge/build",
@@ -442,7 +446,7 @@
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_ENTITLEMENTS = VKTurnProxy/VKTurnProxy.entitlements;
 				CODE_SIGN_IDENTITY = "iPhone Developer";
-				CURRENT_PROJECT_VERSION = 54;
+				CURRENT_PROJECT_VERSION = 57;
 				FRAMEWORK_SEARCH_PATHS = (
 					"$(inherited)",
 					"$(PROJECT_DIR)/../WireGuardBridge/build",
