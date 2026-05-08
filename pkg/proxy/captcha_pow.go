@@ -41,10 +41,14 @@ var captchaPowProfile BrowserProfile
 // string. Both go directly into our outgoing componentDone/check
 // requests without re-encoding.
 type VKBrowserProfile struct {
-	Device     string `json:"device"`
-	BrowserFp  string `json:"browser_fp"`
-	UserAgent  string `json:"user_agent"`
-	CapturedAt int64  `json:"captured_at"`
+	Device    string  `json:"device"`
+	BrowserFp string  `json:"browser_fp"`
+	UserAgent string  `json:"user_agent"`
+	// CapturedAt is unix seconds with sub-second fraction. Stored as
+	// float64 because Swift writes TimeInterval (Double) and Go's
+	// json.Unmarshal won't coerce a float into int64. Match Swift's
+	// type to keep the round-trip lossless.
+	CapturedAt float64 `json:"captured_at"`
 }
 
 // vkProfilePath holds the App Group container path to vk_profile.json.
@@ -401,7 +405,7 @@ func callCaptchaNotRobotAPI(ctx context.Context, client *http.Client, sessionTok
 	deviceParam := url.QueryEscape(string(deviceBytes))
 
 	if saved := loadSavedVKProfile(); saved != nil {
-		ageDays := float64(time.Now().Unix()-saved.CapturedAt) / 86400.0
+		ageDays := (float64(time.Now().Unix()) - saved.CapturedAt) / 86400.0
 		log.Printf("pow: using captured browser profile (browser_fp=%dc, device=%dc, captured %.1f days ago)",
 			len(saved.BrowserFp), len(saved.Device), ageDays)
 		browserFp = saved.BrowserFp
