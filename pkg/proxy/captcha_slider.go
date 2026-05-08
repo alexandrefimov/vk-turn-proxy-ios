@@ -40,25 +40,40 @@ type sliderCandidate struct {
 // solveSliderCaptcha attempts to solve a VK slider captcha automatically.
 // It fetches the scrambled image via captchaNotRobot.getContent, analyzes
 // tile border continuity to find the correct permutation, and submits the answer.
+//
+// deviceParam is the URL-encoded device descriptor (matches whatever was
+// sent in the prior componentDone — either generated default or captured
+// from a real browser via vk_profile.json). Passed through unchanged to
+// the re-issued componentDone before getContent.
 func solveSliderCaptcha(
 	vkReq vkReqFunc,
 	baseParams string,
 	browserFp string,
+	deviceParam string,
 	hash string,
 	settingsResp map[string]interface{},
 ) (string, error) {
+	// Re-issue captchaNotRobot.componentDone before getContent. Per
+	// cacggghp PR #162 (commit 2bcb9e35, Moroka8): VK responds ERROR
+	// to getContent without a fresh componentDone signal — VK is
+	// waiting for the slider widget to announce it loaded. The earlier
+	// componentDone call was for the checkbox path; slider needs its
+	// own. Same browser_fp + device — those are session-scoped, not
+	// per-widget. Failure here is non-fatal: try getContent anyway.
+	componentDoneData := baseParams + "&browser_fp=" + browserFp + "&device=" + deviceParam
+	if _, err := vkReq("captchaNotRobot.componentDone", componentDoneData); err != nil {
+		log.Printf("slider: pre-getContent componentDone failed (non-fatal): %v", err)
+	}
+
 	// Extract slider settings from the settings response
 	sliderSettings := extractSliderSettings(settingsResp)
 
-	log.Printf("slider: fetching captcha content (settings=%q)", sliderSettings)
-
-	// Get scrambled image and swap instructions
-	getContentData := baseParams
-	if sliderSettings != "" {
-		getContentData += "&captcha_settings=" + neturl.QueryEscape(sliderSettings)
-	}
-
-	resp, err := vkReq("captchaNotRobot.getContent", getContentData)
+	// Try getContent with captcha_settings, fall back to without if VK
+	// returns ERROR. Per Moroka8: VK sometimes advertises show_type=
+	// checkbox in settings but actually serves slider content, so the
+	// captcha_settings string we extracted may not match. The unsettings'd
+	// call uses VK's default, which works in those cases.
+	resp, err := requestSliderContentWithFallback(vkReq, baseParams, sliderSettings)
 	if err != nil {
 		return "", fmt.Errorf("slider getContent: %w", err)
 	}
@@ -136,6 +151,60 @@ func solveSliderCaptcha(
 	}
 
 	return "", fmt.Errorf("slider: all %d guesses rejected", maxTries)
+}
+
+// requestSliderContentWithFallback calls captchaNotRobot.getContent first
+// with the extracted captcha_settings string (if non-empty), then if the
+// response status is not "OK", retries without captcha_settings. Per
+// cacggghp PR #162 (commit 2bcb9e35, Moroka8): VK occasionally returns
+// show_captcha_type=checkbox in /settings while actually serving slider
+// content, so the captcha_settings extracted from /settings may not
+// match what /getContent expects. Calling without captcha_settings lets
+// VK pick its default which works in those cases.
+//
+// Returns the response from whichever call returned status=OK (or the
+// last one tried), so the caller can pass it straight to parseSliderContent.
+// On HTTP-layer error from vkReq, gives up immediately.
+func requestSliderContentWithFallback(vkReq vkReqFunc, baseParams, sliderSettings string) (map[string]interface{}, error) {
+	tryGetContent := func(withSettings bool) (map[string]interface{}, string, error) {
+		data := baseParams
+		if withSettings && sliderSettings != "" {
+			data += "&captcha_settings=" + neturl.QueryEscape(sliderSettings)
+		}
+		resp, err := vkReq("captchaNotRobot.getContent", data)
+		if err != nil {
+			return nil, "", err
+		}
+		respObj, ok := resp["response"].(map[string]interface{})
+		if !ok {
+			return resp, "", nil
+		}
+		status, _ := respObj["status"].(string)
+		return resp, status, nil
+	}
+
+	if sliderSettings != "" {
+		log.Printf("slider: getContent attempt 1 (with captcha_settings, %d chars)", len(sliderSettings))
+		resp, status, err := tryGetContent(true)
+		if err != nil {
+			return nil, err
+		}
+		if status == "OK" {
+			return resp, nil
+		}
+		log.Printf("slider: getContent with settings returned status=%q, retrying without", status)
+	} else {
+		log.Printf("slider: getContent attempt 1 (no captcha_settings extracted)")
+	}
+
+	resp, status, err := tryGetContent(false)
+	if err != nil {
+		return nil, err
+	}
+	if status != "OK" && status != "" {
+		log.Printf("slider: getContent without settings also returned status=%q", status)
+	}
+	return resp, nil
 }
 
 // extractSliderSettings extracts slider captcha_settings from settings API response.

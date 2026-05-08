@@ -14,14 +14,89 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
 // captchaPowProfile stores the browser profile for the current PoW session.
 var captchaPowProfile BrowserProfile
+
+// VKBrowserProfile is a captured-from-real-browser fingerprint reused in
+// the auto-PoW solver to evade VK's bot detection. The Swift main app's
+// CaptchaWKWebView intercepts captchaNotRobot.componentDone request bodies
+// (where a real browser sends VK its computed device + browser_fp) and
+// persists them to App Group vk_profile.json. Subsequent solveCaptchaPoW
+// calls — in either main app or extension process — load this file and
+// substitute the captured values for the generated ones, dramatically
+// improving the auto-solve success rate (observed 6% with generated
+// browser_fp, vpn.wifi.0.log 2026-05-08; expected to climb sharply with
+// real captured values per Moroka8 PR #162 commit b9642c6).
+//
+// The captured Device is the form-encoded value from VK's request body
+// (already URL-encoded JSON); BrowserFp is the encoded fingerprint
+// string. Both go directly into our outgoing componentDone/check
+// requests without re-encoding.
+type VKBrowserProfile struct {
+	Device     string `json:"device"`
+	BrowserFp  string `json:"browser_fp"`
+	UserAgent  string `json:"user_agent"`
+	CapturedAt int64  `json:"captured_at"`
+}
+
+// vkProfilePath holds the App Group container path to vk_profile.json.
+// Set via SetVKProfilePath from bridge.go's wgSetLogFilePath. Read by
+// loadSavedVKProfile on every solveCaptchaPoW call (no caching — the
+// file is small, reading once per captcha attempt is negligible, and
+// cache invalidation gets messy).
+var vkProfilePath atomic.Value // string
+
+// SetVKProfilePath records where vk_profile.json lives in the App Group
+// container. Empty string disables loading (loadSavedVKProfile returns
+// nil silently). Called once during bridge init for both main app and
+// extension processes.
+func SetVKProfilePath(p string) {
+	vkProfilePath.Store(p)
+}
+
+// loadSavedVKProfile returns the captured profile if the file exists
+// and parses cleanly, or nil otherwise. Missing file / parse error /
+// empty fields all yield nil — caller falls back to generated values.
+// Logs the load decision so production logs show whether the captured
+// profile is being used on each PoW attempt.
+func loadSavedVKProfile() *VKBrowserProfile {
+	v := vkProfilePath.Load()
+	if v == nil {
+		return nil
+	}
+	path, _ := v.(string)
+	if path == "" {
+		return nil
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		// ENOENT is normal (no captured profile yet); other errors
+		// suggest something wrong with App Group container access.
+		if !os.IsNotExist(err) {
+			log.Printf("pow: vk_profile.json read failed: %v", err)
+		}
+		return nil
+	}
+	var p VKBrowserProfile
+	if err := json.Unmarshal(data, &p); err != nil {
+		log.Printf("pow: vk_profile.json parse failed: %v", err)
+		return nil
+	}
+	if p.BrowserFp == "" || p.Device == "" {
+		log.Printf("pow: vk_profile.json missing required fields (device=%dc, browser_fp=%dc)",
+			len(p.Device), len(p.BrowserFp))
+		return nil
+	}
+	return &p
+}
 
 // randomHex generates a random hex string of n bytes (2n hex chars).
 var _ = randomHex
@@ -296,9 +371,16 @@ func callCaptchaNotRobotAPI(ctx context.Context, client *http.Client, sessionTok
 
 	// 2/4: componentDone
 	log.Printf("pow: 2/4 captchaNotRobot.componentDone")
+
+	// Default: generated browser_fp + canned device descriptor. VK's
+	// anti-bot scoring catches this pattern almost every time
+	// (status=BOT on .check, see vpn.wifi.0.log analysis 2026-05-08
+	// where 62/66 fresh fetches got BOT). If we have a captured real
+	// browser profile from a prior manual solve in CaptchaWKWebView,
+	// use those values instead — they pass VK's check because they
+	// were originally produced and accepted by VK's own JS.
 	browserFp := fmt.Sprintf("%x%x", mathrand.Int63(), mathrand.Int63())
 
-	// Simplified device data matching reference implementation
 	deviceMap := map[string]interface{}{
 		"screenWidth":             1920,
 		"screenHeight":            1080,
@@ -316,9 +398,22 @@ func callCaptchaNotRobotAPI(ctx context.Context, client *http.Client, sessionTok
 		"notificationsPermission": "default",
 	}
 	deviceBytes, _ := json.Marshal(deviceMap)
+	deviceParam := url.QueryEscape(string(deviceBytes))
 
-	componentData := baseParams + fmt.Sprintf("&browser_fp=%s&device=%s",
-		browserFp, url.QueryEscape(string(deviceBytes)))
+	if saved := loadSavedVKProfile(); saved != nil {
+		ageDays := float64(time.Now().Unix()-saved.CapturedAt) / 86400.0
+		log.Printf("pow: using captured browser profile (browser_fp=%dc, device=%dc, captured %.1f days ago)",
+			len(saved.BrowserFp), len(saved.Device), ageDays)
+		browserFp = saved.BrowserFp
+		// saved.Device is the raw value from the captured request body,
+		// which was already URL-encoded form-data. Pass through as-is —
+		// re-encoding would double-escape the JSON braces and quotes.
+		deviceParam = saved.Device
+	} else {
+		log.Printf("pow: no captured browser profile, using generated browser_fp+device")
+	}
+
+	componentData := baseParams + fmt.Sprintf("&browser_fp=%s&device=%s", browserFp, deviceParam)
 
 	_, err = vkReq("captchaNotRobot.componentDone", componentData)
 	if err != nil {
@@ -435,7 +530,7 @@ func callCaptchaNotRobotAPI(ctx context.Context, client *http.Client, sessionTok
 		log.Printf("pow: using HTML-extracted captcha settings for slider")
 	}
 	log.Printf("pow: attempting automatic slider solver...")
-	sliderToken, sliderErr := solveSliderCaptcha(vkReq, baseParams, browserFp, hash, mergedSettings)
+	sliderToken, sliderErr := solveSliderCaptcha(vkReq, baseParams, browserFp, deviceParam, hash, mergedSettings)
 	if sliderErr == nil && sliderToken != "" {
 		log.Printf("pow: slider solver succeeded!")
 		time.Sleep(200 * time.Millisecond)

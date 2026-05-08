@@ -750,10 +750,40 @@ struct CaptchaWKWebView: UIViewRepresentable {
             var h = window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.captchaToken;
             if (!h) return;
 
-            // Hook fetch to intercept captchaNotRobot.check response
+            // Helper: extract device + browser_fp from a form-encoded body
+            // and post 'profile-capture:' to Swift if both present. Used
+            // by both fetch and XHR hooks for captchaNotRobot.componentDone
+            // — VK's JS sends those values to its own API after computing
+            // them client-side; intercepting them lets us reuse them in
+            // our Go-side auto-PoW solver instead of generating fakes
+            // that VK consistently labels as BOT.
+            function captureProfileFromBody(bodyStr, source) {
+                try {
+                    if (!bodyStr) {
+                        h.postMessage('profile-capture-err:empty body (' + source + ')');
+                        return;
+                    }
+                    var deviceMatch = /(?:^|&)device=([^&]*)/.exec(bodyStr);
+                    var fpMatch = /(?:^|&)browser_fp=([^&]*)/.exec(bodyStr);
+                    if (deviceMatch && fpMatch) {
+                        h.postMessage('profile-capture:device=' + deviceMatch[1]
+                            + '&browser_fp=' + fpMatch[1]
+                            + '&ua=' + encodeURIComponent(navigator.userAgent || ''));
+                    } else {
+                        h.postMessage('profile-capture-err:fields not found in body len=' + bodyStr.length + ' (' + source + ')');
+                    }
+                } catch (e) {
+                    h.postMessage('profile-capture-err:' + e.message + ' (' + source + ')');
+                }
+            }
+
+            // Hook fetch to intercept captchaNotRobot.check response AND
+            // captchaNotRobot.componentDone request body (the latter for
+            // browser-profile capture).
             var origFetch = window.fetch;
             window.fetch = function() {
                 var url = arguments[0];
+                var init = arguments[1];
                 if (typeof url === 'object' && url.url) url = url.url;
                 var urlStr = String(url);
                 var p = origFetch.apply(this, arguments);
@@ -776,10 +806,14 @@ struct CaptchaWKWebView: UIViewRepresentable {
                         h.postMessage('check-err:' + e.message);
                     });
                 }
+                if (urlStr.indexOf('captchaNotRobot.componentDone') !== -1) {
+                    captureProfileFromBody(init && init.body ? String(init.body) : '', 'fetch');
+                }
                 return p;
             };
 
-            // Hook XMLHttpRequest as fallback
+            // Hook XMLHttpRequest as fallback (covers both check response
+            // and componentDone body capture).
             var origOpen = XMLHttpRequest.prototype.open;
             var origSend = XMLHttpRequest.prototype.send;
             XMLHttpRequest.prototype.open = function(method, url) {
@@ -788,7 +822,11 @@ struct CaptchaWKWebView: UIViewRepresentable {
             };
             XMLHttpRequest.prototype.send = function() {
                 var xhr = this;
-                if (this._url && String(this._url).indexOf('captchaNotRobot.check') !== -1) {
+                var urlStr = this._url ? String(this._url) : '';
+                if (urlStr.indexOf('captchaNotRobot.componentDone') !== -1) {
+                    captureProfileFromBody(arguments[0] ? String(arguments[0]) : '', 'xhr');
+                }
+                if (urlStr.indexOf('captchaNotRobot.check') !== -1) {
                     xhr.addEventListener('load', function() {
                         try {
                             var data = JSON.parse(xhr.responseText);
@@ -1044,6 +1082,41 @@ struct CaptchaWKWebView: UIViewRepresentable {
                 let token = String(body.dropFirst(6))
                 log("SUCCESS_TOKEN (\(token.count) chars)")
                 captureToken(token)
+                return
+            }
+
+            // Browser-profile capture from intercepted captchaNotRobot.componentDone
+            // request body. Format: "profile-capture:device=URLENC&browser_fp=URLENC&ua=URLENC".
+            // Persist to App Group vk_profile.json so subsequent Go-side
+            // solveCaptchaPoW (in either main app or extension) can substitute
+            // these captured-from-real-browser values for its generated
+            // browser_fp/device — the latter being labeled BOT in 94% of attempts
+            // per vpn.wifi.0.log analysis 2026-05-08.
+            //
+            // Important: device and browser_fp are stored in their RAW
+            // URL-encoded form (as VK's JS originally serialized them
+            // into the request body). Go-side splices them back into a
+            // form-encoded body verbatim — re-encoding would double-escape.
+            // Only `ua` (which we add ourselves via encodeURIComponent in
+            // JS) gets percent-decoded for human-readable storage.
+            if body.hasPrefix("profile-capture:") {
+                let payload = String(body.dropFirst("profile-capture:".count))
+                var raw: [String: String] = [:]
+                for pair in payload.split(separator: "&") {
+                    let kv = pair.split(separator: "=", maxSplits: 1)
+                    if kv.count == 2 {
+                        raw[String(kv[0])] = String(kv[1])
+                    }
+                }
+                let deviceRaw = raw["device"] ?? ""
+                let browserFpRaw = raw["browser_fp"] ?? ""
+                let uaDecoded = (raw["ua"] ?? "").removingPercentEncoding ?? ""
+                log("profile-capture received: device=\(deviceRaw.count)c browser_fp=\(browserFpRaw.count)c ua=\(uaDecoded.count)c")
+                VKProfileCache.save(device: deviceRaw, browserFp: browserFpRaw, userAgent: uaDecoded)
+                return
+            }
+            if body.hasPrefix("profile-capture-err:") {
+                log("profile capture error: \(String(body.dropFirst("profile-capture-err:".count)))")
                 return
             }
 
