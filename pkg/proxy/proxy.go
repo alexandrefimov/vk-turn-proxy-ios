@@ -1360,10 +1360,38 @@ func (p *Proxy) TURNServerIP() string {
 	return ""
 }
 
-// Stop tears down all connections.
+// Stop tears down all connections, blocking until every goroutine
+// observes ctx cancellation and returns. Suitable for tests and clean
+// shutdown paths where unbounded wait is OK. Production iOS shutdown
+// should use StopWithTimeout — iOS force-kills extensions whose
+// stopTunnel doesn't return within ~26s, losing log buffers in the
+// process; bounding the wait avoids that path.
 func (p *Proxy) Stop() {
 	p.cancel()
 	p.wg.Wait()
+}
+
+// StopWithTimeout cancels and waits for goroutines, but gives up after
+// the given duration if some goroutine refuses to exit promptly. Used
+// by wgTurnOff so a slow goroutine (one stuck in pion/turn deallocation,
+// blocking syscall.Read, etc.) doesn't keep the extension process busy
+// past iOS' tolerance window. After the deadline we return regardless;
+// the leftover goroutines die when the Go runtime terminates moments
+// later as iOS reaps the extension process.
+func (p *Proxy) StopWithTimeout(timeout time.Duration) {
+	p.cancel()
+	done := make(chan struct{})
+	go func() {
+		p.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		// clean exit — every goroutine returned within budget
+	case <-time.After(timeout):
+		log.Printf("proxy: StopWithTimeout — %s elapsed, %d goroutines still alive (returning anyway, runtime exit will reap them)",
+			timeout.Round(time.Millisecond), runtime.NumGoroutine())
+	}
 }
 
 // runConnection runs a single connection slot with reconnection.

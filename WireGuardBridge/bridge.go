@@ -500,16 +500,41 @@ func wgTurnOff(tunnelHandle C.int32_t) {
 		return
 	}
 
-	// device may be nil if the tunnel was started via wgStartVKBootstrap
-	// but wgAttachWireGuard was never called (e.g. bootstrap timed out).
-	// In that case we still have to stop the proxy goroutine to release
-	// its TURN allocation and background goroutines.
-	if entry.device != nil {
-		entry.device.Close()
-	} else if entry.proxy != nil {
-		entry.proxy.Stop()
+	started := time.Now()
+	hasDevice := entry.device != nil
+	hasProxy := entry.proxy != nil
+	log.Printf("wgTurnOff: tunnel %d stopping (device=%v proxy=%v)", id, hasDevice, hasProxy)
+
+	// Order matters: stop proxy FIRST, device SECOND.
+	//
+	// Build 56 attempted "device.Close then proxy.StopWithTimeout" —
+	// observed in vpn.wifi.3.log 2026-05-08 to never reach the
+	// proxy.StopWithTimeout call: device.Close() blocked indefinitely
+	// while proxy goroutines kept running ("proxy: session ended" lines
+	// continued for the full 20 seconds of iOS' NESMVPNSessionStateStopping
+	// timeout). Hypothesis: WG device.Close holds device.state.Lock and
+	// waits in device.state.stopping.Wait() / tun.Close() for some
+	// goroutine that, in turn, is blocked on proxy I/O — proxy keeps
+	// reading/writing TUN until its ctx is cancelled. Classic deadlock:
+	// WG waits proxy → proxy waits WG.
+	//
+	// By cancelling proxy first, its goroutines bail out, release their
+	// hold on TUN read/write, and device.Close can complete cleanly.
+	// Proxy.StopWithTimeout(2s) is the safety net — if some goroutine
+	// won't exit promptly, we still proceed; the Go runtime reaps
+	// leftovers when iOS terminates the extension after stopTunnel
+	// returns its completionHandler.
+	if hasProxy {
+		ps := time.Now()
+		entry.proxy.StopWithTimeout(2 * time.Second)
+		log.Printf("wgTurnOff: tunnel %d proxy.Stop took %s", id, time.Since(ps).Round(time.Millisecond))
 	}
-	log.Printf("wgTurnOff: tunnel %d stopped", id)
+	if hasDevice {
+		ds := time.Now()
+		entry.device.Close()
+		log.Printf("wgTurnOff: tunnel %d device.Close took %s", id, time.Since(ds).Round(time.Millisecond))
+	}
+	log.Printf("wgTurnOff: tunnel %d stopped (total %s)", id, time.Since(started).Round(time.Millisecond))
 }
 
 //export wgSetConfig
@@ -800,6 +825,18 @@ func wgSetLogFilePath(path *C.char) {
 	logFilePath = p
 	logFileMu.Unlock()
 	log.Printf("wgSetLogFilePath: %s", p)
+
+	// Side-effect: derive companion paths in the same App Group container.
+	// Both main app (wgProbeVKCreds path) and extension (wgStartVKBootstrap
+	// path) call wgSetLogFilePath at startup with the same App Group dir,
+	// so each process sees the captured browser profile cache the main
+	// app's CaptchaWKWebView writes into vk_profile.json. Empty path
+	// disables — solveCaptchaPoW silently falls back to generated fp.
+	if p != "" {
+		profilePath := filepath.Join(filepath.Dir(p), "vk_profile.json")
+		proxy.SetVKProfilePath(profilePath)
+		log.Printf("wgSetLogFilePath: vk_profile.json path = %s", profilePath)
+	}
 }
 
 // osLogWriter writes Go log output to os_log (visible in Console.app)

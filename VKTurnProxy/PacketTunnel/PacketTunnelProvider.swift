@@ -339,12 +339,42 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     }
 
     override func stopTunnel(with reason: NEProviderStopReason, completionHandler: @escaping () -> Void) {
+        let started = Date()
+        let elapsedMs: () -> Int = { Int(Date().timeIntervalSince(started) * 1000) }
+        logMsg("stopTunnel: entered (reason=\(reason.rawValue))")
         stopPathMonitoring()
+
+        // Safety net: ensure completionHandler is called exactly once
+        // within 3 seconds even if wgTurnOff hangs. Without this, iOS
+        // waits its full 20s NESMVPNSessionStateStopping timeout + 5s
+        // Disposing timeout = 26s before user sees Disconnected. The
+        // race is harmless: if wgTurnOff completes first, callOnce
+        // marks called=true and the timer fires harmlessly later.
+        let lock = NSLock()
+        var called = false
+        let callOnce: (String) -> Void = { [weak self] origin in
+            lock.lock()
+            let firstCall = !called
+            called = true
+            lock.unlock()
+            if firstCall {
+                self?.logMsg("stopTunnel: calling completionHandler from \(origin) (\(elapsedMs())ms)")
+                completionHandler()
+            }
+        }
+        DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 3.0) {
+            callOnce("safety-net 3s timeout")
+        }
+
         if tunnelHandle >= 0 {
+            logMsg("stopTunnel: calling wgTurnOff(\(tunnelHandle))")
             wgTurnOff(tunnelHandle)
             tunnelHandle = -1
+            logMsg("stopTunnel: wgTurnOff returned (\(elapsedMs())ms total)")
+        } else {
+            logMsg("stopTunnel: no active tunnelHandle, skipping wgTurnOff")
         }
-        completionHandler()
+        callOnce("normal path")
     }
 
     // MARK: - NWPathMonitor (passive network state logging)
