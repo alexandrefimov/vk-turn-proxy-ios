@@ -750,36 +750,48 @@ struct CaptchaWKWebView: UIViewRepresentable {
             var h = window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.captchaToken;
             if (!h) return;
 
-            // Helper: extract device + browser_fp from a form-encoded body
-            // and post 'profile-capture:' to Swift if both present. Used
-            // by both fetch and XHR hooks for captchaNotRobot.componentDone
-            // — VK's JS sends those values to its own API after computing
-            // them client-side; intercepting them lets us reuse them in
-            // our Go-side auto-PoW solver instead of generating fakes
-            // that VK consistently labels as BOT.
+            // Helper: extract whichever of device + browser_fp are non-empty
+            // from a form-encoded body and post 'profile-capture:' to Swift.
+            // Empirically (vpn.wifi.[1-3].log 2026-05-08): VK's
+            // captchaNotRobot.componentDone body has device populated but
+            // browser_fp EMPTY. browser_fp gets a real value only in the
+            // captchaNotRobot.check body — so we have to intercept BOTH
+            // requests and accumulate fields across them. Swift side
+            // merges via VKProfileCache.update (preserves existing field
+            // on empty input).
             function captureProfileFromBody(bodyStr, source) {
                 try {
                     if (!bodyStr) {
                         h.postMessage('profile-capture-err:empty body (' + source + ')');
                         return;
                     }
+                    var fields = [];
                     var deviceMatch = /(?:^|&)device=([^&]*)/.exec(bodyStr);
-                    var fpMatch = /(?:^|&)browser_fp=([^&]*)/.exec(bodyStr);
-                    if (deviceMatch && fpMatch) {
-                        h.postMessage('profile-capture:device=' + deviceMatch[1]
-                            + '&browser_fp=' + fpMatch[1]
-                            + '&ua=' + encodeURIComponent(navigator.userAgent || ''));
-                    } else {
-                        h.postMessage('profile-capture-err:fields not found in body len=' + bodyStr.length + ' (' + source + ')');
+                    if (deviceMatch && deviceMatch[1].length > 0) {
+                        fields.push('device=' + deviceMatch[1]);
                     }
+                    var fpMatch = /(?:^|&)browser_fp=([^&]*)/.exec(bodyStr);
+                    if (fpMatch && fpMatch[1].length > 0) {
+                        fields.push('browser_fp=' + fpMatch[1]);
+                    }
+                    if (fields.length === 0) {
+                        h.postMessage('profile-capture-err:both fields empty/absent in body len=' + bodyStr.length + ' (' + source + ')');
+                        return;
+                    }
+                    fields.push('ua=' + encodeURIComponent(navigator.userAgent || ''));
+                    h.postMessage('profile-capture:' + fields.join('&'));
                 } catch (e) {
                     h.postMessage('profile-capture-err:' + e.message + ' (' + source + ')');
                 }
             }
 
-            // Hook fetch to intercept captchaNotRobot.check response AND
-            // captchaNotRobot.componentDone request body (the latter for
-            // browser-profile capture).
+            // Hook fetch to intercept:
+            //   - captchaNotRobot.check RESPONSE (for success_token)
+            //   - captchaNotRobot.check REQUEST body (for browser_fp)
+            //   - captchaNotRobot.componentDone REQUEST body (for device)
+            // Profile fields accumulate on the Swift side via
+            // VKProfileCache.update — componentDone gives device, check
+            // gives browser_fp; merging produces a complete saved profile.
             var origFetch = window.fetch;
             window.fetch = function() {
                 var url = arguments[0];
@@ -788,6 +800,7 @@ struct CaptchaWKWebView: UIViewRepresentable {
                 var urlStr = String(url);
                 var p = origFetch.apply(this, arguments);
                 if (urlStr.indexOf('captchaNotRobot.check') !== -1) {
+                    captureProfileFromBody(init && init.body ? String(init.body) : '', 'fetch-check');
                     p.then(function(response) {
                         return response.clone().json();
                     }).then(function(data) {
@@ -807,13 +820,12 @@ struct CaptchaWKWebView: UIViewRepresentable {
                     });
                 }
                 if (urlStr.indexOf('captchaNotRobot.componentDone') !== -1) {
-                    captureProfileFromBody(init && init.body ? String(init.body) : '', 'fetch');
+                    captureProfileFromBody(init && init.body ? String(init.body) : '', 'fetch-componentDone');
                 }
                 return p;
             };
 
-            // Hook XMLHttpRequest as fallback (covers both check response
-            // and componentDone body capture).
+            // Hook XMLHttpRequest as fallback (same triple capture as fetch).
             var origOpen = XMLHttpRequest.prototype.open;
             var origSend = XMLHttpRequest.prototype.send;
             XMLHttpRequest.prototype.open = function(method, url) {
@@ -824,9 +836,10 @@ struct CaptchaWKWebView: UIViewRepresentable {
                 var xhr = this;
                 var urlStr = this._url ? String(this._url) : '';
                 if (urlStr.indexOf('captchaNotRobot.componentDone') !== -1) {
-                    captureProfileFromBody(arguments[0] ? String(arguments[0]) : '', 'xhr');
+                    captureProfileFromBody(arguments[0] ? String(arguments[0]) : '', 'xhr-componentDone');
                 }
                 if (urlStr.indexOf('captchaNotRobot.check') !== -1) {
+                    captureProfileFromBody(arguments[0] ? String(arguments[0]) : '', 'xhr-check');
                     xhr.addEventListener('load', function() {
                         try {
                             var data = JSON.parse(xhr.responseText);
@@ -1085,13 +1098,12 @@ struct CaptchaWKWebView: UIViewRepresentable {
                 return
             }
 
-            // Browser-profile capture from intercepted captchaNotRobot.componentDone
-            // request body. Format: "profile-capture:device=URLENC&browser_fp=URLENC&ua=URLENC".
-            // Persist to App Group vk_profile.json so subsequent Go-side
-            // solveCaptchaPoW (in either main app or extension) can substitute
-            // these captured-from-real-browser values for its generated
-            // browser_fp/device — the latter being labeled BOT in 94% of attempts
-            // per vpn.wifi.0.log analysis 2026-05-08.
+            // Browser-profile capture from intercepted VK API request bodies.
+            // Format: "profile-capture:[device=URLENC&][browser_fp=URLENC&]ua=URLENC".
+            // device and browser_fp are OPTIONAL (each captured from a
+            // different request type — componentDone has device, check has
+            // browser_fp). Empty/absent fields are not overwritten on disk;
+            // VKProfileCache.update merges with whatever's already saved.
             //
             // Important: device and browser_fp are stored in their RAW
             // URL-encoded form (as VK's JS originally serialized them
@@ -1112,7 +1124,7 @@ struct CaptchaWKWebView: UIViewRepresentable {
                 let browserFpRaw = raw["browser_fp"] ?? ""
                 let uaDecoded = (raw["ua"] ?? "").removingPercentEncoding ?? ""
                 log("profile-capture received: device=\(deviceRaw.count)c browser_fp=\(browserFpRaw.count)c ua=\(uaDecoded.count)c")
-                VKProfileCache.save(device: deviceRaw, browserFp: browserFpRaw, userAgent: uaDecoded)
+                VKProfileCache.update(device: deviceRaw, browserFp: browserFpRaw, userAgent: uaDecoded)
                 return
             }
             if body.hasPrefix("profile-capture-err:") {

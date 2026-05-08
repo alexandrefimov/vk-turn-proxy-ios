@@ -75,6 +75,48 @@ enum VKProfileCache {
         }
     }
 
+    /// Merge new fields into the existing profile. Empty input fields
+    /// preserve the existing on-disk value (no overwrite-with-empty).
+    /// Used when partial captures arrive across multiple requests:
+    /// captchaNotRobot.componentDone supplies device, captchaNotRobot.check
+    /// supplies browser_fp. Each capture calls update; the file
+    /// accumulates a complete profile after both arrive. Atomic write,
+    /// safe under concurrent reader (Go-side loadSavedVKProfile).
+    static func update(device: String, browserFp: String, userAgent: String) {
+        guard let url = fileURL else {
+            SharedLogger.shared.log("[AppDebug] VKProfileCache.update: no App Group container — entitlement missing?")
+            return
+        }
+        let existing = load()
+        let mergedDevice = device.isEmpty ? (existing?.device ?? "") : device
+        let mergedBrowserFp = browserFp.isEmpty ? (existing?.browser_fp ?? "") : browserFp
+        let mergedUA = userAgent.isEmpty ? (existing?.user_agent ?? "") : userAgent
+
+        if mergedDevice.isEmpty && mergedBrowserFp.isEmpty {
+            SharedLogger.shared.log("[AppDebug] VKProfileCache.update: nothing to merge (no existing, no new fields)")
+            return
+        }
+
+        let entry = VKProfileEntry(
+            device: mergedDevice,
+            browser_fp: mergedBrowserFp,
+            user_agent: mergedUA,
+            captured_at: Date().timeIntervalSince1970
+        )
+        do {
+            let data = try JSONEncoder().encode(entry)
+            try data.write(to: url, options: .atomic)
+            // Diff-style log shows what changed: a leading "+" means this
+            // call supplied a new value, " " means existing preserved.
+            let deviceMark = device.isEmpty ? " " : "+"
+            let fpMark = browserFp.isEmpty ? " " : "+"
+            let uaMark = userAgent.isEmpty ? " " : "+"
+            SharedLogger.shared.log("[AppDebug] VKProfileCache.update: ok (\(deviceMark)device=\(mergedDevice.count)c \(fpMark)browser_fp=\(mergedBrowserFp.count)c \(uaMark)ua=\(mergedUA.count)c)")
+        } catch {
+            SharedLogger.shared.log("[AppDebug] VKProfileCache.update: write failed: \(error)")
+        }
+    }
+
     /// Read the captured profile. Used only for diagnostics from Swift —
     /// the actual consumer is Go-side proxy.loadSavedVKProfile() which
     /// reads the same file directly. Returns nil if missing or invalid.
