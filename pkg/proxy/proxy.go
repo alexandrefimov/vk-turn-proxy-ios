@@ -607,19 +607,61 @@ func (p *Proxy) startConnections() error {
 	// below.
 	const maxBootstrapAttempts = 4
 	const bootstrapBackoff = 10 * time.Second
+	// Safety window beyond longest cooldown — guards against slot timer
+	// firing slightly after our calculated deadline (re-arms, scheduler
+	// jitter, etc). Empirically a few seconds is plenty.
+	const allSaturatedWaitSafety = 5 * time.Second
 	err := spawnConn0()
 	for attempt := 1; err != nil && attempt < maxBootstrapAttempts; attempt++ {
 		var captchaErr *CaptchaRequiredError
 		if errors.As(err, &captchaErr) {
 			break
 		}
-		log.Printf("proxy: bootstrap attempt %d/%d failed (%v), retrying conn 0 after %s",
-			attempt, maxBootstrapAttempts, err, bootstrapBackoff)
-		select {
-		case <-time.After(bootstrapBackoff):
-		case <-p.ctx.Done():
-			return p.ctx.Err()
+
+		// Adaptive backoff: when ALL slots are in 486 cooldown, fixed
+		// 10s retries are guaranteed to keep failing — the only thing
+		// that can possibly help is one of the cooldown timers expiring.
+		// Wait on broadcastSlotAvailable instead, with a deadline equal
+		// to the longest remaining cooldown (+safety). The first slot
+		// to free up wakes us, we retry, and on success the rest of
+		// the conn-stagger launches normally.
+		//
+		// Without this, a path-change cascade that saturates every slot
+		// would see bootstrap exhaust its 4×10s budget within ~40s,
+		// then return error → other 29 conns never start → only the
+		// next 5-min watchdog tick can recover. Observed in
+		// vpn.wifi-lte-wifi.3.log 2026-05-08 21:21-21:33: 11m13s
+		// outage, ~4 min of which was waiting for the next watchdog
+		// tick after slots 0/2/4 had already cooled down at 21:29:00
+		// but no goroutine was listening for the broadcast.
+		saturated, total, longest := p.credPool.saturationSnapshot()
+		allSaturated := total > 0 && saturated == total
+
+		if allSaturated {
+			waitFor := longest + allSaturatedWaitSafety
+			log.Printf("proxy: bootstrap attempt %d/%d failed (%v), all %d slots in 486 cooldown — waiting up to %s for slot-available signal",
+				attempt, maxBootstrapAttempts, err, total, waitFor.Round(time.Second))
+			slotCh := p.credPool.slotAvailableChannel()
+			select {
+			case <-slotCh:
+				log.Printf("proxy: bootstrap attempt %d/%d woken by slot-available signal, retrying immediately",
+					attempt, maxBootstrapAttempts)
+			case <-time.After(waitFor):
+				log.Printf("proxy: bootstrap attempt %d/%d slot-wait timed out after %s, retrying",
+					attempt, maxBootstrapAttempts, waitFor.Round(time.Second))
+			case <-p.ctx.Done():
+				return p.ctx.Err()
+			}
+		} else {
+			log.Printf("proxy: bootstrap attempt %d/%d failed (%v), retrying conn 0 after %s",
+				attempt, maxBootstrapAttempts, err, bootstrapBackoff)
+			select {
+			case <-time.After(bootstrapBackoff):
+			case <-p.ctx.Done():
+				return p.ctx.Err()
+			}
 		}
+
 		err = spawnConn0()
 		if err == nil {
 			log.Printf("proxy: bootstrap attempt %d/%d succeeded", attempt+1, maxBootstrapAttempts)
@@ -627,6 +669,18 @@ func (p *Proxy) startConnections() error {
 	}
 
 	if err != nil {
+		// Diagnostic: when all bootstrap attempts get 486 because every
+		// slot's cooldown is active, log a single clear line so post-mortem
+		// readers don't have to correlate N "[conn X] TURN allocate quota
+		// error" lines manually. The watchdog will eventually re-trigger
+		// once cooldowns expire — see vpn.wifi-lte-wifi.1.log 2026-05-08
+		// for the canonical example (10-min outage caused exactly by this
+		// situation).
+		if saturated, total, longest := p.credPool.saturationSnapshot(); saturated == total && total > 0 {
+			log.Printf("proxy: bootstrap exhausted — ALL %d slots in 486 cooldown, longest %s remaining (waiting for VK quota expiry; watchdog will retry)",
+				total, longest.Round(time.Second))
+		}
+
 		// If captcha is required during initial connection, don't fail —
 		// publish the captcha and wait for the user to solve it.
 		var captchaErr *CaptchaRequiredError
@@ -1699,15 +1753,17 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 				// startConnections would burn its 4-attempt budget retrying
 				// the same saturated slot.
 				if isQuotaError(turnErr) {
-					// vkSaturationCooldown (3m) is short enough that the
-					// parked conns wake within one user-perceptible gap
-					// once the slot recovers, paired with the
-					// broadcastSlotAvailable hook in markSaturated that
-					// signals the moment the cooldown expires. See the
-					// constant's doc for the full rationale.
-					p.credPool.markSaturated(credSlot, vkSaturationCooldown)
-					log.Printf("proxy: [conn %d] bootstrap quota error on slot %d, marked VK-saturated for %s",
-						connIdx, credSlot, vkSaturationCooldown.Round(time.Second))
+					// markSaturated picks an adaptive cooldown based on
+					// the slot's lastUsedAt — short (3m) if 486 is from
+					// likely-ghost state, long (11m) if VK still holds
+					// our active allocations from a recent session that
+					// just got its sockets killed (e.g. iOS multi-interface
+					// path-change like vpn.wifi-lte-wifi.1.log). It logs
+					// its own decision; here we only log the proxy-side
+					// context (which conn, which slot).
+					cooldown := p.credPool.markSaturated(credSlot)
+					log.Printf("proxy: [conn %d] TURN allocate quota error (486) on slot %d (cooldown %s)",
+						connIdx, credSlot, cooldown.Round(time.Second))
 				} else if isAuthError(turnErr) {
 					p.credPool.invalidateEntry(credSlot)
 					log.Printf("proxy: [conn %d] bootstrap auth error on slot %d, invalidated",
@@ -2829,64 +2885,75 @@ func pathSnapshotOSDefault() string {
 // Conns whose connLocalIPs entry is empty (not currently allocated —
 // dormant, bootstrap-pending, or just torn down) are excluded from
 // both buckets so the in-sync count reflects active state, not history.
+// LogPathSnapshot emits one pathstats log line on demand. Same format
+// as the periodic logPathStatsLoop but callable from anywhere — used
+// by wgLogPathSnapshot bridge so Swift's NWPathMonitor can dump a
+// snapshot at the moment of every path transition, not just on the
+// 60s tick. Without this, transient interfaces visited during quick
+// wifi-lte-wifi handovers are invisible in the pathstats stream
+// (e.g. vpn.wifi-lte-wifi.1.log: LTE seen for 20s between two ticks
+// at 18:00:45 and 18:01:45, both showing wifi addresses, LTE missed).
+//
+// Safe to call concurrently with logPathStatsLoop; both just emit
+// log lines, no shared mutable state.
+func (p *Proxy) LogPathSnapshot(label string) {
+	osDefault := pathSnapshotOSDefault()
+
+	inSync := 0
+	stale := map[string]int{}
+	active := 0
+	for i := range p.connLocalIPs {
+		v, _ := p.connLocalIPs[i].Load().(string)
+		if v == "" {
+			continue // not currently allocated
+		}
+		active++
+		if v == osDefault {
+			inSync++
+		} else {
+			stale[v]++
+		}
+	}
+
+	if len(stale) == 0 {
+		log.Printf("proxy: pathstats %s os-default=%s in-sync=%d/%d",
+			label, osDefault, inSync, active)
+		return
+	}
+	// Format stale buckets as [ip1 (n), ip2 (m), ...] — sorted by
+	// count desc so the dominant stale IP surfaces first.
+	type bucket struct {
+		ip    string
+		count int
+	}
+	rows := make([]bucket, 0, len(stale))
+	for ip, c := range stale {
+		rows = append(rows, bucket{ip, c})
+	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].count > rows[j].count })
+	parts := make([]string, len(rows))
+	for i, r := range rows {
+		parts[i] = fmt.Sprintf("%s (%d)", r.ip, r.count)
+	}
+	log.Printf("proxy: pathstats %s os-default=%s in-sync=%d/%d stale=[%s]",
+		label, osDefault, inSync, active, strings.Join(parts, ", "))
+}
+
 func (p *Proxy) logPathStatsLoop(ctx context.Context) {
 	const interval = 60 * time.Second
 
 	tick := time.NewTicker(interval)
 	defer tick.Stop()
 
-	dump := func(label string) {
-		osDefault := pathSnapshotOSDefault()
-
-		inSync := 0
-		stale := map[string]int{}
-		active := 0
-		for i := range p.connLocalIPs {
-			v, _ := p.connLocalIPs[i].Load().(string)
-			if v == "" {
-				continue // not currently allocated
-			}
-			active++
-			if v == osDefault {
-				inSync++
-			} else {
-				stale[v]++
-			}
-		}
-
-		if len(stale) == 0 {
-			log.Printf("proxy: pathstats %s os-default=%s in-sync=%d/%d",
-				label, osDefault, inSync, active)
-		} else {
-			// Format stale buckets as [ip1 (n), ip2 (m), ...] — sorted by
-			// count desc so the dominant stale IP surfaces first.
-			type bucket struct {
-				ip    string
-				count int
-			}
-			rows := make([]bucket, 0, len(stale))
-			for ip, c := range stale {
-				rows = append(rows, bucket{ip, c})
-			}
-			sort.Slice(rows, func(i, j int) bool { return rows[i].count > rows[j].count })
-			parts := make([]string, len(rows))
-			for i, r := range rows {
-				parts[i] = fmt.Sprintf("%s (%d)", r.ip, r.count)
-			}
-			log.Printf("proxy: pathstats %s os-default=%s in-sync=%d/%d stale=[%s]",
-				label, osDefault, inSync, active, strings.Join(parts, ", "))
-		}
-	}
-
-	dump("startup")
+	p.LogPathSnapshot("startup")
 
 	for {
 		select {
 		case <-ctx.Done():
-			dump("final")
+			p.LogPathSnapshot("final")
 			return
 		case <-tick.C:
-			dump("tick")
+			p.LogPathSnapshot("tick")
 		}
 	}
 }

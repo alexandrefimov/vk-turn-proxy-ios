@@ -63,6 +63,56 @@ class SharedLogger {
         return archived + current
     }
 
+    /// Diagnostic snapshot of the log-file storage state. Used by the
+    /// LogsView fallback path to surface an accurate reason when
+    /// readLogs returned empty: was the App Group container unavailable
+    /// (no entitlement / wrong provisioning), or did the file just not
+    /// exist yet (fresh install or the user just hit Clear), or did it
+    /// exist but with zero bytes? The previous code conflated all three
+    /// into a single misleading "App Group container unavailable"
+    /// banner.
+    struct StorageStatus {
+        let hasContainer: Bool
+        let containerPath: String   // empty if hasContainer == false
+        let currentExists: Bool
+        let currentBytes: Int       // -1 if currentExists == false
+        let archivedExists: Bool
+        let archivedBytes: Int      // -1 if archivedExists == false
+    }
+
+    func inspectStorage() -> StorageStatus {
+        guard let url = fileURL else {
+            return StorageStatus(
+                hasContainer: false, containerPath: "",
+                currentExists: false, currentBytes: -1,
+                archivedExists: false, archivedBytes: -1
+            )
+        }
+        let containerPath = url.deletingLastPathComponent().path
+        let fm = FileManager.default
+
+        let currentExists = fm.fileExists(atPath: url.path)
+        var currentBytes = -1
+        if currentExists, let attrs = try? fm.attributesOfItem(atPath: url.path),
+           let size = attrs[.size] as? Int {
+            currentBytes = size
+        }
+
+        let archive = rotatedURL(for: url)
+        let archivedExists = fm.fileExists(atPath: archive.path)
+        var archivedBytes = -1
+        if archivedExists, let attrs = try? fm.attributesOfItem(atPath: archive.path),
+           let size = attrs[.size] as? Int {
+            archivedBytes = size
+        }
+
+        return StorageStatus(
+            hasContainer: true, containerPath: containerPath,
+            currentExists: currentExists, currentBytes: currentBytes,
+            archivedExists: archivedExists, archivedBytes: archivedBytes
+        )
+    }
+
     /// Delete all log contents (current and rotated).
     func clearLogs() {
         guard let url = fileURL else { return }

@@ -133,4 +133,41 @@ enum VKProfileCache {
         guard let entry = load() else { return false }
         return !entry.device.isEmpty && !entry.browser_fp.isEmpty
     }
+
+    /// Write a fully-formed entry verbatim. Used by BackupManager when
+    /// restoring a Full Backup — preserves the original captured_at
+    /// timestamp instead of resetting it to "now". Atomic write so a
+    /// concurrent Go-side reader either sees the old file or the
+    /// fully-replaced new one.
+    static func applyFromBackup(_ entry: VKProfileEntry) throws {
+        guard let url = fileURL else {
+            throw BackupError.noContainer
+        }
+        let data = try JSONEncoder().encode(entry)
+        try data.write(to: url, options: .atomic)
+        SharedLogger.shared.log("[AppDebug] VKProfileCache.applyFromBackup: ok (device=\(entry.device.count)c, browser_fp=\(entry.browser_fp.count)c, ua=\(entry.user_agent.count)c, captured_at=\(Int64(entry.captured_at)))")
+    }
+
+    /// Delete the on-disk profile. Used by the "Reset Captured Browser
+    /// Profile" Settings action. Idempotent — succeeds silently if the
+    /// file was already absent (post-condition "no vk_profile.json
+    /// exists" still holds). Distinct from `save`/`update` doing
+    /// nothing on empty input — this proactively removes the file so
+    /// Go-side `loadSavedVKProfile` returns nil immediately, forcing
+    /// the auto-solver back to generated browser_fp.
+    static func delete() throws {
+        guard let url = fileURL else {
+            throw BackupError.noContainer
+        }
+        do {
+            try FileManager.default.removeItem(at: url)
+            SharedLogger.shared.log("[AppDebug] VKProfileCache.delete: removed vk_profile.json")
+        } catch CocoaError.fileNoSuchFile {
+            SharedLogger.shared.log("[AppDebug] VKProfileCache.delete: file already absent")
+        } catch let nsErr as NSError where nsErr.code == NSFileNoSuchFileError {
+            SharedLogger.shared.log("[AppDebug] VKProfileCache.delete: file already absent")
+        } catch {
+            throw error
+        }
+    }
 }

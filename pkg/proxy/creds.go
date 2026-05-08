@@ -691,23 +691,45 @@ const credSaturationCooldown = 10 * time.Minute
 // allocations were still live until the kill moment.
 const credPeriodicSaveInterval = 60 * time.Second
 
-// vkSaturationCooldown is the duration a slot stays marked as
-// 486-saturated after a runTURN/bootstrap quota error. Was 10 min
-// originally — matched VK's full ~600s default TURN allocation lifetime,
-// the worst-case time for ghost allocations on a fully-used cred to
-// expire server-side. In practice the median ghost expiry is much
-// shorter (most "stale" allocations were single-channel and idle), and
-// the cost of marking too short is small: on the next attempt we either
-// succeed (recovered early) or 486 again and re-mark for another window.
-//
-// The cost of marking too LONG was demonstrated 2026-05-06 in
-// vpn.wifi.2.log: a path-change cascade saturated 5 slots at 11:18:33,
-// the only previously-ok conn entered its 30s-3min "no slot available"
-// dormancy, and the slot recovered at 11:28:33 — but the conn slept on
-// past expiry for another 5 minutes before re-trying. 3m here, paired
-// with markSaturated's broadcastSlotAvailable on expiry, lets parked
-// conns retry within milliseconds of the slot becoming usable again.
+// vkSaturationCooldown is the SHORT cooldown applied when a slot's last
+// in-use moment was long ago (no recent active allocations). The 486
+// is most likely from VK-side residual session state which clears
+// quickly, so a brief wait suffices. 3m chosen 2026-05-06 (commit
+// f458389) over the original 10m to fix vpn.wifi.2.log's 14-min 0-conn
+// window where parked conns slept past actual recovery time, and
+// paired with markSaturated's broadcastSlotAvailable on expiry to wake
+// them within milliseconds of cooldown end.
 const vkSaturationCooldown = 3 * time.Minute
+
+// vkActiveAllocationsCooldown is the LONG cooldown applied when 486
+// hits a slot whose allocations were active very recently (lastUsedAt
+// within `activeAllocationsWindow` ago). In that case the 486 isn't
+// from cleared-up ghosts, it's because the slot's previous TURN
+// allocations are STILL OCCUPYING VK's quota for their full ~600s
+// lifetime. We must wait for them to actually expire server-side
+// before retrying — otherwise we churn through the bootstrap retry
+// budget hitting 486 every time.
+//
+// Demonstrated 2026-05-08 in vpn.wifi-lte-wifi.1.log: WiFi → LTE → office
+// WiFi transition. 30 conns successfully allocated on LTE at
+// 18:01:20-26; iOS killed those sockets ~13s later when the office
+// WiFi appeared; bootstrap retried at 18:07:25-45 within the 10m
+// window and got 486 again because VK still held the LTE-side
+// allocations until ~18:11:30. Watchdog #1 fire was wasted; only
+// watchdog #2 at 18:12:45 succeeded. With this cooldown the wasted
+// retry burst would have been suppressed and watchdog #1 would have
+// noticed slots still saturated, sparing the bootstrap budget.
+//
+// 11m = VK's worst-case 600s lifetime + ~1m safety so the retry burst
+// after expiry doesn't race the last allocation's actual cleanup
+// (token bucket, CGNAT mapping, etc).
+const vkActiveAllocationsCooldown = 11 * time.Minute
+
+// activeAllocationsWindow is the lastUsedAt threshold under which a 486
+// is interpreted as "VK still holds our active allocations". Tied to
+// VK's TURN allocation lifetime (~600s = 10m) — if our allocations
+// were active any time in the last 10m, the lifetime hasn't run out.
+const activeAllocationsWindow = 10 * time.Minute
 
 // credCacheFile is the JSON-on-disk shape persisted to App Group container.
 // One file per pool. Contents are non-secret: VK TURN creds are session
@@ -1506,21 +1528,82 @@ func (cp *credPool) release(slot int) {
 // the old one first; spurious fires from already-replaced entries are
 // harmless (broadcastSlotAvailable tolerates them by design).
 //
-// Idempotent for invalid slot indices.
-func (cp *credPool) markSaturated(slot int, duration time.Duration) {
+// saturationSnapshot returns (saturatedCount, totalSlots, longestCooldownRemaining).
+// Used by bootstrap to log a single clear diagnostic when all retry attempts
+// failed because the entire pool is in 486 cooldown — without this, the log
+// shows N independent "[conn X] TURN allocate quota error" lines and the
+// reader has to manually correlate them. Locks cp.mu briefly.
+func (cp *credPool) saturationSnapshot() (saturated, total int, longest time.Duration) {
+	cp.mu.Lock()
+	defer cp.mu.Unlock()
+	now := time.Now()
+	total = cp.size
+	for i := 0; i < cp.size && i < len(cp.pool); i++ {
+		until := cp.pool[i].saturatedUntil
+		if until.After(now) {
+			saturated++
+			remaining := until.Sub(now)
+			if remaining > longest {
+				longest = remaining
+			}
+		}
+	}
+	return
+}
+
+// Idempotent for invalid slot indices. Returns the chosen cooldown
+// duration so the caller can log it; zero return means the slot index
+// was invalid and nothing was marked.
+//
+// Cooldown is adaptive based on slot's current activity and lastUsedAt:
+//   - If slot has active>0 right now (conns still holding it), or
+//     lastUsedAt is within `activeAllocationsWindow`, VK's quota is
+//     genuinely full of our allocations and we wait
+//     `vkActiveAllocationsCooldown` (11m, matching VK's ~600s TURN
+//     allocation lifetime + safety).
+//   - Otherwise the 486 is most likely residual session state from
+//     other clients on the same client_id (rare, but possible), and
+//     the shorter `vkSaturationCooldown` (3m) suffices.
+//
+// Note vpn.wifi-lte-wifi.2.log (build 60) revealed the active>0 check
+// matters: during a path change, conns die and IMMEDIATELY re-acquire
+// the slot before active ever drops to 0. lastUsedAt may never have
+// been set since cred fetch (it's only updated on active 10→0
+// transitions), so a check based purely on lastUsedAt picked
+// "ghost-likely" 3m for slots that genuinely had VK-side allocations
+// in flight from milliseconds-ago use.
+func (cp *credPool) markSaturated(slot int) time.Duration {
 	if slot < 0 {
-		return
+		return 0
 	}
 	cp.mu.Lock()
 	defer cp.mu.Unlock()
 	if slot >= cp.size || slot >= len(cp.pool) {
-		return
+		return 0
 	}
+
+	entry := cp.pool[slot]
+	age := time.Since(entry.lastUsedAt)
+	hasRecentLastUsed := !entry.lastUsedAt.IsZero() && age < activeAllocationsWindow
+
+	cooldown := vkSaturationCooldown
+	reason := "ghost-likely (no active conns and lastUsedAt not in active window)"
+	if entry.active > 0 {
+		cooldown = vkActiveAllocationsCooldown
+		reason = fmt.Sprintf("active-now (active=%d/%d, conns still hold slot)", entry.active, connsPerSlot)
+	} else if hasRecentLastUsed {
+		cooldown = vkActiveAllocationsCooldown
+		reason = fmt.Sprintf("active-recent (lastUsedAt %s ago)", age.Round(time.Second))
+	}
+	log.Printf("credpool: slot %d marked VK-saturated for %s — %s",
+		slot, cooldown.Round(time.Second), reason)
+
 	if cp.pool[slot].saturationTimer != nil {
 		cp.pool[slot].saturationTimer.Stop()
 	}
-	cp.pool[slot].saturatedUntil = time.Now().Add(duration)
-	cp.pool[slot].saturationTimer = time.AfterFunc(duration, cp.broadcastSlotAvailable)
+	cp.pool[slot].saturatedUntil = time.Now().Add(cooldown)
+	cp.pool[slot].saturationTimer = time.AfterFunc(cooldown, cp.broadcastSlotAvailable)
+	return cooldown
 }
 
 // tryFill is called by the background grower (see Proxy.growCredPool) to

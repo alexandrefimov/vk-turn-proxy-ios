@@ -390,6 +390,18 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             if desc != self.lastPathDescription {
                 self.logMsg("[PathMonitor] \(desc)")
                 self.lastPathDescription = desc
+                // Trigger an out-of-band Go-side pathstats snapshot so
+                // transient interfaces visited between the 60s pathstats
+                // ticks (e.g. ~20s on cellular during a wifi-cellular-wifi
+                // handover, see vpn.wifi-lte-wifi.1.log 2026-05-08) appear
+                // in the log stream. Cheap (one log line) and called only
+                // when the path actually changed (deduped above).
+                if self.tunnelHandle >= 0 {
+                    let label = desc
+                    label.withCString { cstr in
+                        wgLogPathSnapshot(self.tunnelHandle, cstr)
+                    }
+                }
             }
         }
         monitor.start(queue: pathMonitorQueue)

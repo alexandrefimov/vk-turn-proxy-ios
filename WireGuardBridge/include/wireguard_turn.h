@@ -84,6 +84,14 @@ void wgResume(int32_t tunnelHandle);
 /// right after unlocking the phone.
 void wgWakeHealthCheck(int32_t tunnelHandle);
 
+/// Emit one pathstats log line on demand. Called by Swift's NWPathMonitor
+/// pathUpdateHandler so transient interfaces (e.g. cellular briefly
+/// visited during a wifi-cellular-wifi handover) appear in the pathstats
+/// stream — the periodic 60s ticker can miss sub-minute transitions.
+/// @param label Free-form short string appended to "pathstats <label>"
+///              in the log line; usually the new path description.
+void wgLogPathSnapshot(int32_t tunnelHandle, const char *label);
+
 /// Provide captcha answer to unblock pending credential fetch.
 void wgSolveCaptcha(int32_t tunnelHandle, const char *answer);
 

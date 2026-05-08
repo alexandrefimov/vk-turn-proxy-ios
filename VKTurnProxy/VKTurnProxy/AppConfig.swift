@@ -37,6 +37,12 @@ struct AppConfig: Codable {
     /// extension has ever populated the cache (fresh install with no
     /// prior connect), and importers must tolerate that.
     let turnPool: CredCacheFile?
+    /// Captured-from-real-browser PoW solver profile. Optional for the
+    /// same reason as turnPool — fresh install + never-solved-captcha
+    /// state has nothing to back up. Also Optional so backups exported
+    /// before this field shipped still decode (Codable synthesised init
+    /// treats absent Optional keys as nil).
+    let vkProfile: VKProfileEntry?
 
     enum CodingKeys: String, CodingKey {
         case version
@@ -44,6 +50,7 @@ struct AppConfig: Codable {
         case exportedAt = "exported_at"
         case settings
         case turnPool = "turn_pool"
+        case vkProfile = "vk_profile"
     }
 }
 

@@ -657,6 +657,28 @@ func wgWakeHealthCheck(tunnelHandle C.int32_t) {
 	entry.proxy.WakeHealthCheck()
 }
 
+//export wgLogPathSnapshot
+//
+// Triggers a one-shot pathstats log line. Called by Swift's NWPathMonitor
+// handler on every path transition so transient interfaces (e.g. cellular
+// briefly visited during a wifi-cellular-wifi handover) appear in the
+// pathstats log stream — the periodic 60s ticker can sample at most one
+// state per minute and misses sub-minute transitions. The label argument
+// is appended to "pathstats <label>" so the caller can mark each snapshot
+// (e.g. "wifi-satisfied", "cellular-satisfied").
+func wgLogPathSnapshot(tunnelHandle C.int32_t, label *C.char) {
+	id := int32(tunnelHandle)
+	tunnelsMu.Lock()
+	entry, ok := tunnels[id]
+	tunnelsMu.Unlock()
+
+	if !ok || entry.proxy == nil {
+		return
+	}
+
+	entry.proxy.LogPathSnapshot(C.GoString(label))
+}
+
 //export wgSolveCaptcha
 func wgSolveCaptcha(tunnelHandle C.int32_t, answer *C.char) {
 	id := int32(tunnelHandle)

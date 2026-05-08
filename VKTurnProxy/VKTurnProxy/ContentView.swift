@@ -215,6 +215,7 @@ struct SettingsView: View {
     @State private var pendingImportConfig: AppConfig? = nil
     @State private var showImportConfirm = false
     @State private var showResetConfirm = false
+    @State private var showResetProfileConfirm = false
     @State private var alertMessage: String? = nil
     @State private var alertTitle: String = ""
 
@@ -307,14 +308,19 @@ struct SettingsView: View {
                 Button(role: .destructive, action: { showResetConfirm = true }) {
                     Label("Reset TURN Cache", systemImage: "trash")
                 }
+
+                Button(role: .destructive, action: { showResetProfileConfirm = true }) {
+                    Label("Reset Captured Browser Profile", systemImage: "trash")
+                }
             } header: {
                 Text("Backup & Restore")
             } footer: {
                 // Make the sensitivity explicit. Settings + WireGuard
                 // private/preshared keys + cached VK TURN credentials
-                // give whoever holds the file the same VPN access the
-                // user has — there's no encryption layer.
-                Text("Backup contains all settings, WireGuard keys, and TURN credentials. Treat the exported file as a secret.")
+                // + captured browser profile give whoever holds the file
+                // the same VPN access the user has — there's no
+                // encryption layer.
+                Text("Backup contains all settings, WireGuard keys, TURN credentials, and the captured browser profile. Treat the exported file as a secret.")
             }
         }
         .navigationTitle("Settings")
@@ -350,7 +356,8 @@ struct SettingsView: View {
             formatter.dateStyle = .medium
             formatter.timeStyle = .short
             let credCount = config.turnPool?.creds.count ?? 0
-            return Text("Backup from \(formatter.string(from: date)) with \(credCount) cached TURN cred(s). This will overwrite all current settings.")
+            let profileMark = (config.vkProfile != nil) ? " + browser profile" : ""
+            return Text("Backup from \(formatter.string(from: date)) with \(credCount) cached TURN cred(s)\(profileMark). This will overwrite all current settings.")
         }
         // Reset confirm — destructive button on the alert removes the
         // creds-pool.json. UserDefaults are untouched.
@@ -361,6 +368,18 @@ struct SettingsView: View {
             Button("Cancel", role: .cancel) {}
         } message: {
             Text("Deletes the cached TURN credentials. The pool will be rebuilt on next connect via the regular VK API + captcha flow.")
+        }
+        // Reset confirm for vk_profile.json (captured browser fingerprint).
+        // The auto-PoW solver falls back to its generated browser_fp until
+        // the next manual captcha solve in CaptchaWKWebView re-captures
+        // fresh values.
+        .alert("Reset Captured Browser Profile?", isPresented: $showResetProfileConfirm) {
+            Button("Reset", role: .destructive) {
+                handleResetProfile()
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Deletes the captured browser fingerprint used by the auto-PoW captcha solver. Until the next manual captcha solve, the solver will use generated values which VK detects as bot far more often.")
         }
         // Result alert — shared across export/import/reset success and
         // error paths since the message is what differs, not the
@@ -418,6 +437,17 @@ struct SettingsView: View {
             try BackupManager.resetTurnCache()
             alertTitle = "TURN Cache Cleared"
             alertMessage = "creds-pool.json deleted. The pool will be rebuilt on next connect."
+        } catch {
+            alertTitle = "Reset Failed"
+            alertMessage = error.localizedDescription
+        }
+    }
+
+    private func handleResetProfile() {
+        do {
+            try BackupManager.resetCapturedProfile()
+            alertTitle = "Captured Browser Profile Cleared"
+            alertMessage = "vk_profile.json deleted. The auto-PoW solver will use generated values until the next manual captcha solve re-captures fresh ones."
         } catch {
             alertTitle = "Reset Failed"
             alertMessage = error.localizedDescription
@@ -1315,21 +1345,36 @@ struct LogsView: View {
             logText = truncated(fileText)
             return
         }
-        // SharedLogger empty — App Group container is probably unreachable
-        // (this happens on improperly-resigned sideloaded IPAs and has
-        // also been reported on TestFlight builds, github issues #7/#8).
-        // Fall back to per-process os_log: main app reads its own ring
-        // buffer, then we ask the extension to read its own and ferry the
-        // text back via providerMessage. Surface a banner so the user
-        // understands the source and limitations.
+        // Empty result. Distinguish "intentionally empty" (Clear was
+        // pressed, or extension just rotated/started) from "broken"
+        // (App Group container unreachable, or the file never existed).
+        // The first case is normal user state — Clear is used routinely
+        // — and showing a fallback banner there surprises the user with
+        // os_log content unrelated to the fresh-start they just asked
+        // for. Only fall back when the file storage itself is missing.
+        let status = SharedLogger.shared.inspectStorage()
+        if status.hasContainer && status.currentExists {
+            usingOSLogFallback = false
+            // Wipe stale fallback cache so a subsequent failure path
+            // doesn't render leftover content.
+            fallbackText = ""
+            fallbackFetchedAt = .distantPast
+            logText = "(log is empty — waiting for new activity)"
+            return
+        }
+
+        // Genuine fallback: no container (entitlement / provisioning
+        // issue) or file never existed (fresh install before any
+        // SharedLogger.log call landed). Read per-process os_log: main
+        // app reads its own ring buffer, extension reads its own via
+        // providerMessage. Surface a banner explaining the source.
         //
         // Both the OSLogStore query and the providerMessage round-trip
         // can take hundreds of milliseconds each — running them on every
         // 2-second timer tick on the main thread caused noticeable UI
-        // lag (especially after Clear, which keeps the file empty and
-        // forces this path). So: cache the result for `fallbackTTL`
-        // seconds, refresh in a background task, and only one fetch may
-        // be in flight at a time.
+        // lag. So: cache the result for `fallbackTTL` seconds, refresh
+        // in a background task, and only one fetch may be in flight at
+        // a time.
         usingOSLogFallback = true
 
         // Show last-cached content immediately if we have any; otherwise
@@ -1352,18 +1397,36 @@ struct LogsView: View {
             let mainAppLogs = OSLogReader.readOwnLogs(maxAge: 1800)
             let extensionLogs = await tunnel.fetchExtensionOSLogs() ?? ""
 
+            // Pick a precise banner reason from SharedLogger storage state
+            // instead of conflating "container unavailable" with "file empty"
+            // and "file unreadable" — each has a different cause and remedy.
+            // Also include container path so the reader can compare with
+            // wgSetLogFilePath in the extension's os_log output (mismatching
+            // paths would indicate a provisioning/entitlement skew between
+            // main app and extension processes).
+            let status = SharedLogger.shared.inspectStorage()
+            let reason: String
+            if !status.hasContainer {
+                reason = "App Group container unavailable to main app (entitlement missing or provisioning issue)"
+            } else if !status.currentExists && !status.archivedExists {
+                reason = "Log file doesn't exist yet at \(status.containerPath)/vpn.log (fresh install or container reset)"
+            } else if status.currentBytes == 0 && status.archivedBytes <= 0 {
+                reason = "Log file is empty (\(status.containerPath)/vpn.log: 0 bytes; recently cleared, or extension hasn't written since clear)"
+            } else if status.currentBytes < 0 {
+                reason = "Log file unreadable despite existing (\(status.containerPath)/vpn.log; permissions / corruption?)"
+            } else {
+                reason = "Log file present but readLogs returned empty (current=\(status.currentBytes)B, archived=\(status.archivedBytes)B at \(status.containerPath))"
+            }
+
             var combined = mainAppLogs + extensionLogs
             if combined.isEmpty {
-                combined = "No logs available.\n\n" +
-                    "The on-disk log file is empty (App Group container " +
-                    "unreachable) and the os_log fallback also returned " +
-                    "nothing — likely the extension was just (re)started " +
-                    "and hasn't logged anything since. Try again in a few " +
-                    "seconds, or reconnect the tunnel."
+                combined = "No logs available.\n\nReason: \(reason)\n\n" +
+                    "Try reconnecting the tunnel, or — if the issue persists — " +
+                    "Reset TURN Cache and reconnect to force a fresh log session."
             } else {
-                combined = "⚠️ App Group container unavailable — showing " +
-                    "os_log fallback (recent ~30 min only, " +
-                    "may be incomplete and out of order).\n\n" +
+                combined = "⚠️ Showing os_log fallback (recent ~30 min only, " +
+                    "may be incomplete and out of order).\n" +
+                    "Reason: \(reason)\n\n" +
                     combined
             }
 

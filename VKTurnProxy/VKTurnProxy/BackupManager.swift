@@ -109,12 +109,19 @@ enum BackupManager {
             turnPool = decoded
         }
 
+        // Captured browser profile (vk_profile.json). Optional — fresh
+        // installs without any solved captcha won't have it. Skipped
+        // silently on missing/corrupt file so the rest of the export
+        // still produces a usable backup.
+        let vkProfile = VKProfileCache.load()
+
         return AppConfig(
             version: supportedConfigVersion,
             type: "full",
             exportedAt: Int64(Date().timeIntervalSince1970),
             settings: settings,
-            turnPool: turnPool
+            turnPool: turnPool,
+            vkProfile: vkProfile
         )
     }
 
@@ -258,6 +265,24 @@ enum BackupManager {
             throw BackupError.writeFailed("write creds-pool.json: \(error.localizedDescription)")
         }
         SharedLogger.shared.log("[AppDebug] Backup: restored creds-pool.json with \(pool.creds.count) slots")
+
+        // Captured browser profile: write only if the backup contained one.
+        // Same nil-tolerance reasoning as turn_pool — older backups
+        // exported before the field shipped just leave the existing
+        // vk_profile.json (if any) alone. Failure here is logged but
+        // doesn't abort the import: the worst case is a stale or absent
+        // profile, which the auto-solver tolerates by falling back to
+        // generated browser_fp.
+        if let entry = config.vkProfile {
+            do {
+                try VKProfileCache.applyFromBackup(entry)
+                SharedLogger.shared.log("[AppDebug] Backup: restored vk_profile.json (device=\(entry.device.count)c, browser_fp=\(entry.browser_fp.count)c)")
+            } catch {
+                SharedLogger.shared.log("[AppDebug] Backup: vk_profile.json write failed (non-fatal): \(error.localizedDescription)")
+            }
+        } else {
+            SharedLogger.shared.log("[AppDebug] Backup: vk_profile absent in backup, leaving vk_profile.json unchanged")
+        }
     }
 
     // MARK: - Reset TURN Cache
@@ -280,5 +305,16 @@ enum BackupManager {
         } catch {
             throw BackupError.writeFailed("delete creds-pool.json: \(error.localizedDescription)")
         }
+    }
+
+    // MARK: - Reset Captured Browser Profile
+
+    /// Deletes vk_profile.json. The auto-PoW solver will fall back to
+    /// its generated browser_fp + canned device descriptor, with the
+    /// pre-build-55 BOT-detection rate (~6%) — until the next manual
+    /// captcha solve in CaptchaWKWebView re-captures fresh values.
+    /// Idempotent same way as resetTurnCache.
+    static func resetCapturedProfile() throws {
+        try VKProfileCache.delete()
     }
 }
