@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 import NetworkExtension
 import WebKit
 import UniformTypeIdentifiers
@@ -219,6 +220,15 @@ struct SettingsView: View {
     @State private var alertMessage: String? = nil
     @State private var alertTitle: String = ""
 
+    // 1-Click Connection Link import. Same flow as Full Backup but with
+    // a separate state pair so a user juggling both never gets confusing
+    // alert collisions. The inbox observes vkturnproxy:// URL deliveries
+    // from App.onOpenURL — see VKTurnProxyApp.swift for the producer side
+    // and the .onAppear/.onChange handlers further down for the consumer.
+    @State private var pendingConnectionLink: ConnectionLink? = nil
+    @State private var showConnectionLinkConfirm = false
+    @StateObject private var connectionLinkInbox = ConnectionLinkInbox.shared
+
     var body: some View {
         Form {
             Section("VK TURN Proxy") {
@@ -305,6 +315,16 @@ struct SettingsView: View {
                     Label("Import Full Backup…", systemImage: "square.and.arrow.down")
                 }
 
+                // 1-Click connection link. Reads a vkturnproxy://… URL
+                // (or its bare base64 payload) from the system clipboard.
+                // The same parse path also runs from .onOpenURL when the
+                // user taps a vkturnproxy:// URL anywhere on iOS — see
+                // VKTurnProxyApp.swift. quick_link.py at the repo root
+                // is the generator script.
+                Button(action: handleConnectionLinkPaste) {
+                    Label("Import from Connection Link…", systemImage: "link.badge.plus")
+                }
+
                 Button(role: .destructive, action: { showResetConfirm = true }) {
                     Label("Reset TURN Cache", systemImage: "trash")
                 }
@@ -331,11 +351,19 @@ struct SettingsView: View {
         .sheet(item: $exportURL) { wrapped in
             ShareSheet(activityItems: [wrapped.url])
         }
-        // Document picker for Import. Filtering on .json keeps random
-        // unrelated files out of the picker — the AppConfig decode would
-        // reject them anyway, but the friendly hint is nicer.
+        // Document picker for Import. Three UTTypes accepted:
+        //   .json — explicit application/json files
+        //   .text — JSON conforms to text/plain; covers cases where iOS
+        //           Files lost the .json UTI (e.g. transferred via AirDrop
+        //           or Mail and arrived as text/plain)
+        //   .data — generic binary; final fallback for any file iOS marks
+        //           ambiguously. The AppConfig decode rejects non-matching
+        //           content, so widening the picker filter is safe.
+        // Originally was [.json] alone but issue #8 author reported
+        // their previously-exported backup file was greyed-out / not
+        // tappable in the document picker (2026-05-09).
         .sheet(isPresented: $showImportPicker) {
-            DocumentPicker(contentTypes: [.json]) { url in
+            DocumentPicker(contentTypes: [.json, .text, .data]) { url in
                 handleImportPicked(url: url)
             }
         }
@@ -358,6 +386,26 @@ struct SettingsView: View {
             let credCount = config.turnPool?.creds.count ?? 0
             let profileMark = (config.vkProfile != nil) ? " + browser profile" : ""
             return Text("Backup from \(formatter.string(from: date)) with \(credCount) cached TURN cred(s)\(profileMark). This will overwrite all current settings.")
+        }
+        // Connection link confirm — same shape as the full-backup import
+        // alert but applies only the deployment definition (WG keys,
+        // vkLink, peerAddress, WRAP key, etc.) without touching the TURN
+        // cache or captured browser profile.
+        .alert("Import Connection Link?", isPresented: $showConnectionLinkConfirm, presenting: pendingConnectionLink) { link in
+            Button("Import", role: .destructive) {
+                applyPendingConnectionLink(link)
+            }
+            Button("Cancel", role: .cancel) {
+                pendingConnectionLink = nil
+            }
+        } message: { link in
+            let s = link.settings
+            let extras = [
+                s.numConnections.map { "\($0) conns" },
+                s.dnsServers.map { "DNS \($0)" }
+            ].compactMap { $0 }.joined(separator: ", ")
+            let extrasText = extras.isEmpty ? "" : " (\(extras))"
+            return Text("Apply settings for \(s.peerAddress)\(extrasText)? This overwrites your WireGuard keys, server, vkLink and WRAP key.")
         }
         // Reset confirm — destructive button on the alert removes the
         // creds-pool.json. UserDefaults are untouched.
@@ -392,6 +440,25 @@ struct SettingsView: View {
         } message: {
             if let msg = alertMessage {
                 Text(msg)
+            }
+        }
+        // Pull a pending vkturnproxy:// URL out of the inbox. Two paths:
+        //   • Cold launch via URL-tap — App.onOpenURL stored the URL
+        //     before SettingsView mounted; this onAppear catches it.
+        //   • Warm app already on SettingsView — onChange fires when
+        //     the inbox publishes a new URL.
+        // Both paths consume (set pendingURL = nil) so re-entering
+        // SettingsView doesn't replay an already-handled URL.
+        .onAppear {
+            if let url = connectionLinkInbox.pendingURL {
+                handleConnectionLinkURL(url)
+                connectionLinkInbox.pendingURL = nil
+            }
+        }
+        .onChange(of: connectionLinkInbox.pendingURL) { newURL in
+            if let url = newURL {
+                handleConnectionLinkURL(url)
+                connectionLinkInbox.pendingURL = nil
             }
         }
     }
@@ -431,6 +498,56 @@ struct SettingsView: View {
             alertMessage = error.localizedDescription
         }
     }
+
+    // MARK: - Connection Link actions
+
+    /// Reads a vkturnproxy:// link (or its bare base64 payload) from
+    /// the system clipboard, parses it, and routes the result into the
+    /// confirm alert. Empty or wrong-shape clipboard surfaces as a
+    /// single error alert; success populates pendingConnectionLink
+    /// and shows the confirm alert.
+    private func handleConnectionLinkPaste() {
+        let raw = UIPasteboard.general.string ?? ""
+        if raw.isEmpty {
+            alertTitle = "Clipboard Empty"
+            alertMessage = "Copy a vkturnproxy://… link to the clipboard first, then tap this again."
+            return
+        }
+        do {
+            let link = try BackupManager.parseConnectionLinkString(raw)
+            pendingConnectionLink = link
+            showConnectionLinkConfirm = true
+        } catch {
+            alertTitle = "Connection Link Invalid"
+            alertMessage = error.localizedDescription
+        }
+    }
+
+    /// Counterpart of handleConnectionLinkPaste for the inbox / URL-open
+    /// path. Same parse → confirm logic; takes a URL the system
+    /// delivered instead of a clipboard string.
+    private func handleConnectionLinkURL(_ url: URL) {
+        do {
+            let link = try BackupManager.parseConnectionLink(from: url)
+            pendingConnectionLink = link
+            showConnectionLinkConfirm = true
+        } catch {
+            alertTitle = "Connection Link Invalid"
+            alertMessage = error.localizedDescription
+        }
+    }
+
+    /// Apply the parsed link to UserDefaults. Doesn't touch creds-pool
+    /// or vk_profile (those are device-specific state); the user's
+    /// existing TURN cache and browser profile, if any, stay in place.
+    private func applyPendingConnectionLink(_ link: ConnectionLink) {
+        BackupManager.applyConnectionLink(link)
+        pendingConnectionLink = nil
+        alertTitle = "Connection Link Imported"
+        alertMessage = "Settings applied. Reconnect to use them."
+    }
+
+    // MARK: - Reset actions
 
     private func handleReset() {
         do {

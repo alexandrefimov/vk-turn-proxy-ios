@@ -84,3 +84,60 @@ struct AppSettings: Codable {
     /// match the server's -wrap-key. Optional for back-compat.
     let wrapKeyHex: String?
 }
+
+// MARK: - 1-Click Connection Link
+//
+// Lightweight payload sibling to AppConfig used for the 1-Click import
+// feature. Encoded as base64 inside `vkturnproxy://import?data=…` URLs
+// (or raw on the clipboard) so a server admin can hand a fresh device
+// the entire deployment definition in one tap.
+//
+// Deliberately a SEPARATE struct from AppConfig/AppSettings — does NOT
+// reuse them — so that:
+//   • Connection links don't accidentally leak the TURN credential cache
+//     or the captured browser profile (those belong to the device, not
+//     the deployment).
+//   • Field requirements differ from full backups: dnsServers and
+//     numConnections are optional in a link (the receiving device keeps
+//     its current value if absent), whereas in a full backup they're
+//     always present. credPoolCooldownSeconds is excluded entirely from
+//     links — it's an internal tuning knob nobody should override at
+//     onboarding time.
+//
+// Schema version is shared with AppConfig (BackupManager.supportedConfigVersion)
+// so a new schema version invalidates BOTH backup files and connection
+// links uniformly.
+
+struct ConnectionLink: Codable {
+    let version: Int
+    /// Always "connection" for link payloads. Distinguishes from
+    /// AppConfig's "full" so the parser can early-reject mismatched
+    /// inputs (e.g. user accidentally pastes a full-backup base64 here).
+    let type: String
+    let settings: ConnectionSettings
+}
+
+/// Subset of AppSettings that defines a deployment. WG keys + server
+/// address + vkLink + WRAP key are all required; per-device tunables
+/// (dnsServers, numConnections) are optional.
+struct ConnectionSettings: Codable {
+    let privateKey: String
+    let peerPublicKey: String
+    let presharedKey: String
+    let tunnelAddress: String
+    let allowedIPs: String
+    let vkLink: String
+    let peerAddress: String
+    let useDTLS: Bool
+    let useWrap: Bool
+    let wrapKeyHex: String
+    /// Optional: if absent, the importing device keeps its current
+    /// dnsServers value (or the AppStorage default of "1.1.1.1" if
+    /// never set). Always set on apply when present.
+    let dnsServers: String?
+    /// Optional: if absent, the importing device keeps its current
+    /// numConnections (default 30). Useful for an admin to ship a
+    /// "recommended for this deployment" hint while still letting
+    /// users tune later.
+    let numConnections: Int?
+}

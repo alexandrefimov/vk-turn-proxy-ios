@@ -317,4 +317,97 @@ enum BackupManager {
     static func resetCapturedProfile() throws {
         try VKProfileCache.delete()
     }
+
+    // MARK: - 1-Click Connection Link
+
+    /// Parses a `vkturnproxy://import?data=<base64>` URL. The system
+    /// hands one of these to .onOpenURL whenever the user taps a link
+    /// with the registered scheme. Throws on any structural error so
+    /// the caller can show a single "Connection Link Invalid" alert
+    /// with the underlying message.
+    static func parseConnectionLink(from url: URL) throws -> ConnectionLink {
+        guard url.scheme?.lowercased() == "vkturnproxy" else {
+            throw BackupError.decodeFailed("URL scheme is not vkturnproxy://")
+        }
+        // Accept both vkturnproxy://import?data=… and the looser
+        // vkturnproxy:?data=… form. URL.host is "import" for the first
+        // and nil for the second; both should work.
+        if let host = url.host, host.lowercased() != "import" {
+            throw BackupError.decodeFailed("URL host must be 'import' (got '\(host)')")
+        }
+        guard let comps = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              let dataItem = comps.queryItems?.first(where: { $0.name == "data" }),
+              let b64 = dataItem.value, !b64.isEmpty else {
+            throw BackupError.decodeFailed("URL is missing the 'data' query parameter")
+        }
+        return try parseConnectionLinkBase64(b64)
+    }
+
+    /// Same as parseConnectionLink(from:) but takes the raw clipboard
+    /// string. Tolerant of either a full URL ("vkturnproxy://…") or a
+    /// bare base64 blob — the user might have copied either form.
+    static func parseConnectionLinkString(_ raw: String) throws -> ConnectionLink {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let url = URL(string: trimmed), url.scheme?.lowercased() == "vkturnproxy" {
+            return try parseConnectionLink(from: url)
+        }
+        // No URL prefix — treat input as raw base64.
+        return try parseConnectionLinkBase64(trimmed)
+    }
+
+    /// Decodes a base64 string (standard or url-safe, with or without
+    /// padding) into the ConnectionLink JSON. Common bottom layer for
+    /// both URL- and clipboard-string entry points.
+    private static func parseConnectionLinkBase64(_ b64Input: String) throws -> ConnectionLink {
+        // Normalise to standard base64 with padding before Foundation's
+        // Data(base64Encoded:) — it's strict about both.
+        var b64 = b64Input.replacingOccurrences(of: "-", with: "+")
+                          .replacingOccurrences(of: "_", with: "/")
+        let padNeeded = (4 - b64.count % 4) % 4
+        b64 += String(repeating: "=", count: padNeeded)
+        guard let data = Data(base64Encoded: b64) else {
+            throw BackupError.decodeFailed("Invalid base64 in connection link")
+        }
+        let link: ConnectionLink
+        do {
+            link = try JSONDecoder().decode(ConnectionLink.self, from: data)
+        } catch {
+            throw BackupError.decodeFailed("Connection link JSON: \(error.localizedDescription)")
+        }
+        if link.version != supportedConfigVersion {
+            throw BackupError.versionMismatch(link.version)
+        }
+        if link.type != "connection" {
+            throw BackupError.decodeFailed("Expected type=connection, got '\(link.type)'")
+        }
+        return link
+    }
+
+    /// Applies the ConnectionLink to UserDefaults. Does NOT touch
+    /// creds-pool.json or vk_profile.json — those belong to the
+    /// receiving device and rebuild themselves on first connect after
+    /// the new settings take effect. Optional fields (dnsServers,
+    /// numConnections) only overwrite when present in the link;
+    /// absent values preserve whatever the device already had.
+    static func applyConnectionLink(_ link: ConnectionLink) {
+        let d = UserDefaults.standard
+        let s = link.settings
+        d.set(s.privateKey, forKey: "privateKey")
+        d.set(s.peerPublicKey, forKey: "peerPublicKey")
+        d.set(s.presharedKey, forKey: "presharedKey")
+        d.set(s.tunnelAddress, forKey: "tunnelAddress")
+        d.set(s.allowedIPs, forKey: "allowedIPs")
+        d.set(s.vkLink, forKey: "vkLink")
+        d.set(s.peerAddress, forKey: "peerAddress")
+        d.set(s.useDTLS, forKey: "useDTLS")
+        d.set(s.useWrap, forKey: "useWrap")
+        d.set(s.wrapKeyHex, forKey: "wrapKeyHex")
+        if let v = s.dnsServers { d.set(v, forKey: "dnsServers") }
+        if let v = s.numConnections { d.set(v, forKey: "numConnections") }
+        // Truncate vkLink and peerAddress in the log so we don't dump
+        // long token URLs into a file the user might share for triage.
+        let nc = s.numConnections.map(String.init) ?? "(kept default)"
+        let dn = s.dnsServers ?? "(kept default)"
+        SharedLogger.shared.log("[AppDebug] Backup: applied connection link (peer=\(s.peerAddress), useDTLS=\(s.useDTLS), useWrap=\(s.useWrap), numConnections=\(nc), dnsServers=\(dn))")
+    }
 }

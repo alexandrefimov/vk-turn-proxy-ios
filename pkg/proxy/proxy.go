@@ -1132,27 +1132,30 @@ func (p *Proxy) runWatchdog() {
 				}
 			}
 
-			// Condition 2: Silent partial degradation — pion is logging
-			// permission or channel-binding refresh failures but the surviving
-			// clients keep lastRecvTime fresh, so condition 1 never trips.
-			// Trigger if we've accumulated enough errors AND they have been
-			// persisting for at least 90 seconds (avoids reacting to a single
-			// flaky cycle).
+			// Condition 2 removed in build 66 (2026-05-09).
 			//
-			// Threshold 5 is tuned from observed vpn11.log: at 1 real VK
-			// rejection per 2-min permission refresh cycle, threshold 10
-			// took 16+ minutes to trigger (8 cycles to accumulate), leaving
-			// the tunnel broken too long before recovery. Threshold 5 cuts
-			// that to ~8 minutes, which is still slow enough to ignore a
-			// single transient cycle but fast enough to actually matter.
-			pionErrs := p.pionTransientErrors.Load()
-			firstErr := p.firstPionErrorTime.Load()
-			if pionErrs >= 5 && firstErr > 0 && time.Since(time.Unix(firstErr, 0)) > 90*time.Second {
-				log.Printf("proxy: watchdog — %d pion permission/binding errors over %s, tunnel silently degraded, forcing reconnect",
-					pionErrs, time.Since(time.Unix(firstErr, 0)).Round(time.Second))
-				p.ForceReconnect()
-				continue
-			}
+			// Was: "5+ pion permission/binding errors AND first error
+			// >90s ago → ForceReconnect", originally tuned to catch slow
+			// silent degradation from vpn11.log where ~1 real VK rejection
+			// per 2-min refresh cycle accumulated over many cycles.
+			//
+			// Removed because the counter was monotonic with no natural
+			// decay: a single burst of post-wake errors (60+ in seconds
+			// from late refresh responses + permission re-establishment)
+			// would meet the threshold, and 90 seconds later — well after
+			// new conns had recovered and started carrying traffic — the
+			// watchdog would fire and kill the just-restored conns.
+			//
+			// Empirically across 5 observed incidents (vpn.wifi.0.log
+			// 2026-05-09 02:40 / 03:53 / 04:13 / 07:04 + vpn.wifi.7.log
+			// 2026-05-08): all 5 were false positives killing just-
+			// recovered conns after iOS-wake bursts. Zero true positives.
+			//
+			// pionTransientErrors counter is kept incrementing (line ~3169)
+			// for future diagnosis but no longer drives any action. If
+			// silent-degradation patterns resurface, reintroduce with
+			// per-conn error tagging that expires on conn death, OR
+			// sliding window with natural decay — NOT a monotonic counter.
 
 			// Condition 3: Zero active connections for too long.
 			// Conditions 1 and 2 both require active>0, so a hard
