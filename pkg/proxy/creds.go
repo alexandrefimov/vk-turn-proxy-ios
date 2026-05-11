@@ -2238,6 +2238,26 @@ func (cp *credPool) logFreshTransitionsLocked() {
 				}
 			}
 			log.Printf("credpool: slot %d transitioned out of fresh — %s", slot, reason)
+		} else if !wasFresh && nowFresh {
+			// Symmetric to the fresh→not-fresh branch: log when a slot
+			// silently becomes fresh. Most common cause: load-from-disk
+			// pending state elapsing (availableAt crossed). Also covers
+			// cases where seedSlot / background-fill produced a fresh
+			// cred between ticks (those paths log their own success
+			// line, so this is mildly redundant for them — accepted as
+			// "all transitions visible" beats "guess from absence").
+			e := cp.pool[slot]
+			reason := "unknown"
+			switch {
+			case e.creds == nil:
+				reason = "creds appeared (race; check seedSlot/background fill log)"
+			case !e.availableAt.IsZero() && !now.Before(e.availableAt):
+				elapsed := now.Sub(e.availableAt).Round(time.Second)
+				reason = fmt.Sprintf("load-cooldown elapsed (became usable %s ago)", elapsed)
+			default:
+				reason = "creds became valid (seeded or background-filled)"
+			}
+			log.Printf("credpool: slot %d transitioned to fresh — %s", slot, reason)
 		}
 		cp.freshLastTick[slot] = nowFresh
 	}
