@@ -359,19 +359,31 @@ struct SettingsView: View {
         .sheet(item: $exportURL) { wrapped in
             ShareSheet(activityItems: [wrapped.url])
         }
-        // Document picker for Import. Three UTTypes accepted:
+        // Document picker for Import. Four UTTypes accepted:
         //   .json — explicit application/json files
         //   .text — JSON conforms to text/plain; covers cases where iOS
         //           Files lost the .json UTI (e.g. transferred via AirDrop
         //           or Mail and arrived as text/plain)
-        //   .data — generic binary; final fallback for any file iOS marks
-        //           ambiguously. The AppConfig decode rejects non-matching
-        //           content, so widening the picker filter is safe.
-        // Originally was [.json] alone but issue #8 author reported
-        // their previously-exported backup file was greyed-out / not
-        // tappable in the document picker (2026-05-09).
+        //   .data — generic binary fallback
+        //   .item — root UTI of EVERYTHING. Accepts even files that iOS
+        //           classified with a dynamic UTI (dyn.ah62d4rv4...) —
+        //           that happens when a file was transferred via apps
+        //           that strip UTI metadata or when iOS-version-specific
+        //           detection bugs misclassify a perfectly valid JSON.
+        //
+        // Filter history:
+        //   build 67: [.json] → [.json, .text, .data] after issue #8
+        //             reporter saw greyed-out file (2026-05-09)
+        //   build 80: + .item after the same reporter confirmed the
+        //             three-type widening still didn't unblock his
+        //             backup (2026-05-12). Per UTType hierarchy,
+        //             everything conforms to .item, so the picker now
+        //             accepts any file. BackupManager.importFromFileURL
+        //             rejects non-AppConfig content with a clear error,
+        //             so the cost is one wasted error alert if the user
+        //             picks a wrong file.
         .sheet(isPresented: $showImportPicker) {
-            DocumentPicker(contentTypes: [.json, .text, .data]) { url in
+            DocumentPicker(contentTypes: [.json, .text, .data, .item]) { url in
                 handleImportPicked(url: url)
             }
         }
