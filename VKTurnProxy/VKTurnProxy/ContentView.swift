@@ -62,8 +62,20 @@ struct ContentView: View {
                     // Connect / Disconnect button
                     Button(action: {
                         if tunnel.status == .connected || tunnel.status == .connecting {
+                            // Log user-initiated stop so we can later distinguish
+                            // "user pressed Disconnect" from iOS-side stops with
+                            // the same reason=1 (.userInitiated) NEProviderStopReason.
+                            // iOS occasionally fires stopTunnel(reason=1) for non-
+                            // user-initiated reasons (network change with
+                            // includeAllNetworks=true being the suspected case);
+                            // having this log line lets us differentiate at triage
+                            // time rather than guessing.
+                            NSLog("[UI] user pressed Disconnect button (status=\(tunnel.status.rawValue))")
+                            SharedLogger.shared.log("[UI] user pressed Disconnect button (status=\(tunnel.status.rawValue))")
                             tunnel.disconnect()
                         } else {
+                            NSLog("[UI] user pressed Connect button (status=\(tunnel.status.rawValue))")
+                            SharedLogger.shared.log("[UI] user pressed Connect button (status=\(tunnel.status.rawValue))")
                             let config = TunnelConfig(
                                 privateKey: privateKey,
                                 peerPublicKey: peerPublicKey,
