@@ -792,6 +792,21 @@ type credPool struct {
 	// killer fires", and the cred should have been invalidated proactively.
 	authErrors []atomic.Int64
 
+	// freshLastTick records the entryIsFresh result per slot at the last
+	// runPeriodicSave tick. logFreshTransitionsLocked compares current
+	// against this snapshot and emits a log line for slots that flipped
+	// out of fresh — these transitions are otherwise invisible because
+	// entryIsFresh is a pure function whose result silently changes when
+	// time.Now() crosses the credExpiryBuffer threshold relative to the
+	// VK-encoded cred expiry. Without this log line, the UI's "available"
+	// count drops without any explanation in the log stream (observed in
+	// vpn.wifi-lte-wifi.1.log on 2026-05-12 — Pool went 8→7→6 over a
+	// minute with zero markSaturated events because slots 9 and 11 were
+	// crossing their 30m expiry-buffer thresholds silently).
+	//
+	// Kept under cp.mu like the rest of pool state.
+	freshLastTick []bool
+
 	// fetch is the underlying credential fetcher. It must do all the work
 	// previously inlined in resolveTURNAddr: build solver + pending-captcha
 	// params, call GetVKCreds, parse TURN host:port, publish turnServerIP.
@@ -1118,6 +1133,12 @@ func (cp *credPool) runPeriodicSave(ctx context.Context) {
 	for {
 		select {
 		case <-ticker.C:
+			// Surface silent fresh→not-fresh transitions BEFORE saving.
+			// Brief locked block; saveToDisk takes its own locks so we
+			// release cp.mu first to avoid nesting.
+			cp.mu.Lock()
+			cp.logFreshTransitionsLocked()
+			cp.mu.Unlock()
 			cp.saveToDisk()
 		case <-ctx.Done():
 			// Final save on shutdown so any in-memory lastUsedAt
@@ -2070,6 +2091,65 @@ func (cp *credPool) countAvailableLocked() int {
 		}
 	}
 	return n
+}
+
+// logFreshTransitionsLocked compares per-slot entryIsFresh against the
+// snapshot stored in freshLastTick from the previous runPeriodicSave
+// tick. For each slot that just transitioned fresh→not-fresh, emits a
+// log line with the inferred reason. Then refreshes freshLastTick for
+// the next tick. Caller MUST hold cp.mu.
+//
+// Reason inference (priority order):
+//   - "cred removed" — entry has no creds (e.g. background grower
+//     cleared the slot)
+//   - "load-pending" — availableAt is in the future (load-cooldown)
+//   - "unparseable cred expiry" — parseCredExpiry failed
+//   - "expiring within Xm buffer" — cred expiry is closer than
+//     credExpiryBuffer (typically 30 min)
+//   - "unknown" — fallthrough, none of the above (shouldn't happen
+//     in practice)
+//
+// Note: smart-pause / 486 saturation does NOT trigger this log line
+// because entryIsFresh doesn't check saturatedUntil — only
+// entryIsAvailable does. Saturation events have their own log line
+// from markSaturated/applySaturationLocked.
+func (cp *credPool) logFreshTransitionsLocked() {
+	// Resize snapshot on first run or after pool growth. On first run
+	// we just snapshot current state without logging — there's no
+	// "transition" to report when we have no history.
+	if len(cp.freshLastTick) != len(cp.pool) {
+		cp.freshLastTick = make([]bool, len(cp.pool))
+		for i := range cp.pool {
+			cp.freshLastTick[i] = entryIsFresh(cp.pool[i])
+		}
+		return
+	}
+	now := time.Now()
+	for slot := range cp.pool {
+		wasFresh := cp.freshLastTick[slot]
+		nowFresh := entryIsFresh(cp.pool[slot])
+		if wasFresh && !nowFresh {
+			e := cp.pool[slot]
+			reason := "unknown"
+			switch {
+			case e.creds == nil:
+				reason = "cred removed"
+			case !e.availableAt.IsZero() && now.Before(e.availableAt):
+				reason = fmt.Sprintf("moved to load-pending state (usable in %s)",
+					time.Until(e.availableAt).Round(time.Second))
+			default:
+				if exp, ok := parseCredExpiry(e.creds.Username); !ok {
+					reason = "unparseable cred expiry"
+				} else if !now.Add(credExpiryBuffer).Before(exp) {
+					remaining := time.Until(exp).Round(time.Second)
+					reason = fmt.Sprintf("cred expiring within %s buffer (cred expires in %s)",
+						credExpiryBuffer, remaining)
+				}
+			}
+			log.Printf("credpool: slot %d transitioned out of fresh — %s", slot, reason)
+		}
+		cp.freshLastTick[slot] = nowFresh
+	}
 }
 
 // countWithCredsLocked assumes cp.mu is held. Counts slots that hold a
