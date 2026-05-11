@@ -21,10 +21,18 @@ struct TunnelStats: Codable {
     // missed saturatedUntil and showed misleading "8/8/8" when all
     // slots were locked, vpn.wifi-lte-wifi.1.log 2026-05-10).
     var credPoolFilled: Int32 = 0
-    // Slots physically holding a cred — superset of credPoolFilled.
-    // Includes saturated, pending and past-expiry-buffer slots. Used by
-    // the StatsView middle number so the user can tell apart "cred is
-    // gone" from "cred is here but locked / aging out".
+    // Slots whose cred is still WITHIN the expiry buffer (not expired,
+    // not within ~30m of expiring). Includes saturated and load-pending
+    // slots — those will recover on their own. Excludes slots with
+    // expired or expiring-soon creds, since the background grower
+    // would need a successful PoW to refresh them.
+    //
+    // Field name is legacy ("WithCreds") — semantic was tightened in
+    // build 82 to "WithUsableCreds" after vpn.wifi-lte-wifi.1.log on
+    // 2026-05-12 showed "6/12/12" while 6 of those 12 slots held
+    // expired creds the grower had been failing to refresh for 26+
+    // minutes (PoW rate-limited by VK). The looser "any cred" semantic
+    // misled the user into thinking the pool was healthier than it was.
     var credPoolWithCreds: Int32 = 0
     var credPoolSize: Int32 = 0
     // Seconds since the extension's Proxy was created. Source of truth

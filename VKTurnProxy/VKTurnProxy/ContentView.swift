@@ -684,21 +684,26 @@ struct StatsView: View {
                     )
                 }
                 StatBox(
-                    // Three numbers: available / with-creds / total.
+                    // Three numbers: available / with-usable-creds / total.
                     //   available: slots usable for new conn allocations
                     //              RIGHT NOW — fresh creds AND not in a
                     //              VK-saturation cooldown (e.g. from
                     //              smart-pause after a path change).
-                    //   with-creds: slots physically holding a cred,
-                    //               including saturated, stale (past
-                    //               expiry buffer) or pending ones —
-                    //               existing conns on those slots stay
-                    //               alive but new allocations are blocked.
+                    //   with-usable-creds: slots whose cred hasn't crossed
+                    //                      the expiry buffer. Includes
+                    //                      saturated and load-pending
+                    //                      (those recover on their own);
+                    //                      EXCLUDES slots whose creds
+                    //                      expired and the grower is
+                    //                      failing to refresh.
                     //   total: configured pool capacity.
-                    // available ≤ with-creds ≤ total. After a back-to-back
-                    // path transition all slots can become saturated,
-                    // showing e.g. "0/12/12" until the first smart-pause
-                    // cooldown expires (~10 min).
+                    // available ≤ with-usable-creds ≤ total. After a
+                    // back-to-back path transition all slots can become
+                    // saturated, showing e.g. "0/12/12" until the first
+                    // smart-pause cooldown expires (~10 min). When the
+                    // middle number drops below total, some slots have
+                    // dead creds and the grower can't refresh them
+                    // (typically PoW rate-limited).
                     title: "Pool",
                     value: "\(tunnel.stats.credPoolFilled)/\(tunnel.stats.credPoolWithCreds)/\(tunnel.stats.credPoolSize)",
                     sub: nil

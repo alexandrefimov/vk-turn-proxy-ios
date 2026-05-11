@@ -731,6 +731,24 @@ const vkActiveAllocationsCooldown = 11 * time.Minute
 // were active any time in the last 10m, the lifetime hasn't run out.
 const activeAllocationsWindow = 10 * time.Minute
 
+// pauseAcquireAfterPathEvent is how long credPool.get() returns "paused"
+// after each wgPathChanged call. iOS fires PathMonitor events in pairs
+// on every physical interface swap (unsatisfied old-iface + satisfied
+// new-iface) typically 130-365ms apart. Without this pause, conns dying
+// from kernel error after the first event acquire fresh slots in the
+// gap, then the second event's smart-pause catches those newly-active
+// slots — burning 1 extra slot per transition (vpn.wifi-lte.0.log
+// 2026-05-12 15:44:36-37: pool 6→2 instead of expected 6→3 on a single
+// WiFi→LTE; slot 6 caught at the cellular-satisfied event because
+// conns 27/22/23 had already migrated to it during the 356ms gap).
+//
+// 500ms covers typical iOS dual-event gap with margin. Pause is
+// refreshed (extended) on each smart-pause call so longer event
+// sequences keep the pool quiet through the whole transition. Conn
+// retry loops see "credpool: paused for path-change settle" and back
+// off, returning to acquire when the pause naturally expires.
+const pauseAcquireAfterPathEvent = 500 * time.Millisecond
+
 // credCacheFile is the JSON-on-disk shape persisted to App Group container.
 // One file per pool. Contents are non-secret: VK TURN creds are session
 // tokens with ~8h validity, sandbox-protected by App Group entitlement.
@@ -806,6 +824,15 @@ type credPool struct {
 	//
 	// Kept under cp.mu like the rest of pool state.
 	freshLastTick []bool
+
+	// pauseAcquireUntil blocks credPool.get() with a "paused" error
+	// while it's in the future. Set by MarkInUseSlotsForPathChange to
+	// time.Now() + pauseAcquireAfterPathEvent on every path-change
+	// event. Refreshed (extended) on each subsequent path event so a
+	// dual-event iOS sequence (unsatisfied + satisfied within
+	// 130-365ms) keeps the pool quiet through the whole transition.
+	// See pauseAcquireAfterPathEvent comment for the full rationale.
+	pauseAcquireUntil time.Time
 
 	// fetch is the underlying credential fetcher. It must do all the work
 	// previously inlined in resolveTURNAddr: build solver + pending-captcha
@@ -1363,6 +1390,17 @@ const connsPerSlot = 10
 func (cp *credPool) get(connIdx int, allowCaptchaBlock bool) (string, *TURNCreds, int, error) {
 	cp.mu.Lock()
 
+	// Path-change pause: while pauseAcquireUntil is in the future, refuse
+	// new acquires so conn-retry-loops don't grab fresh slots in the gap
+	// between iOS's dual PathMonitor events. See pauseAcquireAfterPathEvent
+	// constant for the rationale. Conns see this error in their retry
+	// loop, back off briefly, and try again after the pause expires.
+	if !cp.pauseAcquireUntil.IsZero() && time.Now().Before(cp.pauseAcquireUntil) {
+		remaining := time.Until(cp.pauseAcquireUntil).Round(time.Millisecond)
+		cp.mu.Unlock()
+		return "", nil, -1, fmt.Errorf("credpool: paused for path-change settle, %s remaining", remaining)
+	}
+
 	// ownSlot is the slot this conn would prefer to live on, by
 	// distributing N conns across ceil(N/10) cred sets — slot 0 hosts
 	// conn 0-9, slot 1 hosts conn 10-19, etc. This is a preference,
@@ -1779,6 +1817,13 @@ func (cp *credPool) MarkInUseSlotsForPathChange() {
 	if marked > 0 {
 		log.Printf("credpool: path-change pre-emptive — marked %d in-use slots with smart-pause cooldowns", marked)
 	}
+
+	// Pause new acquires for pauseAcquireAfterPathEvent. Each path event
+	// extends the pause; iOS dual-event sequences (unsatisfied + satisfied
+	// 130-365ms apart) end up with a single pause window that spans the
+	// whole transition, preventing the "extra slot" race documented in the
+	// pauseAcquireAfterPathEvent comment.
+	cp.pauseAcquireUntil = now.Add(pauseAcquireAfterPathEvent)
 }
 
 // tryFill is called by the background grower (see Proxy.growCredPool) to
@@ -1973,7 +2018,7 @@ func (cp *credPool) slotAvailableChannel() <-chan struct{} {
 // slot's username-encoded expiry is within 30 min: the slot drops out
 // of "fresh" (UI shows lower number) while existing conns continue
 // functioning until VK actually invalidates the allocation.
-func (cp *credPool) snapshotSize() (available int, withCreds int, size int) {
+func (cp *credPool) snapshotSize() (available int, withUsableCreds int, size int) {
 	cp.mu.Lock()
 	// "Available" = fresh AND not currently saturated. The Stats UI
 	// "Pool" first number used to count `fresh` (entryIsFresh) which
@@ -1983,7 +2028,16 @@ func (cp *credPool) snapshotSize() (available int, withCreds int, size int) {
 	// 4 minutes. Switching to countAvailableLocked makes the UI
 	// reflect actual usability.
 	available = cp.countAvailableLocked()
-	withCreds = cp.countWithCredsLocked()
+	// "WithUsableCreds" = slots whose cred hasn't crossed the
+	// expiry buffer. Replaces the prior countWithCredsLocked which
+	// counted ANY cred regardless of expiry — misleading when
+	// background grower stalls (PoW rate-limited) and slots hold
+	// stale creds that can't be refreshed (vpn.wifi-lte-wifi.1.log
+	// on 2026-05-12: UI showed "6/12/12" while 6 of those 12 slots
+	// had expired creds the grower had been failing to refresh for
+	// 26+ minutes). The middle number now matches the user's mental
+	// model of "viable creds the pool can fall back on".
+	withUsableCreds = cp.countWithUsableCredsLocked()
 	size = cp.size
 	cp.mu.Unlock()
 	return
@@ -2089,6 +2143,43 @@ func (cp *credPool) countAvailableLocked() int {
 		if entryIsAvailable(e) {
 			n++
 		}
+	}
+	return n
+}
+
+// countWithUsableCredsLocked assumes cp.mu is held. Counts slots whose
+// cred has NOT crossed the credExpiryBuffer threshold — i.e. slots that
+// will (or could) hand out new allocations once any current saturation
+// or load-pending state passes. Excludes:
+//   - empty slots (no cred)
+//   - slots with expired / expiring-within-buffer creds (these are
+//     effectively dead until background grower fetches a fresh cred)
+//   - slots with unparseable cred username (treated as dead)
+//
+// Includes saturated and load-pending slots — those will recover on
+// their own.
+//
+// Used by the StatsView "Pool" middle number so the user sees how many
+// slots have a viable cred backing them, not just any cred. Replaces
+// countWithCredsLocked usage in snapshotSize since 2026-05-12 build 82
+// — the prior "any cred" semantic was misleading when background
+// grower is stuck (e.g. PoW rate-limited) and slots hold stale creds
+// that can't be refreshed.
+func (cp *credPool) countWithUsableCredsLocked() int {
+	n := 0
+	now := time.Now()
+	for _, e := range cp.pool {
+		if e.creds == nil {
+			continue
+		}
+		exp, ok := parseCredExpiry(e.creds.Username)
+		if !ok {
+			continue
+		}
+		if !now.Add(credExpiryBuffer).Before(exp) {
+			continue // expired or expiring within buffer
+		}
+		n++
 	}
 	return n
 }
