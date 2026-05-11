@@ -1171,6 +1171,19 @@ struct CaptchaWKWebView: UIViewRepresentable {
         context.coordinator.webView = webView
         webView.customUserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
 
+        // iOS 16.4+ no longer auto-enables Safari Web Inspector for WKWebViews
+        // even in Debug builds; explicit opt-in required. Wrapped in #if DEBUG
+        // so Release/TestFlight IPAs don't expose the WebView to USB-attached
+        // dev tools. Enables: Mac Safari → Develop → iPhone → captcha WebView,
+        // then Network tab shows the real HTTP/2 headers Safari mobile sends
+        // to id.vk.ru. Needed for matching our Go-side PoW client to the
+        // captured Safari fingerprint.
+        #if DEBUG
+        if #available(iOS 16.4, *) {
+            webView.isInspectable = true
+        }
+        #endif
+
         // Load captcha URL directly — no iframe needed
         context.coordinator.lastLoadedURL = url.absoluteString
         webView.load(URLRequest(url: url))

@@ -143,6 +143,16 @@ func newHTTPClient() *http.Client {
 // caller (creds.go) uses it as a signal for retry/backoff decisions.
 func solveCaptchaPoW(ctx context.Context, redirectURI, captchaSID, userAgent string) (string, string, error) {
 	captchaPowProfile = profileForUA(userAgent)
+	// If we have a captured browser profile (from WKWebView capture saved
+	// to vk_profile.json), override the UA derived from the input userAgent
+	// param. The captured UA is the one VK saw when computing the captured
+	// browser_fp; sending a mismatched UA to validate that fp triggers BOT.
+	// Before this override (2026-05-11) we sent UA=Chrome desktop while the
+	// captured browser_fp was computed for Safari iOS Mobile — guaranteed
+	// fingerprint inconsistency on every check.
+	if saved := loadSavedVKProfile(); saved != nil && saved.UserAgent != "" {
+		captchaPowProfile.UserAgent = saved.UserAgent
+	}
 	log.Printf("pow: attempting automatic captcha solve (UA: %s, platform: %s, Chrome/%d)",
 		captchaPowProfile.UserAgent, captchaPowProfile.Platform, captchaPowProfile.ChromeVersion)
 
@@ -184,6 +194,16 @@ func solveCaptchaPoW(ctx context.Context, redirectURI, captchaSID, userAgent str
 		log.Printf("pow: received %d cookies from vk.ru domain", len(cookies))
 	}
 
+	// Step 1.5: Generate adFp (random 21-char base64url) and fire mail.ru
+	// tracking ping. Both pieces match what real Safari does on
+	// not_robot_captcha page load via sync-loader.js. The ping return value
+	// is empty (verified) so it's purely a Safari-mimicry signal; the adFp
+	// is included in captchaNotRobot.check body where VK now requires it
+	// to be present (since some VK update around 2026-05-08/09).
+	adFp := genAdFp()
+	log.Printf("pow: generated adFp=%s for captchaNotRobot.check", adFp)
+	fetchAdFpPing(ctx, client)
+
 	// Step 2: Solve PoW (brute-force SHA-256)
 	hash := solvePoW(powInput, difficulty)
 	if hash == "" {
@@ -195,7 +215,7 @@ func solveCaptchaPoW(ctx context.Context, redirectURI, captchaSID, userAgent str
 	time.Sleep(time.Duration(200+mathrand.Intn(300)) * time.Millisecond)
 
 	// Step 3: Call captchaNotRobot API sequence (using same client = same cookies)
-	successToken, showType, err := callCaptchaNotRobotAPI(ctx, client, sessionToken, hash, htmlSettings)
+	successToken, showType, err := callCaptchaNotRobotAPI(ctx, client, sessionToken, hash, adFp, htmlSettings)
 	if err != nil {
 		return "", showType, fmt.Errorf("captchaNotRobot API: %w", err)
 	}
@@ -210,18 +230,23 @@ func fetchPoW(ctx context.Context, client *http.Client, redirectURI string) (pow
 	if err != nil {
 		return "", 0, nil, err
 	}
+	// Headers calibrated for Safari iOS 17 mobile (see vkReq for full
+	// rationale). For the document GET we keep navigate-mode Sec-Fetch
+	// triplet plus Upgrade-Insecure-Requests. Removed: sec-ch-ua* (Chrome
+	// only), DNT (Safari dropped). Changed: Accept stripped of Chrome-specific
+	// image format preferences (Safari sends a simpler Accept), Accept-Language
+	// → en-GB matching captured device.language.
 	req.Header.Set("User-Agent", captchaPowProfile.UserAgent)
-	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8")
-	req.Header.Set("Accept-Language", "en-US,en;q=0.9,ru;q=0.8")
-	req.Header.Set("sec-ch-ua", captchaPowProfile.SecChUA())
-	req.Header.Set("sec-ch-ua-mobile", "?0")
-	req.Header.Set("sec-ch-ua-platform", captchaPowProfile.SecChUAPlatform())
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+	req.Header.Set("Accept-Language", "en-GB,en;q=0.9")
+	req.Header.Set("Cache-Control", "no-cache")
+	req.Header.Set("Pragma", "no-cache")
+	req.Header.Set("Priority", "u=0, i")
 	req.Header.Set("Sec-Fetch-Dest", "document")
 	req.Header.Set("Sec-Fetch-Mode", "navigate")
 	req.Header.Set("Sec-Fetch-Site", "none")
 	req.Header.Set("Sec-Fetch-User", "?1")
 	req.Header.Set("Upgrade-Insecure-Requests", "1")
-	req.Header.Set("DNT", "1")
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -290,33 +315,98 @@ func solvePoW(powInput string, difficulty int) string {
 	return ""
 }
 
+// genAdFp produces a 21-char base64url string used as the `adFp` form field
+// in captchaNotRobot.check. Empirically (Safari WKWebView capture via Web
+// Inspector, 2026-05-11) sync-loader.js from ad.mail.ru generates this
+// client-side as a random tracking ID — VK validates only its presence and
+// format, not its value (no cross-domain handshake with mail.ru). Until
+// today we sent `adFp=` empty in the POST body, which after VK tightened
+// bot heuristics dropped PoW success from 88% (build 64 era) to 6% across
+// 49+ attempts on two distinct captured fps. 16 random bytes → 22 base64url
+// chars → truncated to 21 to match the empirically observed length.
+func genAdFp() string {
+	b := make([]byte, 16)
+	_, _ = rand.Read(b)
+	s := base64.RawURLEncoding.EncodeToString(b)
+	if len(s) > 21 {
+		s = s[:21]
+	}
+	return s
+}
+
+// fetchAdFpPing fires the mail.ru tracking GET that real Safari makes when
+// loading the VK ID not_robot_captcha page. Reproduced via curl from Mac
+// 2026-05-11: the endpoint returns 200 OK with empty body (chunked, 0 bytes),
+// no Set-Cookie — it's purely a mail.ru analytics hit. We replay it for two
+// reasons: (1) match Safari's network footprint in case VK correlates with
+// mail.ru-side request logs (low probability but cheap insurance), (2) any
+// future Set-Cookie response would be picked up by the shared CookieJar.
+// Errors are non-fatal — we log and continue.
+//
+// IMPORTANT: the `id` query param is a SEPARATE random ID from the adFp
+// value sent to VK. Safari capture confirmed they differ within one session.
+// sync-loader.js generates two independent 21-char IDs.
+func fetchAdFpPing(ctx context.Context, client *http.Client) {
+	pingID := genAdFp() // same generator, different value from the body adFp
+	pingURL := "https://privacy-cs.mail.ru/fp/?id=" + pingID
+	req, err := http.NewRequestWithContext(ctx, "GET", pingURL, nil)
+	if err != nil {
+		log.Printf("pow: fetchAdFpPing skipped (request creation failed: %v)", err)
+		return
+	}
+	req.Header.Set("User-Agent", captchaPowProfile.UserAgent)
+	req.Header.Set("Accept", "*/*")
+	req.Header.Set("Accept-Language", "en-GB,en;q=0.9")
+	req.Header.Set("Origin", "https://id.vk.ru")
+	req.Header.Set("Referer", "https://id.vk.ru/")
+	req.Header.Set("Sec-Fetch-Dest", "empty")
+	req.Header.Set("Sec-Fetch-Mode", "cors")
+	req.Header.Set("Sec-Fetch-Site", "cross-site")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Printf("pow: fetchAdFpPing failed (non-fatal): %v", err)
+		return
+	}
+	defer func() { _ = resp.Body.Close() }()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	log.Printf("pow: adFp tracking ping sent (status=%d, id=%s)", resp.StatusCode, pingID)
+}
+
 // callCaptchaNotRobotAPI performs the 4-step VK captchaNotRobot protocol.
 // Adapted from the reference implementation in PR #105 — uses simplified
 // sensor data (empty arrays) and longer timing delays.
 //
 // Returns (successToken, lastShowCaptchaType, err). See solveCaptchaPoW for
 // the meaning of lastShowCaptchaType.
-func callCaptchaNotRobotAPI(ctx context.Context, client *http.Client, sessionToken, hash string, htmlSettings map[string]interface{}) (string, string, error) {
+func callCaptchaNotRobotAPI(ctx context.Context, client *http.Client, sessionToken, hash, adFp string, htmlSettings map[string]interface{}) (string, string, error) {
 	vkReq := func(method, postData string) (map[string]interface{}, error) {
 		reqURL := "https://api.vk.ru/method/" + method + "?v=5.131"
 		req, err := http.NewRequestWithContext(ctx, "POST", reqURL, strings.NewReader(postData))
 		if err != nil {
 			return nil, err
 		}
+		// Headers calibrated against real Safari iOS 17 WKWebView capture
+		// (Web Inspector → Network → captchaNotRobot.check, 2026-05-11).
+		// Removed: sec-ch-ua / sec-ch-ua-mobile / sec-ch-ua-platform (Chrome
+		// Client Hints — Safari does NOT send them and our captured browser_fp
+		// was computed for Safari mobile, so sending Chrome hints with Safari
+		// UA was a double mismatch). Removed: DNT (Safari dropped years ago),
+		// Sec-GPC (Brave/Firefox-only signal). Changed: Accept-Language to
+		// en-GB matching captured device.language. Added: Cache-Control,
+		// Pragma, Priority — all present in Safari capture.
 		req.Header.Set("User-Agent", captchaPowProfile.UserAgent)
-		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 		req.Header.Set("Accept", "*/*")
-		req.Header.Set("Accept-Language", "en-US,en;q=0.9,ru;q=0.8")
+		req.Header.Set("Accept-Language", "en-GB,en;q=0.9")
+		req.Header.Set("Cache-Control", "no-cache")
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 		req.Header.Set("Origin", "https://id.vk.ru")
+		req.Header.Set("Pragma", "no-cache")
+		req.Header.Set("Priority", "u=3, i")
 		req.Header.Set("Referer", "https://id.vk.ru/")
-		req.Header.Set("sec-ch-ua", captchaPowProfile.SecChUA())
-		req.Header.Set("sec-ch-ua-mobile", "?0")
-		req.Header.Set("sec-ch-ua-platform", captchaPowProfile.SecChUAPlatform())
-		req.Header.Set("DNT", "1")
-		req.Header.Set("Sec-Fetch-Site", "same-site")
-		req.Header.Set("Sec-Fetch-Mode", "cors")
 		req.Header.Set("Sec-Fetch-Dest", "empty")
-		req.Header.Set("Sec-GPC", "1")
+		req.Header.Set("Sec-Fetch-Mode", "cors")
+		req.Header.Set("Sec-Fetch-Site", "same-site")
 
 		httpResp, err := client.Do(req)
 		if err != nil {
@@ -339,8 +429,12 @@ func callCaptchaNotRobotAPI(ctx context.Context, client *http.Client, sessionTok
 	}
 
 	domain := "vk.com"
-	baseParams := fmt.Sprintf("session_token=%s&domain=%s&adFp=&access_token=",
-		url.QueryEscape(sessionToken), url.QueryEscape(domain))
+	// adFp: 21-char base64url tracking ID generated client-side in real
+	// Safari by sync-loader.js. Until 2026-05-11 we sent it empty and PoW
+	// success collapsed to ~6% after VK started enforcing its presence.
+	// See genAdFp + fetchAdFpPing for full mechanism.
+	baseParams := fmt.Sprintf("session_token=%s&domain=%s&adFp=%s&access_token=",
+		url.QueryEscape(sessionToken), url.QueryEscape(domain), url.QueryEscape(adFp))
 
 	// Extract HTML-level show_captcha_type hint. VK embeds a `window.init.data`
 	// payload in the captcha page that announces which challenge type VK plans

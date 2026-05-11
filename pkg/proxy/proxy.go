@@ -520,6 +520,20 @@ func (p *Proxy) growCredPool(ctx context.Context) {
 	const (
 		fastInterval = 2 * time.Second
 		slowInterval = 30 * time.Second
+		// Staggering window for maintenance-mode fills (pool already
+		// healthy). Picks a random pause after each successful fill so
+		// creds don't end up with synchronised expiry timestamps. Width
+		// of the window (60→240s) is wider than the PoW cycle time
+		// (~8s) so even at 100% PoW success rate we get ~3 minute
+		// average gaps between fills, giving creds ~minutes of natural
+		// expiry spread rather than ~seconds.
+		staggerMinInterval = 60 * time.Second
+		staggerMaxInterval = 240 * time.Second
+		// Pool fill ratio at which we transition fast-fill → staggered
+		// fill. Cold start (pool < 50%) fills as fast as possible so
+		// the user can connect quickly; once pool is half full,
+		// remaining fills are spread out to stagger expirations.
+		maintenanceThreshold = 0.5
 	)
 	interval := fastInterval
 
@@ -547,8 +561,38 @@ func (p *Proxy) growCredPool(ctx context.Context) {
 
 		// tryFill returns fast whether success or failure; it handles
 		// cooldown bookkeeping internally.
-		p.credPool.tryFill(slot, false)
-		interval = fastInterval
+		success := p.credPool.tryFill(slot, false)
+
+		// Decide next-poll interval based on outcome + pool health.
+		// Pre-2026-05-11 the PoW solver per-attempt success rate was
+		// ~6%, which naturally spread fills over ~tens of minutes
+		// because most attempts BOT'd and only ~1-in-16 sessions
+		// produced a fresh cred. After the captcha_pow.go Phase 1 fix
+		// (adFp + Safari headers + UA override) the rate jumped to
+		// ~55% per-attempt → near-100% per-session → all 12 slots
+		// fill in ~90 seconds. Without staggering, all 12 creds would
+		// then expire ~simultaneously 8 hours later, causing a mass
+		// refresh event. Staggering replaces this 90s burst with a
+		// spread-out fill so future expirations are also spread.
+		if success {
+			available, _, total := p.credPool.snapshotSize()
+			if total > 0 && float64(available)/float64(total) >= maintenanceThreshold {
+				// Pool ≥50% full → maintenance mode. Pick random
+				// pause within stagger window.
+				delay := staggerMinInterval + time.Duration(mathrand.Int63n(int64(staggerMaxInterval-staggerMinInterval)))
+				log.Printf("credpool-grow: pool at %d/%d (≥%.0f%%), staggering next fill by %v",
+					available, total, maintenanceThreshold*100, delay.Round(time.Second))
+				interval = delay
+			} else {
+				// Pool still cold (<50%) → keep filling fast.
+				interval = fastInterval
+			}
+		} else {
+			// Failure (BOT, rate-limit, fetching collision) — keep
+			// trying fast. Per-slot cooldown is enforced inside
+			// tryFill so we don't hammer the same dead slot.
+			interval = fastInterval
+		}
 	}
 }
 
