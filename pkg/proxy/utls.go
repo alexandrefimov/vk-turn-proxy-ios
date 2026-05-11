@@ -16,33 +16,52 @@ import (
 
 // vkHostIPs is a host→IP map populated by the main app right before
 // startVPNTunnel. It lets the extension dial VK API endpoints without
-// depending on a working DNS resolver inside the extension process.
+// depending on a working DNS resolver during the bootstrap window.
 //
-// Why this approach:
+// What actually fails / works in the extension (verified empirically
+// 2026-05-11 via dns-probe in build 86 for `privacy-cs.mail.ru`):
 //
-//   - CGo getaddrinfo (Go's default on iOS) returns "no such host" in a
-//     fresh Network Extension before setTunnelNetworkSettings — iOS
-//     hasn't wired up the per-process resolver context yet.
+//   - **Pre-bootstrap window** (extension started, setTunnelNetworkSettings
+//     NOT yet called — i.e., before TUN exists with the dns=1.1.1.1
+//     config). All resolver paths fail: cgo getaddrinfo returns "no
+//     such host" because iOS hasn't wired up the per-process resolver
+//     context for the extension yet; pure-Go resolver hits [::1]:53
+//     "connection refused" (no /etc/resolv.conf); SCDynamicStore is
+//     explicitly unavailable on iOS. This is the window where we MUST
+//     use pre-resolved IPs — and it's exactly when our deferred-
+//     setTunnelNetworkSettings architecture is doing VK API calls for
+//     bootstrap, so pre-resolution is structurally required.
 //
-//   - Pure-Go resolver fails too: there's no usable /etc/resolv.conf in
-//     the extension sandbox, so it falls back to [::1]:53 ("connection
-//     refused").
+//   - **Post-bootstrap window** (TUN up with dns=1.1.1.1 configured).
+//     cgo getaddrinfo WORKS — resolves via mDNSResponder XPC which uses
+//     the tunnel DNS server, packets to 1.1.1.1 route through TUN → WG →
+//     server → 1.1.1.1 and back. The pure-Go resolver still fails (still
+//     no /etc/resolv.conf). So `net.DefaultResolver.LookupHost` and
+//     `net.Dialer.Dial` work for arbitrary hosts in this window.
 //
-//   - SCDynamicStore (which would give us the DNS servers iOS itself is
-//     using) is explicitly marked unavailable on iOS — Apple blocks it
-//     entirely.
+// Why `vk_host_ips` is still useful even post-bootstrap:
 //
-//   - Hardcoded public resolvers (1.1.1.1 / 8.8.8.8) defeat the purpose:
-//     the deployment target is whitelist networks that allow VK + a few
-//     other resources; those networks block public DNS by design.
+//   - Latency: tunnel-routed DNS adds ~50-200ms vs direct in-process
+//     lookup. For hot-path hosts (api.vk.ru hit per cred-fetch) that
+//     matters; for one-off pings (privacy-cs.mail.ru) it doesn't.
+//
+//   - Resilience: if tunnel is broken mid-session, pre-resolved IPs
+//     are the ONLY DNS we have. The main-app pre-resolves before
+//     handing config to extension, so the IPs survive tunnel outages.
+//
+//   - Whitelist networks: the deployment target is networks that allow
+//     VK + a few other resources but block public DNS. In pre-bootstrap
+//     we have no way to reach 1.1.1.1 directly; only after the tunnel
+//     is up does the DNS query travel encapsulated through WG, exempt
+//     from the whitelist's blocking.
 //
 // The main-app process, in contrast, has a fully-populated network
-// context before it triggers startVPNTunnel — its standard CFHost /
-// getaddrinfo resolves through whichever DNS the system is currently
-// using (DHCP / carrier), which is by definition reachable in the
-// user's environment. So we let it resolve VK hosts there, pass the
-// IPs through providerConfiguration, and the extension dials by IP
-// while keeping the original hostname in TLS SNI / Host headers.
+// context the whole time — its standard CFHost / getaddrinfo resolves
+// through whichever DNS the system is currently using (DHCP / carrier),
+// which is by definition reachable in the user's environment. So we
+// let it resolve VK hosts there, pass the IPs through providerConfig,
+// and the extension dials by IP for the bootstrap-critical hosts while
+// keeping the original hostname in TLS SNI / Host headers.
 var (
 	vkHostIPsMu sync.RWMutex
 	vkHostIPs   = make(map[string][]string) // host (no port) → list of IPs (all A-records)
