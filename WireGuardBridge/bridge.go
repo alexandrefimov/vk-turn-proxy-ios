@@ -657,6 +657,38 @@ func wgWakeHealthCheck(tunnelHandle C.int32_t) {
 	entry.proxy.WakeHealthCheck()
 }
 
+//export wgPathChanged
+//
+// Pre-emptive saturation marking on iOS network-path change. Called
+// from Swift's NWPathMonitor pathUpdateHandler after dedup. For each
+// pool slot with active>0 OR lastUsedAt within ~10 min, marks the slot
+// VK-saturated immediately instead of waiting for the next allocate
+// attempt to hit 486 (which fires ~0.4-1s later anyway per build 69
+// empirical test). Saves the 486 retry burst, routes fresh conns
+// straight to the reserve slots.
+//
+// History: this was originally proposed alongside pre-emptive
+// Refresh(0) ("Fix B"). Refresh(0) was empirically disproved 2026-05-10
+// (VK ignores it — quota release is timer-bound to server-side 600s
+// lifetime). This pre-emptive marking is what remains — it doesn't try
+// to make VK release quota, it just stops US from wasting attempts on
+// slots we already know are quota-locked.
+//
+// See evaluated_alternatives_pre_emptive_refresh.md for the empirical
+// disproof of the Refresh(0) approach.
+func wgPathChanged(tunnelHandle C.int32_t) {
+	id := int32(tunnelHandle)
+	tunnelsMu.Lock()
+	entry, ok := tunnels[id]
+	tunnelsMu.Unlock()
+
+	if !ok || entry.proxy == nil {
+		return
+	}
+
+	entry.proxy.OnPathChange()
+}
+
 //export wgLogPathSnapshot
 //
 // Triggers a one-shot pathstats log line. Called by Swift's NWPathMonitor

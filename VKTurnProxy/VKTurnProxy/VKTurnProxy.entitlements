@@ -10,5 +10,10 @@
 	<array>
 		<string>group.com.vkturnproxy.app</string>
 	</array>
+	<!-- See PacketTunnel.entitlements for the rationale; mirrored here
+	     defensively in case Apple's entitlement check looks at the host
+	     app bundle as well. -->
+	<key>com.apple.developer.networking.wifi-info</key>
+	<true/>
 </dict>
 </plist>

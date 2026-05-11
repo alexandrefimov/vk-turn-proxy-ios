@@ -18,7 +18,15 @@ final class ConnectionLinkInbox: ObservableObject {
 @main
 struct VKTurnProxyApp: App {
     init() {
-        SharedLogger.shared.log("[App] VKTurnProxy launched")
+        // Version comes from Bundle's CFBundleVersion = $(CURRENT_PROJECT_VERSION)
+        // (per project.yml info.properties). Both main app and PacketTunnel
+        // extension log their own build number on startup so post-mortem log
+        // analysis can immediately tell whether the running binary matches
+        // the source git state — earlier confusion (2026-05-10) was caused
+        // by an extension running stale Go code from a not-rebuilt xcframework
+        // while the source had moved on.
+        let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "?"
+        SharedLogger.shared.log("[App] VKTurnProxy launched (build \(build))")
     }
 
     var body: some Scene {

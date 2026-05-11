@@ -2899,6 +2899,16 @@ func pathSnapshotOSDefault() string {
 //
 // Safe to call concurrently with logPathStatsLoop; both just emit
 // log lines, no shared mutable state.
+// OnPathChange is called from Swift's NWPathMonitor on every real (deduped)
+// network-path transition. Forwards to credPool which marks in-use slots
+// as pre-emptively saturated. See credPool.MarkInUseSlotsForPathChange
+// for the full rationale.
+func (p *Proxy) OnPathChange() {
+	if p.credPool != nil {
+		p.credPool.MarkInUseSlotsForPathChange()
+	}
+}
+
 func (p *Proxy) LogPathSnapshot(label string) {
 	osDefault := pathSnapshotOSDefault()
 

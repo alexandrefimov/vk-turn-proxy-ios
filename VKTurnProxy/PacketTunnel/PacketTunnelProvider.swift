@@ -16,6 +16,14 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     private var pathMonitor: NWPathMonitor?
     private let pathMonitorQueue = DispatchQueue(label: "com.vkturnproxy.tunnel.pathmonitor")
     private var lastPathDescription: String?
+    // Cached SSID of the current WiFi network. Refreshed asynchronously
+    // on every wifi-iface path event via NEHotspotNetwork.fetchCurrent
+    // (see startPathMonitoring). Cleared when iface switches off wifi.
+    // Non-nil → describePath includes ssid="..." in the [PathMonitor]
+    // log line. nil → either not on wifi, or fetchCurrent returned nil
+    // (which can happen if iOS denies the API for our context — e.g.
+    // missing entitlement, or extension lifecycle quirks).
+    private var currentWiFiSSID: String?
 
     private func logMsg(_ msg: String) {
         os_log("%{public}s", log: log, type: .default, msg)
@@ -54,7 +62,16 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
 
     override func startTunnel(options: [String : NSObject]?, completionHandler: @escaping (Error?) -> Void) {
 
-        logMsg("startTunnel called")
+        // Log the extension's CFBundleVersion ($(CURRENT_PROJECT_VERSION)
+        // from project.yml) on every tunnel start so post-mortem log
+        // analysis can verify which binary the system actually loaded.
+        // Rationale: 2026-05-10 incident where stale xcframework caused
+        // the Swift side to look up-to-date while the Go side carried
+        // old code; without per-process version logging the divergence
+        // wasn't obvious until grep'ing source vs running binary
+        // behavior.
+        let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "?"
+        logMsg("startTunnel called (build \(build))")
         startPathMonitoring()
 
         // Set Go timezone BEFORE wgSetLogFilePath so the first Go log line
@@ -383,25 +400,53 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         let monitor = NWPathMonitor()
         monitor.pathUpdateHandler = { [weak self] path in
             guard let self = self else { return }
-            let desc = self.describePath(path)
-            // Deduplicate identical updates — NWPathMonitor sometimes fires
-            // multiple times on a single transition (DNS update, IPv6
-            // configuration, etc.) without meaningful change for us.
-            if desc != self.lastPathDescription {
-                self.logMsg("[PathMonitor] \(desc)")
-                self.lastPathDescription = desc
-                // Trigger an out-of-band Go-side pathstats snapshot so
-                // transient interfaces visited between the 60s pathstats
-                // ticks (e.g. ~20s on cellular during a wifi-cellular-wifi
-                // handover, see vpn.wifi-lte-wifi.1.log 2026-05-08) appear
-                // in the log stream. Cheap (one log line) and called only
-                // when the path actually changed (deduped above).
-                if self.tunnelHandle >= 0 {
-                    let label = desc
-                    label.withCString { cstr in
-                        wgLogPathSnapshot(self.tunnelHandle, cstr)
+
+            // Process the path event after the (possibly async) SSID
+            // refresh completes — describePath reads currentWiFiSSID.
+            let process = { [weak self] in
+                guard let self = self else { return }
+                let desc = self.describePath(path)
+                // Deduplicate identical updates — NWPathMonitor sometimes
+                // fires multiple times on a single transition (DNS update,
+                // IPv6 configuration, etc.) without meaningful change.
+                if desc != self.lastPathDescription {
+                    self.logMsg("[PathMonitor] \(desc)")
+                    self.lastPathDescription = desc
+                    // Trigger an out-of-band Go-side pathstats snapshot so
+                    // transient interfaces visited between the 60s pathstats
+                    // ticks (e.g. ~20s on cellular during a wifi-cellular-wifi
+                    // handover, see vpn.wifi-lte-wifi.1.log 2026-05-08) appear
+                    // in the log stream. Cheap (one log line) and called only
+                    // when the path actually changed (deduped above).
+                    if self.tunnelHandle >= 0 {
+                        let label = desc
+                        label.withCString { cstr in
+                            wgLogPathSnapshot(self.tunnelHandle, cstr)
+                        }
+                        // Pre-emptive saturation marking — tell Go side that
+                        // a path change just happened so it marks in-use
+                        // slots as quota-locked BEFORE the inevitable 486
+                        // burst that would otherwise hit them via the retry
+                        // loop. Saves ~0.5-1 sec of failed-allocate spam
+                        // plus the log pollution. See wgPathChanged in
+                        // bridge.go.
+                        wgPathChanged(self.tunnelHandle)
                     }
                 }
+            }
+
+            // SSID enrichment for wifi paths. NEHotspotNetwork.fetchCurrent
+            // is async and may return nil if iOS denies our context (e.g.
+            // missing entitlement) — we still proceed in either case so
+            // path event logging never blocks on the SSID lookup.
+            if path.usesInterfaceType(Network.NWInterface.InterfaceType.wifi) {
+                NEHotspotNetwork.fetchCurrent { [weak self] network in
+                    self?.currentWiFiSSID = network?.ssid
+                    process()
+                }
+            } else {
+                self.currentWiFiSSID = nil
+                process()
             }
         }
         monitor.start(queue: pathMonitorQueue)
@@ -435,6 +480,29 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         if path.supportsIPv4 { attrs.append("v4") }
         if path.supportsIPv6 { attrs.append("v6") }
         if path.supportsDNS { attrs.append("dns") }
+        // SSID of the current WiFi network if we're on wifi and
+        // fetchCurrent succeeded. Useful for "what was that mystery
+        // [expensive,constrained] WiFi" diagnosis. Quoted because SSIDs
+        // can contain spaces / special chars.
+        if iface == "wifi", let ssid = currentWiFiSSID {
+            attrs.append("ssid=\"\(ssid)\"")
+        }
+        // For unsatisfied paths, include Apple's machine-readable reason
+        // so post-mortem can distinguish "user denied cellular" from
+        // "no available network" etc. iOS 14.2+ API; deploymentTarget 15.0
+        // guarantees availability.
+        if path.status == .unsatisfied {
+            let reason: String
+            switch path.unsatisfiedReason {
+            case .notAvailable: reason = "n/a"
+            case .cellularDenied: reason = "cellular-denied"
+            case .wifiDenied: reason = "wifi-denied"
+            case .localNetworkDenied: reason = "local-net-denied"
+            case .vpnInactive: reason = "vpn-inactive"
+            @unknown default: reason = "unknown"
+            }
+            attrs.append("reason:\(reason)")
+        }
         let attrStr = attrs.isEmpty ? "" : " [\(attrs.joined(separator: ","))]"
         return "\(status) iface=\(iface)\(attrStr)"
     }

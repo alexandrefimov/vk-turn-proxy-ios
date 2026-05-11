@@ -865,43 +865,66 @@ type credPool struct {
 // was wrong. The pool's previous formula (3 + (n-1)/20, committed in
 // 260d8bc on this same misreading) is reverted here.
 //
-// Formula: ceil(n * 1.5 / 10). One cred per 10 conns (matches VK's hard
-// quota) plus a 50% spare buffer for refresh insurance + cascade recovery.
+// Formula: ceil(n * 4 / 10) = ceil(n * 2 / 5). One cred per 10 conns
+// (matches VK's hard quota) plus a 300% spare buffer for cascade
+// recovery during network-path changes — survives up to 3 back-to-back
+// transitions within one 10m30s smart-pause window.
 //
-// The +50% buffer (vs the previous "+1 spare") is empirically motivated.
-// The previous "+1" assumed single-slot-at-a-time refresh, but mass-kill
-// events (vpn.wifi-lte-wifi.0.log on 2026-05-04: 38 conns killed near-
-// simultaneously after 1h10m sleep) force many conns through Phase 2
-// fetch concurrently. With only 1 spare slot, the surge of fetch demand
-// trips VK's per-cred 486 (Allocation Quota), saturating slots for 10
-// minutes each and collapsing the pool to 3/6/6 (vpn.wifi.1.log on
-// 2026-05-04 — 24× higher kill rate than baseline). More spare slots
-// give the pool headroom to absorb a kill cascade without falling into
-// a "no slot available" loop while saturation cooldowns drain.
+// History — formula bumped twice in two days:
 //
-// Examples (cred slots → max conns at 10/slot, of which N for live conns,
-//          remainder are spare):
-//   n=1..6   → 2 (would be 0-1 by formula; clamped to 2 for refresh insurance)
-//   n=7..13  → 2
-//   n=14..20 → 3
-//   n=21..26 → 4
-//   n=27..33 → 5
-//   n=34..40 → 6
-//   n=41..46 → 7
-//   n=47..53 → 8 (typical NumConns=50 case: 5 for conns + 3 spare)
-//   n=54..60 → 9
-//   n=61..66 → 10
+//   * 2026-05-10 build 70: ceil(n * 1.5 / 10) → ceil(n * 2.5 / 10).
+//     The previous +50% buffer (3 working + 2 spare for typical N=30)
+//     was empirically insufficient for rapid-flap saturation cascades.
+//
+//   * 2026-05-10 build 73: ceil(n * 2.5 / 10) → ceil(n * 4 / 10).
+//     Build 72's smart-pause + pool=8 worked perfectly for SINGLE
+//     transitions (vpn.wifi.3.log: WiFi→LTE recovery 7.5s, 0 quota
+//     errors). But back-to-back transitions saturate disjoint slot
+//     sets — vpn.wifi-lte-wifi.1.log on 2026-05-10 23:03 showed
+//     LTE→WiFi (5 slots saturated) coming 6.5 min after WiFi→LTE
+//     (5 slots saturated 10m30s) → ALL 8 slots locked, 4m09s outage
+//     until first cohort's smart-pause expired. With pool=12 the
+//     two transitions saturate 6 slots, leaving 6 fresh — survives.
+//
+// Why this works: VK's per-cred 486 quota is bound to allocation
+// LIFETIME (server-side ~600s timer), not client actions — verified
+// empirically 2026-05-10 with build 69's wgForceReconnect debug button
+// (see evaluated_alternatives_pre_emptive_refresh.md). The only way
+// to keep throughput during a path-cascade is to have enough fresh,
+// never-used slots that VK has no allocations against.
+//
+// Capacity math for back-to-back transitions (N=30, ~3 active slots
+// per phase): pool=12 absorbs 4 transitions before all-saturated;
+// pool=8 absorbs 2 (overlapping into the 3rd-transition window).
+// Three back-to-back transitions within ~10 min is rare enough that
+// pool=12 covers practically all real-world scenarios.
+//
+// Examples (cred slots → max conns at 10/slot, of which N for live
+//          conns, remainder are spare):
+//   n=1..4   → 2 (clamped to 2 for refresh insurance)
+//   n=5..7   → 4 (was 2 with old formula)
+//   n=8..12  → 4-5
+//   n=13..17 → 6-7
+//   n=18..22 → 8-9
+//   n=23..27 → 10-11
+//   n=28..32 → 12 (typical NumConns=30: 3 for conns + 9 spare)
+//   n=33..37 → 14
+//   n=38..42 → 16-17
+//   n=43..47 → 18-19
+//   n=48..52 → 20 (typical NumConns=50: 5 for conns + 15 spare)
 //
 // Trade-off: each extra spare slot is one more cred VK needs to issue
-// (PoW + slider, ~20-60 sec), one more cooldown timer to track, and one
-// more allocation-refresh pulse every ~5 min in steady state. We tolerate
-// that overhead in exchange for crash-free cascade recovery.
+// (PoW + slider, ~20-60 sec but happens in background after pre-bootstrap)
+// and one more allocation-refresh pulse every ~5 min in steady state.
+// Cold-start time is unaffected since pre-bootstrap fills only slot 0;
+// the remaining slots fill asynchronously via background grower while
+// the user is already browsing.
 func poolSizeForNumConns(n int) int {
 	if n <= 0 {
 		n = 1
 	}
-	// ceil(n * 1.5 / 10) = ceil(3n / 20) — integer math.
-	size := (3*n + 19) / 20
+	// ceil(n * 4 / 10) = ceil(n * 2 / 5) — integer math.
+	size := (n*2 + 4) / 5
 	if size < 2 {
 		size = 2
 	}
@@ -1595,15 +1618,146 @@ func (cp *credPool) markSaturated(slot int) time.Duration {
 		cooldown = vkActiveAllocationsCooldown
 		reason = fmt.Sprintf("active-recent (lastUsedAt %s ago)", age.Round(time.Second))
 	}
+
+	cp.applySaturationLocked(slot, cooldown, reason)
+	return cooldown
+}
+
+// applySaturationLocked is the inner state-mutation step shared by
+// markSaturated (which computes a fixed cooldown from current slot
+// state — 11m active or 3m ghost) and MarkInUseSlotsForPathChange
+// (which computes a precise per-slot cooldown based on lastUsedAt +
+// VK allocation lifetime). Caller MUST hold cp.mu.
+func (cp *credPool) applySaturationLocked(slot int, cooldown time.Duration, reason string) {
 	log.Printf("credpool: slot %d marked VK-saturated for %s — %s",
 		slot, cooldown.Round(time.Second), reason)
-
 	if cp.pool[slot].saturationTimer != nil {
 		cp.pool[slot].saturationTimer.Stop()
 	}
 	cp.pool[slot].saturatedUntil = time.Now().Add(cooldown)
 	cp.pool[slot].saturationTimer = time.AfterFunc(cooldown, cp.broadcastSlotAvailable)
-	return cooldown
+}
+
+// MarkInUseSlotsForPathChange is called from Swift's NWPathMonitor on every
+// real (deduped) network-path transition. For each pool slot that VK
+// almost-certainly still holds allocations for (active>0 OR lastUsedAt
+// within activeAllocationsWindow), mark it saturated proactively — same
+// effect as if a conn had just hit 486 on the slot, but without the wasted
+// allocate attempt + retry burst.
+//
+// Why this helps: without this, after a path change we typically see
+// ~3 conns hit 486 in series on each in-use slot (slot 0 → 486 → mark,
+// slot 1 → 486 → mark, slot 2 → 486 → mark) over ~0.5-1 seconds before
+// credPool routing realises which slots are dead. With pre-emptive
+// marking, conn 0 immediately sees slots 0/1/2 saturated and goes to
+// fresh reserve slots (3/4/5/...) — no 486 burst, no log spam, no
+// CPU/network churn.
+//
+// Slots with active=0 AND lastUsedAt > 10m ago (or never used) are NOT
+// marked — they're either ghost-likely-expired or fresh-never-used, and
+// in both cases VK has no allocations against them. Marking them would
+// waste 11 minutes of an otherwise-fine slot.
+//
+// Empirically confirmed VK-side timing: build 69's wgForceReconnect test
+// showed 486 firing ~0.4-0.8s after Refresh(0) closes — VK quota release
+// is timer-driven (600s lifetime), not client-driven. So the lastUsedAt
+// + 600s window is a reliable predictor of when a slot is safe to reuse.
+// See evaluated_alternatives_pre_emptive_refresh.md.
+func (cp *credPool) MarkInUseSlotsForPathChange() {
+	const vkAllocLifetime = 600 * time.Second
+	// Safety buffer: clock skew + jitter in VK's quota-release task.
+	// If a slot becomes usable a few seconds before this expires the
+	// cost is just one wasted allocate attempt that hits 486 and
+	// re-marks via the existing path — bounded harm.
+	const safetyBuffer = 30 * time.Second
+	// Minimum age of lastUsedAt for "active-recent" classification to
+	// fire. Below this threshold the slot was just-released by a conn
+	// that briefly touched it during the current path-cascade — kernel
+	// error killed the socket within ~ms of acquire, so no TURN
+	// allocate could have completed (round-trip ~50-200ms minimum,
+	// plus VK processing). Without this guard, MarkInUseSlotsForPathChange
+	// fires AFTER the conn-retry-loop has already done acquire→release
+	// cycles on previously-active slots, marking them all active-recent
+	// even though no real VK quota was committed.
+	//
+	// Observed in vpn.wifi.1.log on 2026-05-11 09:05:51: WiFi→LTE
+	// transition fired 3 active-now markings (legitimate) PLUS 3
+	// active-recent markings on slots whose lastUsedAt was 0s ago
+	// (just-released by reconnect-cycle). Result: pool dropped 12→6
+	// fresh instead of expected 12→9. Build 76 fix.
+	const minRealUseAge = 2 * time.Second
+
+	cp.mu.Lock()
+	defer cp.mu.Unlock()
+
+	now := time.Now()
+	marked := 0
+	for slot := 0; slot < cp.size && slot < len(cp.pool); slot++ {
+		e := cp.pool[slot]
+		// Skip already-saturated (re-marking is no-op but spams logs)
+		if !e.saturatedUntil.IsZero() && e.saturatedUntil.After(now) {
+			continue
+		}
+		// Skip empty/never-filled slots (no creds, no VK state)
+		if e.creds == nil {
+			continue
+		}
+
+		// Skip slots already in load-from-disk pending state. availableAt
+		// was set by loadFromDisk based on a PRIOR session's lastUsedAt
+		// + credSaturationCooldown — VK's lingering allocations from
+		// before this session are already correctly accounted for. Smart-
+		// pause would re-mark these slots based on the same lastUsedAt,
+		// only extending the wait by safetyBuffer (~30s) and confusing
+		// the log. Trust the load-cooldown.
+		//
+		// Observed in vpn.wifi-lte-wifi.3.log on 2026-05-10 23:52: pool
+		// loaded from disk had slots 8/9/11 with lastUsedAt 36s ago →
+		// pending until 23:58:25 (load-cooldown). Smart-pause at 23:52:21
+		// re-marked them saturated until 23:58:56 (~30s later than load-
+		// cooldown's natural expiry). No real harm but no real benefit
+		// either, and it makes the saturation count misleading.
+		if !e.availableAt.IsZero() && e.availableAt.After(now) {
+			continue
+		}
+
+		// Smart-pause anchor selection:
+		//   active>0  → conns alive right now, refreshes every ~5m, so the
+		//               latest allocation expires no later than now + 600s.
+		//   active=0  → lastUsedAt is when active dropped to 0; VK still
+		//               holds allocations for the remainder of 600s after
+		//               last refresh, bounded above by lastUsedAt + 600s.
+		var anchor time.Time
+		var reason string
+		if e.active > 0 {
+			anchor = now
+			reason = fmt.Sprintf("path-change active-now (active=%d/%d, smart-pause)", e.active, connsPerSlot)
+		} else if !e.lastUsedAt.IsZero() &&
+			now.Sub(e.lastUsedAt) > minRealUseAge &&
+			now.Sub(e.lastUsedAt) < activeAllocationsWindow {
+			anchor = e.lastUsedAt
+			age := now.Sub(e.lastUsedAt).Round(time.Second)
+			reason = fmt.Sprintf("path-change active-recent (lastUsedAt %s ago, smart-pause)", age)
+		} else {
+			// Ghost-likely-expired (lastUsedAt > 10m), never-used,
+			// OR just-released-during-this-path-cascade (lastUsedAt
+			// within minRealUseAge — see comment on that constant).
+			continue
+		}
+
+		// remaining = (anchor + vkAllocLifetime + safetyBuffer) - now
+		remaining := vkAllocLifetime - now.Sub(anchor) + safetyBuffer
+		if remaining <= 0 {
+			continue
+		}
+
+		cp.applySaturationLocked(slot, remaining, reason)
+		marked++
+	}
+
+	if marked > 0 {
+		log.Printf("credpool: path-change pre-emptive — marked %d in-use slots with smart-pause cooldowns", marked)
+	}
 }
 
 // tryFill is called by the background grower (see Proxy.growCredPool) to
@@ -1798,9 +1952,16 @@ func (cp *credPool) slotAvailableChannel() <-chan struct{} {
 // slot's username-encoded expiry is within 30 min: the slot drops out
 // of "fresh" (UI shows lower number) while existing conns continue
 // functioning until VK actually invalidates the allocation.
-func (cp *credPool) snapshotSize() (fresh int, withCreds int, size int) {
+func (cp *credPool) snapshotSize() (available int, withCreds int, size int) {
 	cp.mu.Lock()
-	fresh = cp.countFreshLocked()
+	// "Available" = fresh AND not currently saturated. The Stats UI
+	// "Pool" first number used to count `fresh` (entryIsFresh) which
+	// missed saturatedUntil — back-to-back path transitions on
+	// build 72 (vpn.wifi-lte-wifi.1.log 2026-05-10 23:03) showed
+	// "Pool 8/8/8" while ALL 8 slots were saturated for the next
+	// 4 minutes. Switching to countAvailableLocked makes the UI
+	// reflect actual usability.
+	available = cp.countAvailableLocked()
 	withCreds = cp.countWithCredsLocked()
 	size = cp.size
 	cp.mu.Unlock()
@@ -1845,6 +2006,27 @@ func entryIsFresh(e credPoolEntry) bool {
 	return true
 }
 
+// entryIsAvailable reports whether the slot can hand out new TURN
+// allocations RIGHT NOW: cred is fresh AND no active VK-side saturation
+// cooldown. Used by the StatsView "available" count so the user sees the
+// actual usable-slot count, not a misleading total when all slots are
+// saturated. entryIsFresh alone does NOT check saturatedUntil — it was
+// designed for cred-validity checks, not runtime usability.
+//
+// Example: build 72 on 2026-05-10 23:03 had pool=8 with all 8 slots
+// holding fresh creds (entryIsFresh=true for all) but all 8 also marked
+// VK-saturated by smart-pause. UI showed "Pool 8/8/8" misleadingly when
+// reality was 0 usable. entryIsAvailable would have correctly reported 0.
+func entryIsAvailable(e credPoolEntry) bool {
+	if !entryIsFresh(e) {
+		return false
+	}
+	if !e.saturatedUntil.IsZero() && time.Now().Before(e.saturatedUntil) {
+		return false
+	}
+	return true
+}
+
 // entryIsPending reports whether the slot holds a cred that's
 // load-from-disk-pending: present, with a valid expiry, but not yet
 // past its saturation cooldown. pickSlotToFill uses this to leave
@@ -1871,6 +2053,19 @@ func (cp *credPool) countFreshLocked() int {
 	n := 0
 	for _, e := range cp.pool {
 		if entryIsFresh(e) {
+			n++
+		}
+	}
+	return n
+}
+
+// countAvailableLocked assumes cp.mu is held. Same as countFreshLocked
+// but ALSO excludes saturated slots — see entryIsAvailable. Used for the
+// UI "available" count.
+func (cp *credPool) countAvailableLocked() int {
+	n := 0
+	for _, e := range cp.pool {
+		if entryIsAvailable(e) {
 			n++
 		}
 	}

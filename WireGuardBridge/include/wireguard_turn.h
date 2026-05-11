@@ -92,6 +92,14 @@ void wgWakeHealthCheck(int32_t tunnelHandle);
 ///              in the log line; usually the new path description.
 void wgLogPathSnapshot(int32_t tunnelHandle, const char *label);
 
+/// Pre-emptive saturation marking on iOS network-path change. Called from
+/// Swift's NWPathMonitor pathUpdateHandler after dedup. For each pool
+/// slot with active>0 OR lastUsedAt within ~10 min, marks the slot
+/// VK-saturated immediately instead of waiting for the next allocate
+/// attempt to hit 486. Cheap, no-op for slots that aren't in use.
+/// See Proxy.OnPathChange / credPool.MarkInUseSlotsForPathChange.
+void wgPathChanged(int32_t tunnelHandle);
+
 /// Provide captcha answer to unblock pending credential fetch.
 void wgSolveCaptcha(int32_t tunnelHandle, const char *answer);
 

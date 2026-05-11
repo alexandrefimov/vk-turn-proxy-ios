@@ -13,14 +13,18 @@ struct TunnelStats: Codable {
     var turnRTTms: Double = 0
     var dtlsHandshakeMs: Double = 0
     var reconnects: Int64 = 0
+    // Number of slots AVAILABLE for new conn allocations RIGHT NOW:
+    // cred is fresh (valid VK expiry, past load cooldown) AND not
+    // currently VK-saturated (no active smart-pause from a recent path
+    // change or 486). Field name is legacy — populated from
+    // countAvailableLocked since build 73 (was countFreshLocked which
+    // missed saturatedUntil and showed misleading "8/8/8" when all
+    // slots were locked, vpn.wifi-lte-wifi.1.log 2026-05-10).
     var credPoolFilled: Int32 = 0
     // Slots physically holding a cred — superset of credPoolFilled.
-    // Diverges when a slot's cred crosses its 30-min expiry buffer or
-    // enters a pending/saturated state: drops out of "filled" so new
-    // conns won't pick it, but existing conns on it stay alive until
-    // VK-side allocation actually expires. The StatsView "Pool" box
-    // shows both numbers so the user can tell apart "cred is gone" from
-    // "cred is here but not handing out new allocations right now".
+    // Includes saturated, pending and past-expiry-buffer slots. Used by
+    // the StatsView middle number so the user can tell apart "cred is
+    // gone" from "cred is here but locked / aging out".
     var credPoolWithCreds: Int32 = 0
     var credPoolSize: Int32 = 0
     // Seconds since the extension's Proxy was created. Source of truth
@@ -498,6 +502,7 @@ class TunnelManager: ObservableObject {
               let msg = "debug_log:\(message)".data(using: .utf8) else { return }
         try? session.sendProviderMessage(msg) { _ in }
     }
+
 
     /// Route captcha-WebView log messages into the vpn.log stream.
     ///

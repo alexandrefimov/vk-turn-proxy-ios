@@ -278,7 +278,15 @@ struct SettingsView: View {
                         }
                 }
 
-                Stepper("Connections: \(numConnections)", value: $numConnections, in: 1...64)
+                // UI cap at 50 — pool size formula (ceil(N*4/10), creds.go
+                // build 73) means N=50 → 20 slots, N=64 → 26 slots, both
+                // pull more VK API traffic than is practical for typical
+                // single-user setups. Existing values above 50 (legacy
+                // installs, or values applied via Full Backup / Connection
+                // Link import — both bypass this Stepper) are preserved
+                // by widening the upper bound to max(50, current). Stepper
+                // can only decrease them; once back ≤ 50 the cap holds.
+                Stepper("Connections: \(numConnections)", value: $numConnections, in: 1...max(50, numConnections))
 
                 Stepper("Cred pool cooldown: \(credPoolCooldownSeconds) s", value: $credPoolCooldownSeconds, in: 30...600, step: 30)
             }
@@ -664,16 +672,21 @@ struct StatsView: View {
                     )
                 }
                 StatBox(
-                    // Three numbers: fresh / with-creds / total.
-                    //   fresh: slots usable for new conn allocations.
+                    // Three numbers: available / with-creds / total.
+                    //   available: slots usable for new conn allocations
+                    //              RIGHT NOW — fresh creds AND not in a
+                    //              VK-saturation cooldown (e.g. from
+                    //              smart-pause after a path change).
                     //   with-creds: slots physically holding a cred,
-                    //               including stale (past expiry buffer)
-                    //               or pending ones — existing conns on
-                    //               those slots are still alive.
+                    //               including saturated, stale (past
+                    //               expiry buffer) or pending ones —
+                    //               existing conns on those slots stay
+                    //               alive but new allocations are blocked.
                     //   total: configured pool capacity.
-                    // fresh ≤ with-creds ≤ total. They diverge after
-                    // ~7.5h+ of uptime when slot creds approach their
-                    // VK-side 8-hour expiry.
+                    // available ≤ with-creds ≤ total. After a back-to-back
+                    // path transition all slots can become saturated,
+                    // showing e.g. "0/12/12" until the first smart-pause
+                    // cooldown expires (~10 min).
                     title: "Pool",
                     value: "\(tunnel.stats.credPoolFilled)/\(tunnel.stats.credPoolWithCreds)/\(tunnel.stats.credPoolSize)",
                     sub: nil

@@ -10,5 +10,14 @@
 	<array>
 		<string>group.com.vkturnproxy.app</string>
 	</array>
+	<!-- Required for NEHotspotNetwork.fetchCurrent in PacketTunnelProvider
+	     to return non-nil network data. Without this, fetchCurrent silently
+	     returns nil even from a VPN extension context (verified 2026-05-11
+	     build 78: zero ssid="..." entries in [PathMonitor] log lines).
+	     wifi-info is the lighter-weight option vs HotspotConfiguration —
+	     read-only access to current WiFi network metadata, no joining /
+	     configuring capability. -->
+	<key>com.apple.developer.networking.wifi-info</key>
+	<true/>
 </dict>
 </plist>
