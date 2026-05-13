@@ -726,10 +726,37 @@ const vkSaturationCooldown = 3 * time.Minute
 const vkActiveAllocationsCooldown = 11 * time.Minute
 
 // activeAllocationsWindow is the lastUsedAt threshold under which a 486
-// is interpreted as "VK still holds our active allocations". Tied to
-// VK's TURN allocation lifetime (~600s = 10m) — if our allocations
-// were active any time in the last 10m, the lifetime hasn't run out.
-const activeAllocationsWindow = 10 * time.Minute
+// is interpreted as "VK still holds our active allocations" (and dually,
+// also the smart-pause threshold for marking a slot as having potentially
+// live VK quota on path change).
+//
+// VK's TURN allocation lifetime is 600s from the LAST refresh, and pion
+// refreshes every ~5min during a conn's life. So the latest allocation
+// expiry timestamp is:
+//
+//   T_last_refresh + 600s, where T_last_refresh ∈ [T_conn_die - 5m, T_conn_die]
+//
+// Worst case (refresh fired just before death): T_conn_die + 600s = +10m.
+// Our `lastUsedAt` is set when conn count drops to 0 (≈ T_conn_die for
+// last conn in slot). So VK can hold a live allocation up to 10m past
+// lastUsedAt in the worst case.
+//
+// Originally this window was 10m — exactly matching VK's lifetime with
+// ZERO safety margin. Symptom (vpn.over24h.log 2026-05-13 15:26 outage):
+// slots 3/4/5 had `lastUsedAt > 10m ago` so smart-pause skipped them at
+// event 1, but pion's last refresh on those slots had been just before
+// their lastUsedAt → VK allocations still alive ~1-2 min after our 10m
+// threshold. 26 conns retried Allocate on slots 3/4/5 after smart-pause
+// blocked 0/1/2, hit 486 (quota still occupied by previous-session
+// allocations VK hadn't expired yet), markSaturated fired with reason
+// "active-now, conns still hold slot". Cascade: all 12 slots saturated
+// → 10-minute outage until cooldowns elapsed.
+//
+// 12m = 10m worst-case allocation lifetime + 2m buffer for VK processing
+// + slot of conservatism. Cost: smart-pause may mark 1-2 extra slots per
+// path change covering the 10-12m window. With pool=12 and typically
+// only 3-6 slots active at any moment, this is acceptable.
+const activeAllocationsWindow = 12 * time.Minute
 
 // pauseAcquireAfterPathEvent is how long credPool.get() returns "paused"
 // after each wgPathChanged call. iOS fires PathMonitor events in pairs
