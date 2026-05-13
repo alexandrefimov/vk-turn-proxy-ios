@@ -423,14 +423,45 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                         label.withCString { cstr in
                             wgLogPathSnapshot(self.tunnelHandle, cstr)
                         }
-                        // Pre-emptive saturation marking — tell Go side that
-                        // a path change just happened so it marks in-use
-                        // slots as quota-locked BEFORE the inevitable 486
-                        // burst that would otherwise hit them via the retry
-                        // loop. Saves ~0.5-1 sec of failed-allocate spam
-                        // plus the log pollution. See wgPathChanged in
-                        // bridge.go.
-                        wgPathChanged(self.tunnelHandle)
+
+                        // Branch on iface type. `iface=other` satisfied
+                        // events almost always mean our own TUN device
+                        // (utun*) became os-default during a brief
+                        // recursive-routing fallback window between
+                        // physical interface changes — Apple DTS has
+                        // confirmed VPN tunnels show up as
+                        // InterfaceType.other (forum thread 706963).
+                        // Observed pattern (vpn.over24h.log 2026-05-13
+                        // 15:26 outage):
+                        //   T+0      unsatisfied <real-iface>     ← wgPathChanged (mark in-use)
+                        //   T+162ms  satisfied iface=other        ← MUST extend pause, NOT re-mark
+                        //   T+3.3s   satisfied <new-real-iface>   ← wgPathChanged (mark + extend)
+                        //
+                        // Without the wgPathInTransition path, the
+                        // 500ms pause from the unsatisfied event expires
+                        // before the new real interface arrives, so
+                        // conns acquire fresh slots during the gap,
+                        // their allocations end up dead/486-blocked,
+                        // and the pool cascade-saturates.
+                        let isOther = path.status == .satisfied
+                            && !path.usesInterfaceType(Network.NWInterface.InterfaceType.wifi)
+                            && !path.usesInterfaceType(Network.NWInterface.InterfaceType.cellular)
+                            && !path.usesInterfaceType(Network.NWInterface.InterfaceType.wiredEthernet)
+                            && !path.usesInterfaceType(Network.NWInterface.InterfaceType.loopback)
+                            && path.usesInterfaceType(Network.NWInterface.InterfaceType.other)
+                        if isOther {
+                            // Extend pause-acquire only, no smart-pause
+                            // re-marking. See wgPathInTransition in
+                            // bridge.go.
+                            wgPathInTransition(self.tunnelHandle)
+                        } else {
+                            // Pre-emptive saturation marking — tell Go
+                            // side that a path change just happened so
+                            // it marks in-use slots as quota-locked
+                            // BEFORE the inevitable 486 burst. See
+                            // wgPathChanged in bridge.go.
+                            wgPathChanged(self.tunnelHandle)
+                        }
                     }
                 }
             }

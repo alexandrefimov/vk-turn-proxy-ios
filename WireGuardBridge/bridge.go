@@ -689,6 +689,38 @@ func wgPathChanged(tunnelHandle C.int32_t) {
 	entry.proxy.OnPathChange()
 }
 
+//export wgPathInTransition
+//
+// Pause-only path event handler. Called from Swift's NWPathMonitor on
+// satisfied events with iface=other (which empirically means our own TUN
+// device becoming os-default during the brief recursive-routing window
+// between physical interface changes). Unlike wgPathChanged, this does
+// NOT trigger smart-pause re-marking — there's no new active state to
+// mark, the previous physical-iface unsatisfied event already handled
+// that. Instead this extends the pause-acquire window (currently 5s) so
+// conns don't acquire fresh slots during the misleading "recovery"
+// state.
+//
+// Without this, the 500ms pause from the previous unsatisfied event
+// expires before the real new physical iface arrives (~3s gap observed
+// in vpn.over24h.log 2026-05-13 15:26 outage), allowing conns to acquire
+// slots that will then host dead allocations + 486 cascade.
+//
+// See Proxy.OnPathTransition + credPool.ExtendPauseAcquireForTransition
+// for full rationale.
+func wgPathInTransition(tunnelHandle C.int32_t) {
+	id := int32(tunnelHandle)
+	tunnelsMu.Lock()
+	entry, ok := tunnels[id]
+	tunnelsMu.Unlock()
+
+	if !ok || entry.proxy == nil {
+		return
+	}
+
+	entry.proxy.OnPathTransition()
+}
+
 //export wgLogPathSnapshot
 //
 // Triggers a one-shot pathstats log line. Called by Swift's NWPathMonitor

@@ -1853,6 +1853,40 @@ func (cp *credPool) MarkInUseSlotsForPathChange() {
 	cp.pauseAcquireUntil = now.Add(pauseAcquireAfterPathEvent)
 }
 
+// ExtendPauseAcquireForTransition extends pauseAcquireUntil without marking
+// any slots. Used for path events that signal "transition in progress, real
+// network not yet stable" — specifically iOS PathMonitor satisfied events
+// with iface=other (which empirically means our own TUN device becoming
+// os-default during the brief window between physical interfaces).
+//
+// Motivation: vpn.over24h.log 2026-05-13 15:26 outage. Sequence was:
+//   T+0     requiresConnection cellular (Event 1)
+//   T+162ms satisfied iface=other os-default=192.168.102.4 (our TUN!)
+//   T+3.3s  satisfied iface=cellular (Event 3 — real new path)
+//
+// MarkInUseSlotsForPathChange on Event 1 correctly marked 6 active slots
+// and set pauseAcquireUntil = now + 500ms. By the time Event 2 fired
+// (162ms after Event 1) the pause was still alive. But the 500ms pause
+// expired before Event 3 (3.3s later), so 26 conns acquired fresh slots
+// 0/1/2 during the gap, then those allocations dropped/failed/got 486 →
+// pool-wide saturation cascade → 10-minute outage.
+//
+// The proper fix isn't to call MarkInUseSlotsForPathChange on the .other
+// event — there are no NEW active slots to mark (the slots are the same
+// ones marked at Event 1). Instead we just extend the pause to cover the
+// transition window so conns DON'T acquire during the misleading recovery.
+//
+// Existing pause-set-via-MarkInUseSlots stays untouched. This function
+// only extends. Idempotent and safe to call multiple times — uses max().
+func (cp *credPool) ExtendPauseAcquireForTransition(d time.Duration) {
+	cp.mu.Lock()
+	defer cp.mu.Unlock()
+	deadline := time.Now().Add(d)
+	if deadline.After(cp.pauseAcquireUntil) {
+		cp.pauseAcquireUntil = deadline
+	}
+}
+
 // tryFill is called by the background grower (see Proxy.growCredPool) to
 // fill one empty/stale slot without blocking any caller. Returns true if
 // the slot ended up fresh as a result — either because we filled it, or

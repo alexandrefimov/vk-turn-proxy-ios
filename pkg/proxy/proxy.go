@@ -2953,6 +2953,27 @@ func (p *Proxy) OnPathChange() {
 	}
 }
 
+// OnPathTransition is called from Swift's NWPathMonitor when a satisfied
+// path event arrives with iface=other (recursive routing fallback —
+// typically our own TUN device becoming os-default during the brief gap
+// between physical interface changes). Unlike OnPathChange, this does
+// NOT trigger smart-pause marking — there are no new active slots to
+// mark, the previous physical-iface unsatisfied event already handled
+// that. Instead we just extend the pause window so conns don't acquire
+// fresh slots during this misleading "recovery" state (which would lead
+// to dead allocations + 486 cascade when the real new path eventually
+// arrives).
+//
+// See credPool.ExtendPauseAcquireForTransition for the empirical rationale
+// (vpn.over24h.log 2026-05-13 15:26 outage).
+func (p *Proxy) OnPathTransition() {
+	if p.credPool != nil {
+		// 5 seconds covers observed worst-case iface=other window of ~3.3s
+		// (vpn.over24h.log 15:26:08 → 15:26:11) with comfortable margin.
+		p.credPool.ExtendPauseAcquireForTransition(5 * time.Second)
+	}
+}
+
 func (p *Proxy) LogPathSnapshot(label string) {
 	osDefault := pathSnapshotOSDefault()
 

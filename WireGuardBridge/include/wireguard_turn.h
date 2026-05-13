@@ -100,6 +100,14 @@ void wgLogPathSnapshot(int32_t tunnelHandle, const char *label);
 /// See Proxy.OnPathChange / credPool.MarkInUseSlotsForPathChange.
 void wgPathChanged(int32_t tunnelHandle);
 
+/// Pause-only path event handler for iOS satisfied events with iface=other
+/// (recursive-routing fallback through our own TUN — typically observed
+/// during the gap between physical interface changes). Extends the
+/// pause-acquire window so conns don't grab fresh slots during this
+/// misleading "recovery" state. Does NOT trigger smart-pause re-marking.
+/// See Proxy.OnPathTransition / credPool.ExtendPauseAcquireForTransition.
+void wgPathInTransition(int32_t tunnelHandle);
+
 /// Provide captcha answer to unblock pending credential fetch.
 void wgSolveCaptcha(int32_t tunnelHandle, const char *answer);
 
