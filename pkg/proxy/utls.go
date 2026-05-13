@@ -15,53 +15,52 @@ import (
 )
 
 // vkHostIPs is a host→IP map populated by the main app right before
-// startVPNTunnel. It lets the extension dial VK API endpoints without
-// depending on a working DNS resolver during the bootstrap window.
+// startVPNTunnel. It lets the extension dial VK API endpoints by IP
+// without doing DNS resolution, saving the ~30-50ms round-trip per host
+// (latency optimization). Originally it was thought to be a structural
+// requirement; empirical testing 2026-05-13 disproved that.
 //
-// What actually fails / works in the extension (verified empirically
-// 2026-05-11 via dns-probe in build 86 for `privacy-cs.mail.ru`):
+// Empirical results (build with `ProbeDNS` in pkg/proxy/dns_probe.go,
+// running both pre-bootstrap from wgStartVKBootstrap and post-bootstrap
+// via fetchAdFpPing):
 //
-//   - **Pre-bootstrap window** (extension started, setTunnelNetworkSettings
-//     NOT yet called — i.e., before TUN exists with the dns=1.1.1.1
-//     config). All resolver paths fail: cgo getaddrinfo returns "no
-//     such host" because iOS hasn't wired up the per-process resolver
-//     context for the extension yet; pure-Go resolver hits [::1]:53
-//     "connection refused" (no /etc/resolv.conf); SCDynamicStore is
-//     explicitly unavailable on iOS. This is the window where we MUST
-//     use pre-resolved IPs — and it's exactly when our deferred-
-//     setTunnelNetworkSettings architecture is doing VK API calls for
-//     bootstrap, so pre-resolution is structurally required.
+//   - **Pure-Go resolver** (`net.Resolver{PreferGo: true}`): fails in
+//     BOTH pre- and post-bootstrap with `lookup ... on [::1]:53: read
+//     udp ...: connection refused`. Extension sandbox has no usable
+//     /etc/resolv.conf, so pure-Go falls back to [::1]:53 where nothing
+//     is listening. Don't rely on this path.
 //
-//   - **Post-bootstrap window** (TUN up with dns=1.1.1.1 configured).
-//     cgo getaddrinfo WORKS — resolves via mDNSResponder XPC which uses
-//     the tunnel DNS server, packets to 1.1.1.1 route through TUN → WG →
-//     server → 1.1.1.1 and back. The pure-Go resolver still fails (still
-//     no /etc/resolv.conf). So `net.DefaultResolver.LookupHost` and
-//     `net.Dialer.Dial` work for arbitrary hosts in this window.
+//   - **System resolver** (cgo getaddrinfo via libsystem_info →
+//     mDNSResponder XPC): WORKS in both windows. Pre-bootstrap returned
+//     9 IPs for api.vk.ru in 37ms before setTunnelNetworkSettings was
+//     called. Post-bootstrap resolves arbitrary hosts (including
+//     non-VK like privacy-cs.mail.ru) through tunnel-routed DNS.
 //
-// Why `vk_host_ips` is still useful even post-bootstrap:
+//   - **net.Dialer.Dial**: succeeds in both windows. Uses system
+//     resolver internally, so its success corroborates system DNS
+//     working end-to-end (resolution + TCP connect).
 //
-//   - Latency: tunnel-routed DNS adds ~50-200ms vs direct in-process
-//     lookup. For hot-path hosts (api.vk.ru hit per cred-fetch) that
-//     matters; for one-off pings (privacy-cs.mail.ru) it doesn't.
+// So `vk_host_ips` is NOT structurally required. The extension could
+// fall back to system DNS for any VK host and bootstrap would still
+// succeed. We keep the pre-resolution path as:
 //
-//   - Resilience: if tunnel is broken mid-session, pre-resolved IPs
-//     are the ONLY DNS we have. The main-app pre-resolves before
-//     handing config to extension, so the IPs survive tunnel outages.
+//   - Latency optimization: ~30-50ms saved per VK host call (DNS
+//     round-trip avoided). Adds up across many calls during bootstrap.
+//   - Defense in depth: if system DNS ever stops working in some future
+//     iOS version or in a particular network, pre-resolved IPs continue
+//     to work.
+//   - Whitelist resilience: on networks where iOS-configured DNS may not
+//     resolve VK hosts (some restrictive corporate / public networks),
+//     IPs pre-resolved by the main app via its own DNS context still
+//     work for the extension.
 //
-//   - Whitelist networks: the deployment target is networks that allow
-//     VK + a few other resources but block public DNS. In pre-bootstrap
-//     we have no way to reach 1.1.1.1 directly; only after the tunnel
-//     is up does the DNS query travel encapsulated through WG, exempt
-//     from the whitelist's blocking.
-//
-// The main-app process, in contrast, has a fully-populated network
-// context the whole time — its standard CFHost / getaddrinfo resolves
-// through whichever DNS the system is currently using (DHCP / carrier),
-// which is by definition reachable in the user's environment. So we
-// let it resolve VK hosts there, pass the IPs through providerConfig,
-// and the extension dials by IP for the bootstrap-critical hosts while
-// keeping the original hostname in TLS SNI / Host headers.
+// The main-app process, in contrast, always has a fully-populated
+// network context — its standard CFHost / getaddrinfo resolves through
+// whichever DNS the system is currently using (DHCP / carrier), which
+// is by definition reachable in the user's environment. The main app
+// pre-resolves VK hosts and passes the IPs through providerConfig; the
+// extension dials by IP for these specific hosts while keeping the
+// original hostname in TLS SNI / Host headers.
 var (
 	vkHostIPsMu sync.RWMutex
 	vkHostIPs   = make(map[string][]string) // host (no port) → list of IPs (all A-records)
