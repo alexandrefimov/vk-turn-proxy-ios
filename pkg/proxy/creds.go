@@ -1894,7 +1894,21 @@ func (cp *credPool) ExtendPauseAcquireForTransition(d time.Duration) {
 //
 // Respects cooldown (skip) and in-flight fetches (skip). Like get(), it
 // does NOT hold mu across the VK fetch.
-func (cp *credPool) tryFill(slot int, allowCaptchaBlock bool) bool {
+//
+// abortIfAvailableGTE (0 = disabled, >0 = enabled): if at any of the two
+// checkpoints — pre-fetch (saves PoW time) or post-fetch (catches races
+// during PoW) — cp.countAvailableLocked() returns >= this value, the fill
+// is aborted. Pre-fetch abort releases the slot's `fetching` flag and
+// returns false (no VK call made). Post-fetch abort discards already-
+// fetched creds AND releases the flag.
+//
+// Used by the grower to bail when conn-driven fetches in get() race ahead
+// and push the pool past the cold-start target during our 5-10s PoW wait.
+// Without this, the grower systematically over-shoots cold-start by 1
+// (observed vpn.wifi.5.log + wifi.6.log: pool 0 → 4 instead of 0 → 3 for
+// NumConns=30 because conn 10 fetched slot 2 while grower was mid-PoW
+// on slot 3).
+func (cp *credPool) tryFill(slot int, allowCaptchaBlock bool, abortIfAvailableGTE int) bool {
 	cp.mu.Lock()
 	if slot < 0 || slot >= cp.size {
 		cp.mu.Unlock()
@@ -1919,6 +1933,13 @@ func (cp *credPool) tryFill(slot int, allowCaptchaBlock bool) bool {
 		cp.mu.Unlock()
 		return false
 	}
+	// Pre-fetch abort check (saves PoW). If conn-driven fetches in get()
+	// have already pushed available past the cold-start target, this
+	// fill is redundant.
+	if abortIfAvailableGTE > 0 && cp.countAvailableLocked() >= abortIfAvailableGTE {
+		cp.mu.Unlock()
+		return false
+	}
 	cp.pool[slot].fetching = true
 	cp.mu.Unlock()
 
@@ -1927,6 +1948,14 @@ func (cp *credPool) tryFill(slot int, allowCaptchaBlock bool) bool {
 	cp.mu.Lock()
 	cp.pool[slot].fetching = false
 	if err == nil {
+		// Post-fetch abort check (catches races during our 5-10s PoW
+		// window). Discards fetched creds — they go to waste this round
+		// but that's far cheaper than continuing to systematically
+		// over-shoot the cold-start target by 1.
+		if abortIfAvailableGTE > 0 && cp.countAvailableLocked() >= abortIfAvailableGTE {
+			cp.mu.Unlock()
+			return false
+		}
 		cp.pool[slot] = credPoolEntry{addr: addr, creds: creds, ts: time.Now()}
 		filled := cp.countFreshLocked()
 		cp.mu.Unlock()
