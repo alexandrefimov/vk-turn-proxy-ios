@@ -1459,6 +1459,81 @@ func (cp *credPool) saveToDisk() {
 // out a saturated slot's cred.
 const connsPerSlot = 10
 
+// pickAcquireSlotLocked picks the best slot for connIdx to acquire, or
+// returns -1 if no slot is usable. Caller must hold cp.mu.
+//
+// Selection priority:
+//  1. ownSlot if fresh + has capacity + not VK-saturated.
+//  2. Among other fresh + capacity + non-saturated slots, the one with
+//     the highest active count (compact-fill: consolidate conns onto
+//     already-in-use slots so each path-change event marks fewer slots).
+//  3. If no candidate has active>0 (all idle), the lowest-index idle
+//     candidate — same order the prior implementation used.
+//
+// kind classifies the choice for the caller's log line: "own",
+// "compact", or "fresh" (or "" if no slot found).
+//
+// logSkips=true emits per-slot "skipping (VK-saturated)" log lines for
+// slots passed over due to active saturation cooldowns. Pass false on
+// the post-fetch retry path to avoid duplicating log lines the initial
+// scan already produced.
+//
+// Compact-fill rationale: MarkInUseSlotsForPathChange (smart-pause)
+// marks EVERY slot with active>0 on each PathMonitor event. Spreading
+// 30 conns across 7 slots costs 7 marks per event; clustering on the
+// optimal 3 costs 3. Compact-fill keeps the spread near the floor of
+// ceil(NumConns/connsPerSlot), so the pool survives more back-to-back
+// cascades before all-saturated. See open_improvement_compact_fill in
+// memory for the empirical context (build 87, 2026-05-14).
+func (cp *credPool) pickAcquireSlotLocked(connIdx, ownSlot int, logSkips bool) (int, string) {
+	now := time.Now()
+
+	// Priority 1: ownSlot, unconditionally preferred when usable.
+	if cp.isFreshLocked(ownSlot) && cp.pool[ownSlot].active < connsPerSlot {
+		if now.Before(cp.pool[ownSlot].saturatedUntil) {
+			if logSkips {
+				log.Printf("credpool: conn %d skipping slot %d (VK-saturated for %s more)",
+					connIdx, ownSlot, cp.pool[ownSlot].saturatedUntil.Sub(now).Round(time.Second))
+			}
+		} else {
+			return ownSlot, "own"
+		}
+	}
+
+	// Priority 2/3: scan other slots, picking max-active (compact-fill)
+	// or the lowest-index idle slot when all candidates have active=0.
+	bestSlot := -1
+	bestActive := -1
+	for i := 0; i < cp.size; i++ {
+		if i == ownSlot {
+			continue
+		}
+		if !cp.isFreshLocked(i) || cp.pool[i].active >= connsPerSlot {
+			continue
+		}
+		if now.Before(cp.pool[i].saturatedUntil) {
+			if logSkips {
+				log.Printf("credpool: conn %d skipping slot %d (VK-saturated for %s more)",
+					connIdx, i, cp.pool[i].saturatedUntil.Sub(now).Round(time.Second))
+			}
+			continue
+		}
+		// Strict > keeps the lowest-index slot when active counts tie
+		// (iteration order is ascending).
+		if cp.pool[i].active > bestActive {
+			bestSlot = i
+			bestActive = cp.pool[i].active
+		}
+	}
+	if bestSlot < 0 {
+		return -1, ""
+	}
+	if bestActive > 0 {
+		return bestSlot, "compact"
+	}
+	return bestSlot, "fresh"
+}
+
 func (cp *credPool) get(connIdx int, allowCaptchaBlock bool) (string, *TURNCreds, int, error) {
 	cp.mu.Lock()
 
@@ -1492,9 +1567,10 @@ func (cp *credPool) get(connIdx int, allowCaptchaBlock bool) (string, *TURNCreds
 	}
 
 	// candidatesOrdered enumerates pool slots starting with ownSlot
-	// (preference), then the others in index order. Used twice: once
-	// for the fresh-and-available scan, once for picking a fetch
-	// target.
+	// (preference), then the others in index order. Used by Phase 2
+	// (fetch-target picking) below. Phase 1's acquire path uses
+	// pickAcquireSlotLocked instead — it implements compact-fill,
+	// which candidatesOrdered cannot express on its own.
 	candidatesOrdered := func() []int {
 		out := make([]int, 0, cp.size)
 		out = append(out, ownSlot)
@@ -1506,26 +1582,23 @@ func (cp *credPool) get(connIdx int, allowCaptchaBlock bool) (string, *TURNCreds
 		return out
 	}
 
-	// Phase 1: any fresh slot with quota room? Prefer ownSlot. Skip
-	// slots marked as VK-side saturated — their cred is still valid
-	// (will be reused once the cooldown expires) but VK has lingering
-	// allocations from before that are blocking new ones.
-	now := time.Now()
-	for _, slot := range candidatesOrdered() {
-		if !cp.isFreshLocked(slot) || cp.pool[slot].active >= connsPerSlot {
-			continue
-		}
-		if now.Before(cp.pool[slot].saturatedUntil) {
-			log.Printf("credpool: conn %d skipping slot %d (VK-saturated for %s more)",
-				connIdx, slot, cp.pool[slot].saturatedUntil.Sub(now).Round(time.Second))
-			continue
-		}
+	// Phase 1: any fresh slot with quota room? Prefer ownSlot; when
+	// ownSlot isn't usable, fall back via compact-fill (consolidate
+	// onto already-active slots) instead of first-by-index. See
+	// pickAcquireSlotLocked for the selection logic + rationale (each
+	// path event marks fewer slots when conns cluster).
+	if slot, kind := cp.pickAcquireSlotLocked(connIdx, ownSlot, true); slot >= 0 {
 		cp.pool[slot].active++
 		e := cp.pool[slot]
 		cp.mu.Unlock()
-		tag := "own slot"
-		if slot != ownSlot {
-			tag = "fallback"
+		var tag string
+		switch kind {
+		case "own":
+			tag = "own slot"
+		case "compact":
+			tag = "fallback compact-fill"
+		default: // "fresh"
+			tag = "fallback fresh slot"
 		}
 		log.Printf("credpool: conn %d acquired slot %d (%s, active=%d/%d, age %s)",
 			connIdx, slot, tag, e.active, connsPerSlot, time.Since(e.ts).Round(time.Second))
@@ -1540,7 +1613,7 @@ func (cp *credPool) get(connIdx int, allowCaptchaBlock bool) (string, *TURNCreds
 	// pending slots avoids overwriting a disk-loaded cred that's about
 	// to become available on its own — a wasted VK fetch (and likely
 	// captcha attempt) for no benefit.
-	now = time.Now()
+	now := time.Now()
 	target := -1
 	for _, slot := range candidatesOrdered() {
 		if cp.isFreshLocked(slot) {
@@ -1598,15 +1671,26 @@ func (cp *credPool) get(connIdx int, allowCaptchaBlock bool) (string, *TURNCreds
 	// slot — background grower may have filled one while we were
 	// blocked on VK.
 	cp.pool[target].cooldownUntil = time.Now().Add(cp.cooldown)
-	for _, slot := range candidatesOrdered() {
-		if cp.isFreshLocked(slot) && cp.pool[slot].active < connsPerSlot {
-			cp.pool[slot].active++
-			e := cp.pool[slot]
-			cp.mu.Unlock()
-			log.Printf("credpool: conn %d fetch into slot %d failed (%v), falling back to slot %d (active=%d/%d, age %s), cooldown %s",
-				connIdx, target, fetchErr, slot, e.active, connsPerSlot, time.Since(e.ts).Round(time.Second), cp.cooldown)
-			return e.addr, e.creds, slot, nil
+	// Compact-fill applies here too: if the grower or another conn
+	// filled a slot during our fetch window, prefer the most-active
+	// one. logSkips=false because Phase 1's initial scan already
+	// emitted any per-slot "VK-saturated" lines for these slots.
+	if slot, kind := cp.pickAcquireSlotLocked(connIdx, ownSlot, false); slot >= 0 {
+		cp.pool[slot].active++
+		e := cp.pool[slot]
+		cp.mu.Unlock()
+		var tag string
+		switch kind {
+		case "own":
+			tag = "own slot"
+		case "compact":
+			tag = "fallback compact-fill"
+		default: // "fresh"
+			tag = "fallback fresh slot"
 		}
+		log.Printf("credpool: conn %d fetch into slot %d failed (%v), falling back to slot %d (%s, active=%d/%d, age %s), cooldown %s",
+			connIdx, target, fetchErr, slot, tag, e.active, connsPerSlot, time.Since(e.ts).Round(time.Second), cp.cooldown)
+		return e.addr, e.creds, slot, nil
 	}
 	cp.mu.Unlock()
 	log.Printf("credpool: conn %d fetch into slot %d failed and no fallback available: %v (cooldown %s)",
