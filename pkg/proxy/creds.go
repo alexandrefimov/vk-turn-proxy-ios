@@ -776,6 +776,43 @@ const activeAllocationsWindow = 12 * time.Minute
 // off, returning to acquire when the pause naturally expires.
 const pauseAcquireAfterPathEvent = 500 * time.Millisecond
 
+// cascadeDetectionWindow + cascadePauseDuration implement adaptive pause-
+// acquire for multi-event path cascades (vs single iOS dual-event sequence).
+//
+// Single handover: one PathMonitor event (or iOS dual-event 130-365ms
+// apart) → pauseAcquireAfterPathEvent (500ms) is enough.
+//
+// Multi-event cascade: WiFi → LTE → other-WiFi → LTE within ~30-60 seconds
+// (e.g., walking past a known WiFi network while moving from indoor to
+// outdoor coverage, or jittery cellular causing reconnect bouncing).
+// Each event marks the slots holding active conns. Between events, conns
+// redistribute onto OTHER fresh slots — the next event then marks those
+// too. Result: pool wiped after 3-4 events.
+//
+// Observed multi-event cascades and their gaps:
+//   2026-05-13 20:01-20:02 — gaps 46s, 27s
+//   2026-05-14 19:43-19:45 — gaps 51s, 36s
+//   2026-05-14 14:30      — gaps ~3s + ~3s (with iface=other in middle,
+//                            handled by Variant B's 5s extended pause)
+//
+// On each path event we check `gap = now - lastPathEventAt`:
+//
+//   gap < 500ms                → iOS dual-event, normal pause refresh (500ms)
+//   500ms ≤ gap < 90s           → CASCADE detected, set pause to 30s
+//   gap ≥ 90s                  → isolated event, normal pause (500ms)
+//
+// 90s window comfortably covers observed real cascades with margin (typical
+// gap 25-60s). 30s pause covers the time conns would otherwise redistribute
+// onto fresh slots between events. After 30s of "no path event" we assume
+// network has stabilized.
+//
+// Trade-off: zero impact on normal handovers (no preceding event in 90s
+// window → regular 500ms). Only abnormal multi-event sequences pay the
+// 30s acquire-block. Conn retry loops see "credpool: paused for path-
+// change settle" and wait, then resume normally.
+const cascadeDetectionWindow = 90 * time.Second
+const cascadePauseDuration = 30 * time.Second
+
 // credCacheFile is the JSON-on-disk shape persisted to App Group container.
 // One file per pool. Contents are non-secret: VK TURN creds are session
 // tokens with ~8h validity, sandbox-protected by App Group entitlement.
@@ -860,6 +897,14 @@ type credPool struct {
 	// 130-365ms) keeps the pool quiet through the whole transition.
 	// See pauseAcquireAfterPathEvent comment for the full rationale.
 	pauseAcquireUntil time.Time
+
+	// lastPathEventAt is the timestamp of the most recent
+	// MarkInUseSlotsForPathChange invocation. Used for adaptive cascade
+	// detection: if a new path event fires within cascadeDetectionWindow
+	// of this timestamp (and not within iOS dual-event range), we extend
+	// pauseAcquireUntil by cascadePauseDuration instead of the default
+	// 500ms — see cascadeDetectionWindow comment.
+	lastPathEventAt time.Time
 
 	// fetch is the underlying credential fetcher. It must do all the work
 	// previously inlined in resolveTURNAddr: build solver + pending-captcha
@@ -1856,12 +1901,26 @@ func (cp *credPool) MarkInUseSlotsForPathChange() {
 		log.Printf("credpool: path-change pre-emptive — marked %d in-use slots %v with smart-pause cooldowns", len(markedSlots), markedSlots)
 	}
 
-	// Pause new acquires for pauseAcquireAfterPathEvent. Each path event
-	// extends the pause; iOS dual-event sequences (unsatisfied + satisfied
-	// 130-365ms apart) end up with a single pause window that spans the
-	// whole transition, preventing the "extra slot" race documented in the
-	// pauseAcquireAfterPathEvent comment.
-	cp.pauseAcquireUntil = now.Add(pauseAcquireAfterPathEvent)
+	// Adaptive pause-acquire selection. See cascadeDetectionWindow comment
+	// for the full rationale.
+	pauseDur := pauseAcquireAfterPathEvent // default 500ms
+	if !cp.lastPathEventAt.IsZero() {
+		gap := now.Sub(cp.lastPathEventAt)
+		if gap >= pauseAcquireAfterPathEvent && gap < cascadeDetectionWindow {
+			// Cascade detected — previous event was 500ms-90s ago,
+			// not iOS dual-event (< 500ms) and not isolated (≥ 90s).
+			// Extend pause to block conn redistribution until network
+			// stabilises.
+			pauseDur = cascadePauseDuration
+			log.Printf("credpool: path-change cascade detected (gap %v from prev event) — extending pause to %v",
+				gap.Round(time.Millisecond), cascadePauseDuration)
+		}
+	}
+	deadline := now.Add(pauseDur)
+	if deadline.After(cp.pauseAcquireUntil) {
+		cp.pauseAcquireUntil = deadline
+	}
+	cp.lastPathEventAt = now
 }
 
 // ExtendPauseAcquireForTransition extends pauseAcquireUntil without marking
