@@ -1777,7 +1777,18 @@ func (cp *credPool) MarkInUseSlotsForPathChange() {
 	defer cp.mu.Unlock()
 
 	now := time.Now()
-	marked := 0
+	// Track which slots got marked so the summary log line below can list
+	// them explicitly. Defense in depth against losing a per-slot log line:
+	// the per-slot lines emitted by applySaturationLocked carry full detail
+	// (cooldown, active count, reason) and are normally what we read; the
+	// list in the summary line is a backup so even if one per-slot line is
+	// missing from the log for any reason, we can still tell which slots
+	// were touched. Observed wifi-lte-wifi.1.log 2026-05-14 19:44:43:
+	// `marked 3 in-use slots` summary count but only 2 per-slot lines (slot
+	// 4's line missing). The actual slot 4 was demonstrably marked
+	// (subsequent "skipping slot 4 (VK-saturated)" lines confirm) — only
+	// the marking log itself was lost.
+	markedSlots := make([]int, 0, cp.size)
 	for slot := 0; slot < cp.size && slot < len(cp.pool); slot++ {
 		e := cp.pool[slot]
 		// Skip already-saturated (re-marking is no-op but spams logs)
@@ -1838,11 +1849,11 @@ func (cp *credPool) MarkInUseSlotsForPathChange() {
 		}
 
 		cp.applySaturationLocked(slot, remaining, reason)
-		marked++
+		markedSlots = append(markedSlots, slot)
 	}
 
-	if marked > 0 {
-		log.Printf("credpool: path-change pre-emptive — marked %d in-use slots with smart-pause cooldowns", marked)
+	if len(markedSlots) > 0 {
+		log.Printf("credpool: path-change pre-emptive — marked %d in-use slots %v with smart-pause cooldowns", len(markedSlots), markedSlots)
 	}
 
 	// Pause new acquires for pauseAcquireAfterPathEvent. Each path event
