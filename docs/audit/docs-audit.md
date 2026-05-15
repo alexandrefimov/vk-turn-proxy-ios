@@ -27,13 +27,12 @@ Reviewed:
 - Added Keychain migration notes for secret storage.
 - Added Codex escalation notes for Xcode, project generation, push, and GitHub Actions commands.
 - Added import validation notes for size caps, schema checks, and value checks.
+- Added safe-mode default notes and test strategy notes.
 
 ## Current documentation gaps
 
-- No safe-mode/full-tunnel UX design yet.
 - No license resolution document yet.
 
 ## Next docs to add with future branches
 
-- `docs/security/safe-mode-default.md`
 - `docs/legal/license-risk.md`

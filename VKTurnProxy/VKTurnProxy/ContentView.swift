@@ -15,11 +15,12 @@ struct ContentView: View {
     @AppStorage("peerPublicKey") private var peerPublicKey = ""
     @AppStorage("tunnelAddress") private var tunnelAddress = "192.168.102.3/24"
     @AppStorage("dnsServers") private var dnsServers = "1.1.1.1"
-    @AppStorage("allowedIPs") private var allowedIPs = "0.0.0.0/0"
+    @AppStorage("allowedIPs") private var allowedIPs = "192.168.102.0/24"
     @AppStorage("peerAddress") private var peerAddress = ""
+    @AppStorage("fullTunnelMode") private var fullTunnelMode = false
     @AppStorage("useDTLS") private var useDTLS = true
     @AppStorage("useWrap") private var useWrap = false
-    @AppStorage("numConnections") private var numConnections = 30
+    @AppStorage("numConnections") private var numConnections = 4
     @AppStorage("credPoolCooldownSeconds") private var credPoolCooldownSeconds = 150
 
     var body: some View {
@@ -64,7 +65,7 @@ struct ContentView: View {
                             // the same reason=1 (.userInitiated) NEProviderStopReason.
                             // iOS occasionally fires stopTunnel(reason=1) for non-
                             // user-initiated reasons (network change with
-                            // includeAllNetworks=true being the suspected case);
+                            // full-device VPN routing being the suspected case);
                             // having this log line lets us differentiate at triage
                             // time rather than guessing.
                             NSLog("[UI] user pressed Disconnect button (status=\(tunnel.status.rawValue))")
@@ -97,6 +98,7 @@ struct ContentView: View {
                                 allowedIPs: allowedIPs,
                                 vkLink: vkLink,
                                 peerAddress: peerAddress,
+                                fullTunnelMode: fullTunnelMode,
                                 useDTLS: useDTLS,
                                 useWrap: useWrap,
                                 wrapKeyHex: wrapKeyHex,
@@ -216,11 +218,12 @@ struct SettingsView: View {
     @AppStorage("peerPublicKey") private var peerPublicKey = ""
     @AppStorage("tunnelAddress") private var tunnelAddress = "192.168.102.3/24"
     @AppStorage("dnsServers") private var dnsServers = "1.1.1.1"
-    @AppStorage("allowedIPs") private var allowedIPs = "0.0.0.0/0"
+    @AppStorage("allowedIPs") private var allowedIPs = "192.168.102.0/24"
     @AppStorage("peerAddress") private var peerAddress = ""
+    @AppStorage("fullTunnelMode") private var fullTunnelMode = false
     @AppStorage("useDTLS") private var useDTLS = true
     @AppStorage("useWrap") private var useWrap = false
-    @AppStorage("numConnections") private var numConnections = 30
+    @AppStorage("numConnections") private var numConnections = 4
     @AppStorage("credPoolCooldownSeconds") private var credPoolCooldownSeconds = 150
 
     @State private var privateKey = ""
@@ -246,6 +249,7 @@ struct SettingsView: View {
     @State private var showResetConfirm = false
     @State private var showResetProfileConfirm = false
     @State private var showResetSecretsConfirm = false
+    @State private var showFullTunnelConfirm = false
     @State private var alertMessage: String? = nil
     @State private var alertTitle: String = ""
 
@@ -260,129 +264,10 @@ struct SettingsView: View {
 
     var body: some View {
         Form {
-            Section("VK TURN Proxy") {
-                TextField("VK Call Link", text: $vkLink)
-                    .textContentType(.URL)
-                    .autocapitalization(.none)
-                    .disableAutocorrection(true)
-                    .onChange(of: vkLink) { saveSecret($0, for: .vkLink) }
-
-                TextField("Proxy Server (host:port)", text: $peerAddress)
-                    .autocapitalization(.none)
-                    .disableAutocorrection(true)
-
-                Toggle("DTLS Obfuscation", isOn: $useDTLS)
-
-                // WRAP layer: ChaCha20-XOR every UDP packet between DTLS
-                // and TURN ChannelData so VK's TURN-relay payload classifier
-                // can't recognise DTLS+WG and tag the destination endpoint.
-                // The endpoint configured above (Proxy Server) MUST be a
-                // server running with matching -wrap and -wrap-key from the
-                // upstream cacggghp/vk-turn-proxy WRAP-aware build —
-                // without that, the DTLS handshake fails because the
-                // server-side raw bytes get XOR'd by our wrapping.
-                Toggle("Use WRAP (peer must be WRAP-aware)", isOn: $useWrap)
-
-                if useWrap {
-                    SecureField("WRAP key (64 hex chars)", text: $wrapKeyHex)
-                        .autocapitalization(.none)
-                        .disableAutocorrection(true)
-                        // Strip whitespace as the user types / pastes — paste
-                        // from clipboard often picks up leading/trailing
-                        // spaces or newlines, and a hex key has no legitimate
-                        // use for spaces inside, so silently cleaning is
-                        // safe. Without this, a stray space caused the Go
-                        // bridge to fail decoding with
-                        // "encoding/hex: invalid byte: U+0020 ' '" and
-                        // disable WRAP for the session — observed in user
-                        // report 2026-05-07. The Go bridge also strips
-                        // whitespace defensively as a backstop, but doing
-                        // it here keeps the stored value clean and avoids
-                        // a confusing reopen-Settings experience where
-                        // the SecureField has hidden whitespace inside.
-                        .onChange(of: wrapKeyHex) { newValue in
-                            let cleaned = newValue.filter { !$0.isWhitespace }
-                            if cleaned != newValue {
-                                wrapKeyHex = cleaned
-                            } else {
-                                saveSecret(cleaned, for: .wrapKeyHex)
-                            }
-                        }
-                }
-
-                // UI cap at 50 — pool size formula (ceil(N*4/10), creds.go
-                // build 73) means N=50 → 20 slots, N=64 → 26 slots, both
-                // pull more VK API traffic than is practical for typical
-                // single-user setups. Existing values above 50 (legacy
-                // installs, or values applied via Backup / Connection
-                // Link import — both bypass this Stepper) are preserved
-                // by widening the upper bound to max(50, current). Stepper
-                // can only decrease them; once back ≤ 50 the cap holds.
-                Stepper("Connections: \(numConnections)", value: $numConnections, in: 1...max(50, numConnections))
-
-                Stepper("Cred pool cooldown: \(credPoolCooldownSeconds) s", value: $credPoolCooldownSeconds, in: 30...600, step: 30)
-            }
-
-            Section("WireGuard") {
-                SecureField("Private Key (base64)", text: $privateKey)
-                    .autocapitalization(.none)
-                    .disableAutocorrection(true)
-                    .onChange(of: privateKey) { saveSecret($0, for: .privateKey) }
-
-                TextField("Peer Public Key (base64)", text: $peerPublicKey)
-                    .autocapitalization(.none)
-                    .disableAutocorrection(true)
-
-                SecureField("Preshared Key (base64)", text: $presharedKey)
-                    .autocapitalization(.none)
-                    .disableAutocorrection(true)
-                    .onChange(of: presharedKey) { saveSecret($0, for: .presharedKey) }
-
-                TextField("Tunnel Address", text: $tunnelAddress)
-                    .autocapitalization(.none)
-
-                TextField("DNS Servers", text: $dnsServers)
-                    .autocapitalization(.none)
-
-                TextField("Allowed IPs", text: $allowedIPs)
-                    .autocapitalization(.none)
-            }
-
-            Section {
-                Button(action: handleExport) {
-                    Label("Export Safe Backup…", systemImage: "square.and.arrow.up")
-                }
-
-                Button(action: { showImportPicker = true }) {
-                    Label("Import Backup…", systemImage: "square.and.arrow.down")
-                }
-
-                // 1-Click connection link. Reads a vkturnproxy://… URL
-                // (or its bare base64 payload) from the system clipboard.
-                // The same parse path also runs from .onOpenURL when the
-                // user taps a vkturnproxy:// URL anywhere on iOS — see
-                // VKTurnProxyApp.swift. quick_link.py at the repo root
-                // is the generator script.
-                Button(action: handleConnectionLinkPaste) {
-                    Label("Import from Connection Link…", systemImage: "link.badge.plus")
-                }
-
-                Button(role: .destructive, action: { showResetConfirm = true }) {
-                    Label("Reset TURN Cache", systemImage: "trash")
-                }
-
-                Button(role: .destructive, action: { showResetProfileConfirm = true }) {
-                    Label("Reset Captured Browser Profile", systemImage: "trash")
-                }
-
-                Button(role: .destructive, action: { showResetSecretsConfirm = true }) {
-                    Label("Reset Keychain Secrets", systemImage: "trash")
-                }
-            } header: {
-                Text("Backup & Restore")
-            } footer: {
-                Text("Safe backup exports non-secret preferences only. WireGuard keys, VK links, WRAP key, TURN credentials, and captured browser profile are excluded.")
-            }
+            proxySection
+            wireGuardSection
+            routingSection
+            backupSection
         }
         .navigationTitle("Settings")
         // Share sheet for the freshly-exported temp file. Bound to a
@@ -493,6 +378,16 @@ struct SettingsView: View {
         } message: {
             Text("Deletes WireGuard private key, preshared key, VK link, and WRAP key from Keychain. Non-secret settings remain unchanged.")
         }
+        .alert("Enable Full-device VPN?", isPresented: $showFullTunnelConfirm) {
+            Button("Enable", role: .destructive) {
+                fullTunnelMode = true
+            }
+            Button("Cancel", role: .cancel) {
+                fullTunnelMode = false
+            }
+        } message: {
+            Text("This routes all device traffic through the VPN profile, including system traffic where iOS allows it. Use only when you intentionally want full tunnel mode.")
+        }
         // Result alert — shared across export/import/reset success and
         // error paths since the message is what differs, not the
         // presentation. Dismiss is just OK.
@@ -528,7 +423,131 @@ struct SettingsView: View {
         }
     }
 
+    @ViewBuilder
+    private var proxySection: some View {
+        Section("VK TURN Proxy") {
+            TextField("VK Call Link", text: $vkLink)
+                .textContentType(.URL)
+                .autocapitalization(.none)
+                .disableAutocorrection(true)
+                .onChange(of: vkLink) { saveSecret($0, for: .vkLink) }
+
+            TextField("Proxy Server (host:port)", text: $peerAddress)
+                .autocapitalization(.none)
+                .disableAutocorrection(true)
+
+            Toggle("DTLS Obfuscation", isOn: $useDTLS)
+
+            // WRAP layer: ChaCha20-XOR every UDP packet between DTLS and TURN
+            // ChannelData so VK's TURN-relay payload classifier can't
+            // recognise DTLS+WG and tag the destination endpoint.
+            Toggle("Use WRAP (peer must be WRAP-aware)", isOn: $useWrap)
+
+            if useWrap {
+                SecureField("WRAP key (64 hex chars)", text: $wrapKeyHex)
+                    .autocapitalization(.none)
+                    .disableAutocorrection(true)
+                    .onChange(of: wrapKeyHex) { newValue in
+                        let cleaned = newValue.filter { !$0.isWhitespace }
+                        if cleaned != newValue {
+                            wrapKeyHex = cleaned
+                        } else {
+                            saveSecret(cleaned, for: .wrapKeyHex)
+                        }
+                    }
+            }
+
+            Stepper("Connections: \(numConnections)", value: $numConnections, in: 1...max(50, numConnections))
+            Stepper("Cred pool cooldown: \(credPoolCooldownSeconds) s", value: $credPoolCooldownSeconds, in: 30...600, step: 30)
+        }
+    }
+
+    @ViewBuilder
+    private var wireGuardSection: some View {
+        Section("WireGuard") {
+            SecureField("Private Key (base64)", text: $privateKey)
+                .autocapitalization(.none)
+                .disableAutocorrection(true)
+                .onChange(of: privateKey) { saveSecret($0, for: .privateKey) }
+
+            TextField("Peer Public Key (base64)", text: $peerPublicKey)
+                .autocapitalization(.none)
+                .disableAutocorrection(true)
+
+            SecureField("Preshared Key (base64)", text: $presharedKey)
+                .autocapitalization(.none)
+                .disableAutocorrection(true)
+                .onChange(of: presharedKey) { saveSecret($0, for: .presharedKey) }
+
+            TextField("Tunnel Address", text: $tunnelAddress)
+                .autocapitalization(.none)
+
+            TextField("DNS Servers", text: $dnsServers)
+                .autocapitalization(.none)
+
+            TextField("Allowed IPs", text: $allowedIPs)
+                .autocapitalization(.none)
+        }
+    }
+
+    @ViewBuilder
+    private var routingSection: some View {
+        Section {
+            Toggle("Full-device VPN", isOn: fullTunnelBinding)
+        } header: {
+            Text("Routing")
+        } footer: {
+            Text("Default safe mode routes only non-default Allowed IPs through the tunnel. Full-device VPN routes all device traffic and must be enabled explicitly.")
+        }
+    }
+
+    @ViewBuilder
+    private var backupSection: some View {
+        Section {
+            Button(action: handleExport) {
+                Label("Export Safe Backup…", systemImage: "square.and.arrow.up")
+            }
+
+            Button(action: { showImportPicker = true }) {
+                Label("Import Backup…", systemImage: "square.and.arrow.down")
+            }
+
+            Button(action: handleConnectionLinkPaste) {
+                Label("Import from Connection Link…", systemImage: "link.badge.plus")
+            }
+
+            Button(role: .destructive, action: { showResetConfirm = true }) {
+                Label("Reset TURN Cache", systemImage: "trash")
+            }
+
+            Button(role: .destructive, action: { showResetProfileConfirm = true }) {
+                Label("Reset Captured Browser Profile", systemImage: "trash")
+            }
+
+            Button(role: .destructive, action: { showResetSecretsConfirm = true }) {
+                Label("Reset Keychain Secrets", systemImage: "trash")
+            }
+        } header: {
+            Text("Backup & Restore")
+        } footer: {
+            Text("Safe backup exports non-secret preferences only. WireGuard keys, VK links, WRAP key, TURN credentials, and captured browser profile are excluded.")
+        }
+    }
+
     // MARK: - Backup actions
+
+    private var fullTunnelBinding: Binding<Bool> {
+        Binding(
+            get: { fullTunnelMode },
+            set: { enabled in
+                if enabled {
+                    showFullTunnelConfirm = true
+                } else {
+                    fullTunnelMode = false
+                }
+            }
+        )
+    }
 
     private func loadSecretsFromKeychain() {
         KeychainStore.migrateLegacySecretsFromUserDefaults()

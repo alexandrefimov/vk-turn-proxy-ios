@@ -2,7 +2,7 @@
 
 ## Summary
 
-This repo now passes local static checks, Go package checks, WireGuardBridge XCFramework build, and compile-only Xcode build without signing. The highest priority remaining fix is safe/split mode defaults before any public distribution work.
+This repo now passes local static checks, Go package checks, WireGuardBridge XCFramework build, and compile-only Xcode build without signing. The highest priority remaining fixes are physical-device validation, Network Extension handoff review, and license review before any public distribution work.
 
 Main risks:
 
@@ -10,10 +10,11 @@ Main risks:
 - Mitigated in `hardening/redacted-logs`: PacketTunnel no longer logs full `proxy_config`, and known app/extension/Go log/export paths are pattern-redacted.
 - Mitigated in `hardening/no-plaintext-backup`: new backup export is settings-only and excludes keys, links, WRAP key, TURN credentials, and captured browser profile.
 - Mitigated in `main`: backup and connection-link import paths have size caps, schema checks, and value validation before apply.
-- High: full-tunnel mode is enabled silently with `includeAllNetworks = true` and default `allowedIPs = 0.0.0.0/0`.
+- Mitigated in `main`: fresh installs default to safe routing; full-device VPN requires an explicit toggle and warning.
+- High until device-tested: safe/full routing behavior requires validation on a signed physical iPhone build.
 - High: license compatibility is unresolved for public distribution because this repo says MIT while the Go module and README identify GPL-3.0 upstream ancestry through `vk-turn-proxy`.
 
-Recommended next patch: safe/split mode default with an explicit full-tunnel toggle/warning.
+Recommended next patch: local physical-iPhone build validation docs/results or license-risk documentation, depending on whether Apple signing is ready.
 
 ## Repository map
 
@@ -58,16 +59,16 @@ Keychain is now used for `privateKey`, `presharedKey`, `vkLink`, and `wrapKeyHex
 
 - `NETunnelProviderProtocol` is created in `VKTurnProxy/VKTurnProxy/TunnelManager.swift`.
 - `providerBundleIdentifier` is `com.vkturnproxy.app.tunnel`.
-- `providerConfiguration` carries `wg_config`, `proxy_config`, `tunnel_address`, `dns_servers`, and `mtu`.
-- `includeAllNetworks = true` is set unconditionally.
+- `providerConfiguration` carries `wg_config`, `proxy_config`, `tunnel_address`, `dns_servers`, `mtu`, `allowed_ips`, and `full_tunnel_mode`.
+- `includeAllNetworks` follows explicit `fullTunnelMode`; default is `false`.
 - `excludeLocalNetworks = true` is set unconditionally.
-- On iOS 16.4+, `excludeAPNs = false` and `excludeCellularServices = false` are set to force those services into the tunnel.
-- `PacketTunnelProvider.createTunnelSettings` sets IPv4 `includedRoutes` to default route by default and `excludedRoutes = []`.
+- On iOS 16.4+, APNs and cellular services are excluded unless full tunnel is explicitly enabled.
+- `PacketTunnelProvider.createTunnelSettings` sets IPv4 `includedRoutes` to default route only in full mode. Safe mode applies only non-default IPv4 routes derived from `allowedIPs`.
 - DNS settings come from comma-separated `dnsServers`, default `1.1.1.1`.
 - MTU is read from provider config, default `1280`, and applied if it parses as an integer.
-- `allowedIPs` from UI/defaults are converted into WireGuard UAPI `allowed_ip=` lines; default is `0.0.0.0/0`.
+- `allowedIPs` from UI/defaults are converted into WireGuard UAPI `allowed_ip=` lines; fresh default is `192.168.102.0/24`.
 - WiFi/LTE handoff handling exists in `PacketTunnelProvider.swift` through `NWPathMonitor`, `wgPathChanged`, `wgPathInTransition`, wake health checks, and Go watchdog logic.
-- Full tunnel is effectively default because `allowedIPs` defaults to `0.0.0.0/0` and `includeAllNetworks` is unconditional. This conflicts with the hardening rule that full tunnel must not be the silent default.
+- Full tunnel is no longer the silent default, but actual routing behavior still needs physical-device validation.
 
 ## Logging audit
 
@@ -124,9 +125,9 @@ Findings:
 1. Done: redacted logging helper for known key names, URLs, TURN credentials, WRAP keys, VK links, browser profile fields, and WireGuard UAPI keys.
 2. Done: plaintext secret export removed. New export uses settings-only `SafeBackupConfig`; legacy full import remains for manual recovery.
 3. Done: KeychainStore for `privateKey`, `presharedKey`, `vkLink`, and `wrapKeyHex`; non-sensitive tuning remains in `AppStorage`.
-4. Safe/split mode default: default to non-full-tunnel routing for fresh installs.
-5. Full-tunnel explicit toggle/warning: require user action before `includeAllNetworks = true` and `allowedIPs = 0.0.0.0/0`.
-6. Safer defaults for `numConnections`/MTU: lower initial `numConnections` and enforce MTU range.
+4. Done: safe/split mode default for fresh installs.
+5. Done: full-device VPN requires explicit toggle/warning before `includeAllNetworks = true`.
+6. Done: fresh `numConnections` default lowered to 4; MTU default remains 1280.
 7. Done: import schema validation caps file/link size and validates JSON version/type/known fields, key lengths, CIDRs, host:port, DNS, WRAP key, and `numConnections` bounds before applying.
 8. Reset all secrets button: clear Keychain secrets, UserDefaults non-sensitive config, TURN cache, browser profile, logs, and Network Extension preferences.
 

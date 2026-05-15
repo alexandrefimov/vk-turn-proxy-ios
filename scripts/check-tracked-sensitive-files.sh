@@ -40,6 +40,27 @@ if git grep -nE -- '@AppStorage\("(privateKey|presharedKey|vkLink|wrapKeyHex)"' 
 fi
 rm -f /tmp/vk-turn-secret-appstorage.txt
 
+if git grep -nF -- 'proto.includeAllNetworks = true' -- 'VKTurnProxy/**/*.swift' >/tmp/vk-turn-include-all-networks.txt 2>/dev/null; then
+    echo "includeAllNetworks must not be a silent constant true default:" >&2
+    cat /tmp/vk-turn-include-all-networks.txt >&2
+    failed=1
+fi
+rm -f /tmp/vk-turn-include-all-networks.txt
+
+if git grep -nE -- '(@AppStorage\("allowedIPs"\).*"0\.0\.0\.0/0"|var allowedIPs: String = "0\.0\.0\.0/0")' -- 'VKTurnProxy/**/*.swift' >/tmp/vk-turn-default-routes.txt 2>/dev/null; then
+    echo "Fresh allowedIPs default must not be the full-device default route:" >&2
+    cat /tmp/vk-turn-default-routes.txt >&2
+    failed=1
+fi
+rm -f /tmp/vk-turn-default-routes.txt
+
+if git grep -nE -- '(@AppStorage\("numConnections"\).*=[[:space:]]*30|var numConnections: Int = 30)' -- 'VKTurnProxy/**/*.swift' >/tmp/vk-turn-default-conns.txt 2>/dev/null; then
+    echo "Fresh numConnections default must stay conservative:" >&2
+    cat /tmp/vk-turn-default-conns.txt >&2
+    failed=1
+fi
+rm -f /tmp/vk-turn-default-conns.txt
+
 safe_export_body=$(
     awk '/static func currentSafeConfig\(\)/,/^    }/' VKTurnProxy/VKTurnProxy/BackupManager.swift
 )

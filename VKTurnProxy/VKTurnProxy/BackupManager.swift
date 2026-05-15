@@ -96,12 +96,12 @@ enum BackupManager {
             // state even if the user never opened Settings.
             tunnelAddress: d.string(forKey: "tunnelAddress") ?? "192.168.102.3/24",
             dnsServers: d.string(forKey: "dnsServers") ?? "1.1.1.1",
-            allowedIPs: d.string(forKey: "allowedIPs") ?? "0.0.0.0/0",
+            allowedIPs: d.string(forKey: "allowedIPs") ?? "192.168.102.0/24",
             // Bool defaults: UserDefaults.bool(forKey:) returns false for
             // unset, but useDTLS defaults to true in @AppStorage. Use
             // object(forKey:) to distinguish "set to false" from "unset".
             useDTLS: (d.object(forKey: "useDTLS") as? Bool) ?? true,
-            numConnections: (d.object(forKey: "numConnections") as? Int) ?? 30,
+            numConnections: (d.object(forKey: "numConnections") as? Int) ?? 4,
             credPoolCooldownSeconds: (d.object(forKey: "credPoolCooldownSeconds") as? Int) ?? 150,
             // WRAP defaults match SettingsView's @AppStorage defaults
             // (false / empty). Same object(forKey:) trick as useDTLS to

@@ -168,7 +168,7 @@ struct ConnectionSettings: Codable {
     /// never set). Always set on apply when present.
     let dnsServers: String?
     /// Optional: if absent, the importing device keeps its current
-    /// numConnections (default 30). Useful for an admin to ship a
+    /// numConnections (default 4). Useful for an admin to ship a
     /// "recommended for this deployment" hint while still letting
     /// users tune later.
     let numConnections: Int?

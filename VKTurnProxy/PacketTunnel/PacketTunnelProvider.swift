@@ -36,14 +36,8 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     // running on. Written by this extension whenever it queries the IP via
     // wgGetTURNServerIP, read by TunnelManager on each connect() to set
     // NEVPNProtocol.serverAddress. Making serverAddress match the actual
-    // TURN relay IP puts that address on Apple's always-excluded list,
-    // which is the only documented way to keep TURN UDP outside the
-    // tunnel when includeAllNetworks=true (Step 4 switches to that mode).
-    //
-    // Before Step 4 this is belt-and-suspenders: the excludedRoutes
-    // machinery still carries TURN IP, so current builds behave the same
-    // whether serverAddress matches or not. After Step 4, excludedRoutes
-    // is ignored and serverAddress becomes the only mechanism.
+    // TURN relay IP puts that address on Apple's always-excluded list. This
+    // is required in full-device VPN mode where excludedRoutes are ignored.
     private static let sharedDefaultsSuiteName = "group.com.vkturnproxy.app"
     private static let turnServerIPKey = "lastTurnServerIP"
 
@@ -105,8 +99,10 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         let tunnelAddress = config["tunnel_address"] as? String ?? "192.168.102.3/24"
         let dnsServers = config["dns_servers"] as? String ?? "1.1.1.1"
         let mtu = config["mtu"] as? String ?? "1280"
+        let allowedIPs = config["allowed_ips"] as? String ?? ""
+        let fullTunnelMode = config["full_tunnel_mode"] as? Bool ?? false
 
-        logMsg("tunnelAddress=\(tunnelAddress) dns=\(dnsServers) mtu=\(mtu)")
+        logMsg("tunnelAddress=\(tunnelAddress) dns=\(dnsServers) mtu=\(mtu) routing=\(fullTunnelMode ? "full" : "safe")")
         logMsg("proxyConfig=<redacted> bytes=\(proxyConfigJSON.utf8.count)")
 
         // ------------------------------------------------------------------
@@ -115,15 +111,15 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         // before Go has a live DTLS+TURN session.
         //
         // The reason this matters: iOS treats `setTunnelNetworkSettings(_)` as
-        // "tunnel up" — that's the moment includeAllNetworks=true starts
-        // capturing main-app traffic into the (still-unattached) TUN. If we
-        // were to call it early to give the extension a DNS context, the
-        // captcha WebView in the main app would lose all network access
-        // ("offline") for the duration of bootstrap. Instead, the extension
-        // resolves VK hosts via vkDirectResolver (Cloudflare 1.1.1.1:53 over
-        // UDP) — see pkg/proxy/utls.go — bypassing the iOS system resolver
-        // entirely. UDP to 1.1.1.1 works fine on the physical interface
-        // before any routes are installed.
+        // "tunnel up" — in full-device VPN mode, that's the moment system
+        // traffic starts flowing into the TUN. If we were to call it early to
+        // give the extension a DNS context, the captcha WebView in the main
+        // app could lose network access ("offline") for the duration of
+        // bootstrap. Instead, the extension resolves VK hosts via
+        // vkDirectResolver (Cloudflare 1.1.1.1:53 over UDP) — see
+        // pkg/proxy/utls.go — bypassing the iOS system resolver entirely.
+        // UDP to 1.1.1.1 works fine on the physical interface before any
+        // routes are installed.
         //
         // Sequence:
         //   1. wgStartVKBootstrap      — launches the Go proxy in a goroutine
@@ -134,13 +130,9 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         //                                so captchaImageURL surfaces in time
         //                                to show the WebView (the WebView
         //                                works because TUN doesn't exist yet,
-        //                                so includeAllNetworks=true has
-        //                                nothing to enforce — main-app
-        //                                traffic flows via the physical
-        //                                interface naturally).
-        //   3. setTunnelNetworkSettings — applied ONCE with the full routes.
-        //                                Only now does iOS honor
-        //                                includeAllNetworks=true.
+        //                                so main-app traffic flows via the
+        //                                physical interface naturally).
+        //   3. setTunnelNetworkSettings — applied ONCE with final routes.
         //   4. wgAttachWireGuard       — opens the TUN fd and hands it to
         //                                WireGuard, which starts forwarding
         //                                packets through the already-live
@@ -198,22 +190,21 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                 self.persistTurnServerIP(turnIP)
             }
 
-            // Apply the full tunnel settings ONCE. With
-            // includeAllNetworks=true on the NEVPNProtocol, excludedRoutes
-            // are ignored by iOS; the only traffic that stays on the
-            // physical interface is what Apple always-excludes (DHCP,
-            // captive networks, traffic to serverAddress, and — on
-            // iOS 16.4+ with our flags — APNs/CellularServices as
-            // configured on the main-app side).
+            // Apply final tunnel settings ONCE. Full mode installs the
+            // default route; safe mode installs only non-default AllowedIPs
+            // routes and ignores 0.0.0.0/0 so a fresh install cannot silently
+            // become a full-device VPN.
             let finalSettings = self.createTunnelSettings(
                 address: tunnelAddress,
                 dns: dnsServers,
                 mtu: mtu,
-                tunnelRemoteAddress: turnIP.isEmpty ? "10.0.0.1" : turnIP
+                tunnelRemoteAddress: turnIP.isEmpty ? "10.0.0.1" : turnIP,
+                allowedIPs: allowedIPs,
+                fullTunnelMode: fullTunnelMode
             )
 
             DispatchQueue.main.async {
-                self.logMsg("setTunnelNetworkSettings: applying full routes (single shot)")
+                self.logMsg("setTunnelNetworkSettings: applying \(fullTunnelMode ? "full" : "safe") routes (single shot)")
                 self.setTunnelNetworkSettings(finalSettings) { error in
                     if let error = error {
                         self.logMsg("setTunnelNetworkSettings ERROR: \(error)")
@@ -546,6 +537,8 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         dns: String,
         mtu: String,
         tunnelRemoteAddress: String,
+        allowedIPs: String,
+        fullTunnelMode: Bool,
         includeDefaultRoute: Bool = true
     ) -> NEPacketTunnelNetworkSettings {
         let parts = address.split(separator: "/")
@@ -560,20 +553,20 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         let settings = NEPacketTunnelNetworkSettings(tunnelRemoteAddress: tunnelRemoteAddress)
 
         let ipv4 = NEIPv4Settings(addresses: [ip], subnetMasks: [prefixToSubnet(prefix)])
-        // includeDefaultRoute=false is for the Phase 1 "DNS-only" call: we
-        // need iOS to give the extension a DNS resolver context so Go-side
-        // dial(login.vk.ru) works during bootstrap, but we don't want to
-        // capture system traffic into the tunnel before TUN is actually
-        // attached. With includeAllNetworks=true on the VPN profile, an
-        // empty includedRoutes here keeps the tunnel routing-inert — iOS
-        // doesn't have a default route to enforce yet.
-        ipv4.includedRoutes = includeDefaultRoute ? [NEIPv4Route.default()] : []
-        // No excludedRoutes: with includeAllNetworks=true on the VPN profile,
-        // iOS ignores excludedRoutes entirely (Apple docs). The only
-        // always-excluded destination is the serverAddress (see above), plus
-        // Apple's built-in list (DHCP, captive networks, cellular services
-        // when flagged). Removing excludedRoutes here keeps the intent
-        // explicit.
+        if includeDefaultRoute {
+            if fullTunnelMode {
+                ipv4.includedRoutes = [NEIPv4Route.default()]
+            } else {
+                let routes = splitIPv4Routes(from: allowedIPs)
+                ipv4.includedRoutes = routes
+                logMsg("safe routing: applying \(routes.count) non-default IPv4 route(s)")
+            }
+        } else {
+            ipv4.includedRoutes = []
+        }
+        // No excludedRoutes in full mode: with includeAllNetworks=true on the
+        // VPN profile, iOS ignores excludedRoutes entirely. Safe mode avoids a
+        // default route instead of trying to exclude destinations from one.
         ipv4.excludedRoutes = []
         settings.ipv4Settings = ipv4
 
@@ -587,6 +580,40 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         }
 
         return settings
+    }
+
+    private func splitIPv4Routes(from allowedIPs: String) -> [NEIPv4Route] {
+        allowedIPs
+            .split(separator: ",")
+            .compactMap { raw -> NEIPv4Route? in
+                let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+                let parts = value.split(separator: "/", omittingEmptySubsequences: false)
+                guard parts.count == 2,
+                      let prefix = Int(parts[1]),
+                      prefix >= 0,
+                      prefix <= 32 else {
+                    return nil
+                }
+                let ip = String(parts[0])
+                guard isIPv4Address(ip) else {
+                    return nil
+                }
+                if ip == "0.0.0.0" && prefix == 0 {
+                    return nil
+                }
+                return NEIPv4Route(destinationAddress: ip, subnetMask: prefixToSubnet(prefix))
+            }
+    }
+
+    private func isIPv4Address(_ ip: String) -> Bool {
+        let parts = ip.split(separator: ".", omittingEmptySubsequences: false)
+        guard parts.count == 4 else { return false }
+        return parts.allSatisfy { part in
+            guard !part.isEmpty, let value = Int(part), value >= 0, value <= 255 else {
+                return false
+            }
+            return true
+        }
     }
 
     private func prefixToSubnet(_ prefix: Int) -> String {

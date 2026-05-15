@@ -33,4 +33,5 @@ Public distribution is blocked until:
 - Legacy full backup import is still supported for manual recovery, but should be treated as secret input.
 - WireGuard private key, preshared key, VK link, and WRAP key are stored in Keychain with legacy `UserDefaults` migration.
 - Backup and connection-link imports have size caps plus schema/value validation before apply.
-- Full-tunnel safe default work is still pending and requires physical-device validation.
+- Fresh installs default to safe routing. Full-device VPN requires an explicit Settings toggle and warning.
+- Safe/full routing behavior still requires physical-device validation.

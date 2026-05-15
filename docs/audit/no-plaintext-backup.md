@@ -34,6 +34,6 @@ New backup export is settings-only. It no longer writes WireGuard keys, VK links
 
 ## Remaining risks
 
-- Secrets still live in `@AppStorage` / `UserDefaults` until the Keychain migration.
-- Import reads the selected file into memory before decode; size caps and schema validation are still pending.
+- Secret fields have moved to Keychain, but `wg_config` / `proxy_config` are still passed through Network Extension provider configuration at tunnel start.
+- Imports now have size caps and schema/value validation before apply.
 - Connection links remain secret-bearing import payloads.

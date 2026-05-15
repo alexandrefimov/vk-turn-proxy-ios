@@ -223,13 +223,11 @@ class TunnelManager: ObservableObject {
             // We solve VK captcha here, in the main-app process, BEFORE
             // calling startVPNTunnel. Two reasons:
             //
-            //  1. Step 4 architecture (deferred-setTunnelNetworkSettings +
-            //     includeAllNetworks=true) takes the main app's network
-            //     stack down at kernel level the moment startVPNTunnel runs
-            //     and brings it back only after the tunnel reaches
-            //     .connected. The WebView captcha flow needs network in the
-            //     main app process — which it has now (status .disconnected,
-            //     full physical interface) and won't have during .connecting.
+            //  1. Deferred setTunnelNetworkSettings means the main app's
+            //     network path can change while startVPNTunnel runs,
+            //     especially when full-device VPN is enabled. The WebView
+            //     captcha flow needs network in the main app process, which
+            //     it has now (status .disconnected, full physical interface).
             //
             //  2. The PoW + slider auto-solvers in Go work in 90%+ of cases.
             //     When they don't, we need a human in the loop, and that
@@ -354,9 +352,9 @@ class TunnelManager: ObservableObject {
             let proxyConfig = buildProxyConfig(config: config, vkHostIPs: vkHostIPs, seededTURN: seeded)
 
             // Pick serverAddress. iOS always excludes serverAddress from the
-            // tunnel per Apple's documented rule (essential for Step 4's
-            // includeAllNetworks=true so TURN UDP doesn't loop back through
-            // the tunnel — recursive routing makes the dataplane unusable).
+            // tunnel per Apple's documented rule. This is essential in
+            // full-device VPN mode so TURN UDP doesn't loop back through the
+            // tunnel — recursive routing makes the dataplane unusable.
             //
             // Priority order:
             //   1. The TURN IP we JUST got from pre-bootstrap (seeded.address).
@@ -401,40 +399,22 @@ class TunnelManager: ObservableObject {
                 "proxy_config": proxyConfig,
                 "tunnel_address": config.tunnelAddress,
                 "dns_servers": config.dnsServers,
-                "mtu": config.mtu
+                "mtu": config.mtu,
+                "allowed_ips": config.allowedIPs,
+                "full_tunnel_mode": config.fullTunnelMode
             ]
 
-            // Full-tunnel mode (Step 4 of the APNs-through-tunnel refactor).
-            // includeAllNetworks=true is the ONLY documented mechanism that
-            // pulls APNs (Apple Push Notification Service) traffic into the
-            // VPN on iOS — which is the goal of this whole refactor: pushes
-            // keep arriving when the device is on Wi-Fi going through the
-            // tunnel.
-            //
-            // Trade-offs we accept:
-            //  - excludedRoutes become inert (Apple ignores them). So the
-            //    only always-excluded destinations are: serverAddress
-            //    (set to the TURN relay IP above, see Step 3), Apple's
-            //    built-in always-excluded list (DHCP, captive networks,
-            //    cellular-services-direct…), and — iOS 16.4+ — whatever
-            //    we gate with the flags below.
-            //  - excludeLocalNetworks=true keeps LAN reachable even with
-            //    the full tunnel up (printers, AirPlay, etc.).
-            //  - excludeAPNs=false / excludeCellularServices=false
-            //    (both iOS 16.4+) override Apple's default where these
-            //    system-service categories bypass the tunnel — we want
-            //    them IN the tunnel so the user on Wi-Fi keeps receiving
-            //    pushes via our VPS.
-            //
-            // Saving a profile whose includeAllNetworks changed re-prompts
-            // iOS for VPN permission on the next connect. This is a
-            // one-time UX cost for existing users.
-            proto.includeAllNetworks = true
+            // Full-device VPN is now explicit. Safe mode leaves
+            // includeAllNetworks off and the extension ignores default-route
+            // AllowedIPs when creating NE routes; the WireGuard peer config is
+            // preserved so users can still enable full tunnel deliberately.
+            proto.includeAllNetworks = config.fullTunnelMode
             proto.excludeLocalNetworks = true
             if #available(iOS 16.4, *) {
-                proto.excludeAPNs = false
-                proto.excludeCellularServices = false
+                proto.excludeAPNs = !config.fullTunnelMode
+                proto.excludeCellularServices = !config.fullTunnelMode
             }
+            SharedLogger.shared.log("[AppDebug] TunnelManager.connect: routing mode \(config.fullTunnelMode ? "full" : "safe")")
 
             manager.protocolConfiguration = proto
             manager.localizedDescription = "VK TURN Proxy"
@@ -446,15 +426,13 @@ class TunnelManager: ObservableObject {
             // NECP settle delay before startVPNTunnel.
             //
             // Empirically observed (vpn YESGLITCH 2026-04-30 17:32:48):
-            // saveToPreferences() with includeAllNetworks=true triggers iOS
-            // NECP rule rebuild that briefly nulls all primary interfaces
+            // saveToPreferences() with full-device VPN enabled can trigger an
+            // iOS NECP rule rebuild that briefly nulls all primary interfaces
             // (en0, pdp_ip0) for ~370 ms. If startVPNTunnel() races into
-            // PreparingNetwork during that window, iOS aborts the session
-            // with stop reason 4 (NEUnrecoverableNetworkChange / "No
-            // network available"). The first extension instance dies, iOS
-            // auto-relaunches a second one ~800 ms later — visible as the
-            // cosmetic "preparing → connecting → connected → disconnecting
-            // → disconnected → connected" UI glitch.
+            // PreparingNetwork during that window, iOS aborts the session with
+            // stop reason 4 (NEUnrecoverableNetworkChange / "No network
+            // available"). Keeping the delay for safe mode is conservative
+            // until both modes are validated on device.
             //
             // 700 ms covers the empirical 370 ms blackout with margin and
             // is unnoticeable on top of the multi-second pre-bootstrap
@@ -1448,13 +1426,14 @@ struct TunnelConfig {
     var presharedKey: String?
     var tunnelAddress: String = "192.168.102.3/24"
     var dnsServers: String = "1.1.1.1"
-    var allowedIPs: String = "0.0.0.0/0"
+    var allowedIPs: String = "192.168.102.0/24"
     var mtu: String = "1280"
     var persistentKeepalive: Int = 25
 
     // Proxy
     var vkLink: String = ""
     var peerAddress: String = ""  // vk-turn-proxy server host:port
+    var fullTunnelMode: Bool = false
     var useDTLS: Bool = true
     // WRAP layer: ChaCha20-XOR every UDP packet between DTLS and TURN
     // ChannelData so VK's payload classifier can't recognise DTLS+WG
@@ -1467,7 +1446,7 @@ struct TunnelConfig {
     // must match the server's -wrap-key value exactly.
     var wrapKeyHex: String = ""
     var useUDP: Bool = true
-    var numConnections: Int = 30 // configurable from Settings; VK allows ~10 simultaneous TURN allocations per cred set, so 30 conns spreads over ceil(N/10) = 3 cred sets plus a "+1 reserve" (4 total slots). 30 strikes a useful balance: enough parallelism for high-throughput single sessions, few enough to avoid overwhelming VK's per-IP rate-limit on cred refresh.
+    var numConnections: Int = 4 // safe default for fresh installs; advanced users can raise this from Settings after validating their server/VK rate-limit behavior.
     // Per-slot cooldown after a failed fetch (typically captcha required).
     // Slot stays in cooldown for this long before being eligible to retry.
     // Shorter = pool recovers faster when VK cools down, longer = less VK
