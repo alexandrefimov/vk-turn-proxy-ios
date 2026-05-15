@@ -28,10 +28,16 @@ Reviewed:
 - Added Codex escalation notes for Xcode, project generation, push, and GitHub Actions commands.
 - Added import validation notes for size caps, schema checks, and value checks.
 - Added safe-mode default notes and test strategy notes.
+- Expanded private local-device build notes with Apple Developer portal setup,
+  signing identifiers, App Groups, Network Extension entitlement checks, and
+  real-device validation checklist.
 
 ## Current documentation gaps
 
 - No license resolution document yet.
+- No dedicated fork-signing patch yet; current checked-in bundle IDs, App Group,
+  and development team still need a separate signing-only decision before a
+  real-device build.
 
 ## Next docs to add with future branches
 
