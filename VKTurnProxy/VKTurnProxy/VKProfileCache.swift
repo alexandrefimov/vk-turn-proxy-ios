@@ -134,8 +134,8 @@ enum VKProfileCache {
         return !entry.device.isEmpty && !entry.browser_fp.isEmpty
     }
 
-    /// Write a fully-formed entry verbatim. Used by BackupManager when
-    /// restoring a Full Backup — preserves the original captured_at
+    /// Write a fully-formed entry verbatim. Used by BackupManager only when
+    /// restoring a legacy full backup — preserves the original captured_at
     /// timestamp instead of resetting it to "now". Atomic write so a
     /// concurrent Go-side reader either sees the old file or the
     /// fully-replaced new one.

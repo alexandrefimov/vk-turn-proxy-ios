@@ -23,10 +23,10 @@ Reviewed:
 - Updated `SECURITY.md` with current hardening status.
 - Updated baseline audit to reflect installed Go/XcodeGen and completed redacted-log patch.
 - Added agent instructions for sandboxed Go cache paths and avoiding release pipeline usage during hardening.
+- Added no-plaintext-backup notes and local/CI validation scripts.
 
 ## Current documentation gaps
 
-- No finalized no-plaintext-backup design yet.
 - No Keychain migration design yet.
 - No safe-mode/full-tunnel UX design yet.
 - No import-link schema document yet.
@@ -34,7 +34,6 @@ Reviewed:
 
 ## Next docs to add with future branches
 
-- `docs/audit/no-plaintext-backup.md`
 - `docs/security/keychain-migration.md`
 - `docs/security/safe-mode-default.md`
 - `docs/integration/import-link-schema.md`

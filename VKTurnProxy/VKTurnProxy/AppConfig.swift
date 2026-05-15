@@ -1,16 +1,12 @@
 // AppConfig.swift
 //
-// Codable representation of the entire app's persisted state, used by
+// Codable representation of app backup/import payloads used by
 // BackupManager for the user-facing Export/Import flow in Settings.
 //
-// Two scopes of "state" the user might want to preserve:
-//   1. UserDefaults-backed @AppStorage values (connection params,
-//      WireGuard keys, tuning knobs).
-//   2. The TURN credential cache the extension writes to the App Group
-//      container (creds-pool.json). Including this in the backup means
-//      a restore can skip the VK PoW + captcha round on first connect
-//      after import — directly relevant when migrating to a fresh install
-//      after `xcrun devicectl install` left the previous cache behind.
+// Current exports are settings-only and intentionally exclude plaintext
+// secrets: WireGuard keys, VK links, WRAP keys, TURN cache, and captured
+// browser profile. Legacy "full" backups are still decoded for manual
+// restore, but new exports must stay safe-by-default.
 //
 // Schema version is independent of the on-disk creds-pool.json schema —
 // they bump for different reasons. This file's `version` increments when
@@ -18,11 +14,8 @@
 // we embed verbatim) increments when the TURN-cache shape changes. A
 // future v2 of AppConfig might wrap a v3 CredCacheFile, etc.
 //
-// Sensitive content: WireGuard private key, preshared key, and TURN
-// credentials are all in plaintext here. The app warns the user before
-// share — no encryption in this iteration. Friend-shareable subsets
-// (without TURN cache) are a separate "connection link" feature planned
-// for a follow-up.
+// Connection links remain a separate secret import path. Treat every
+// vkturnproxy:// import payload as secret material.
 
 import Foundation
 
@@ -83,6 +76,45 @@ struct AppSettings: Codable {
     /// 64-character hex encoding of the 32-byte WRAP shared key. Must
     /// match the server's -wrap-key. Optional for back-compat.
     let wrapKeyHex: String?
+}
+
+// MARK: - Safe Settings Backup
+
+/// Exported by the Backup & Restore UI. Contains only non-secret local
+/// preferences, so the resulting JSON can be shared without exposing tunnel
+/// credentials. Importing this payload must not overwrite existing secrets.
+struct SafeBackupConfig: Codable {
+    let version: Int
+    let type: String
+    let exportedAt: Int64
+    let settings: SafeBackupSettings
+
+    enum CodingKeys: String, CodingKey {
+        case version
+        case type
+        case exportedAt = "exported_at"
+        case settings
+    }
+}
+
+struct SafeBackupSettings: Codable {
+    let tunnelAddress: String
+    let dnsServers: String
+    let allowedIPs: String
+    let useDTLS: Bool
+    let numConnections: Int
+    let credPoolCooldownSeconds: Int
+    let useWrap: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case tunnelAddress
+        case dnsServers
+        case allowedIPs
+        case useDTLS
+        case numConnections
+        case credPoolCooldownSeconds
+        case useWrap
+    }
 }
 
 // MARK: - 1-Click Connection Link

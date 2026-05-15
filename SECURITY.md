@@ -6,15 +6,15 @@ This fork is intended for private, personal iOS builds first. Do not publish Tes
 
 - The device may be backed up, inspected through Files/share sheets, or connected to a developer machine.
 - Logs may be exported for troubleshooting and shared accidentally.
-- Full backups and connection links may contain enough material to recreate VPN access.
+- Legacy full backups and connection links may contain enough material to recreate VPN access.
 - App Group files are shared between the app and PacketTunnel extension and should be treated as local secret storage until migrated.
 - Apple signing artifacts and App Store Connect credentials are out of scope for the repo and must remain local-only.
 
 ## Handling rules
 
 - Do not commit WireGuard private keys, preshared keys, WRAP keys, VK call links, TURN credentials, captured VK browser profiles, provisioning profiles, certificates, `.p12` files, App Store Connect credentials, device UDIDs, or real server IPs unless intentionally documented as examples.
-- Do not share exported `vpn.log`, `vpn-export.log`, full backup JSON, or `vkturnproxy://import` links without redaction.
-- Treat `creds-pool.json`, `vk_profile.json`, and full backup JSON files as secrets.
+- Do not share exported `vpn.log`, `vpn-export.log`, legacy full backup JSON, or `vkturnproxy://import` links without redaction.
+- Treat `creds-pool.json`, `vk_profile.json`, and legacy full backup JSON files as secrets.
 - Prefer Keychain for persistent secrets in future runtime patches.
 
 ## Distribution gate
@@ -29,6 +29,7 @@ Public distribution is blocked until:
 ## Current hardening status
 
 - Redacted logging is implemented for known app, extension, Go, and log-export paths.
-- Plaintext backup export is still unsafe and blocked as the next hardening target.
+- New backup export is settings-only and excludes plaintext secrets.
+- Legacy full backup import is still supported for manual recovery, but should be treated as secret input.
 - Keychain migration is still pending.
 - Full-tunnel safe default work is still pending and requires physical-device validation.

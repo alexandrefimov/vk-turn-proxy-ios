@@ -3,22 +3,14 @@
 // Export/Import/Reset of app state for the Settings → Backup & Restore
 // section.
 //
-// Export builds an AppConfig snapshot of (1) all @AppStorage values via
-// UserDefaults.standard and (2) the current creds-pool.json from the App
-// Group container. Output is a temp .json file fed into UIActivityViewController
-// (Share Sheet) so the user picks the destination — Files, AirDrop, Mail, etc.
+// Export builds a SafeBackupConfig snapshot with non-secret local preferences
+// only. It intentionally excludes WireGuard keys, VK links, WRAP keys,
+// creds-pool.json, and vk_profile.json. Output is a temp .json file fed into
+// UIActivityViewController (Share Sheet) so the user picks the destination.
 //
-// Import is the inverse: read a JSON the user picked from the document
-// picker, decode as AppConfig, and atomically replace UserDefaults +
-// creds-pool.json. Atomicity here means "all or nothing per-domain":
-// UserDefaults writes happen first (they're synchronous and don't fail
-// in normal conditions), then creds-pool.json is replaced via
-// tmp-file + rename to match how the Go side writes (atomic relative
-// to readers). If creds-pool.json write fails after UserDefaults already
-// changed, the user has settings restored but no TURN cache — first
-// connect will fall through to the regular VK fetch path. We log the
-// failure but don't try to roll back UserDefaults; the previous file
-// would be lost anyway.
+// Import accepts the current settings-only format and legacy "full" backups.
+// Settings-only imports never overwrite secrets or shared cache/profile files.
+// Legacy full imports retain old restore behavior for manual recovery.
 //
 // Reset just deletes creds-pool.json. The pool gets rebuilt on next
 // connect via the normal VK API + PoW path. No UserDefaults changes.
@@ -52,6 +44,13 @@ enum BackupManager {
     /// Schema version of AppConfig itself. Bump when the wrapper shape
     /// changes (new top-level fields, restructured settings, etc.).
     static let supportedConfigVersion = 1
+    private static let settingsOnlyBackupType = "settings"
+    private static let legacyFullBackupType = "full"
+
+    private struct BackupEnvelope: Decodable {
+        let version: Int
+        let type: String
+    }
 
     /// Path to the App Group's creds-pool.json. Mirrors the Go-side
     /// `filepath.Dir(logFilePath) + "/creds-pool.json"` and the Swift-side
@@ -66,17 +65,12 @@ enum BackupManager {
 
     // MARK: - Build current snapshot
 
-    /// Reads all @AppStorage values via UserDefaults.standard (since
-    /// @AppStorage is a thin wrapper over UserDefaults) and the current
-    /// creds-pool.json. Always returns an AppConfig — turnPool is nil if
-    /// the cache file is absent or unreadable, which is normal after a
-    /// fresh install or a Reset TURN Cache.
-    static func currentConfig() -> AppConfig {
+    /// Reads only non-secret @AppStorage values via UserDefaults.standard
+    /// (since @AppStorage is a thin wrapper over UserDefaults). Do not add
+    /// keys, VK links, TURN credentials, or captured browser profiles here.
+    static func currentSafeConfig() -> SafeBackupConfig {
         let d = UserDefaults.standard
-        let settings = AppSettings(
-            privateKey: d.string(forKey: "privateKey") ?? "",
-            peerPublicKey: d.string(forKey: "peerPublicKey") ?? "",
-            presharedKey: d.string(forKey: "presharedKey") ?? "",
+        let settings = SafeBackupSettings(
             // Default values must match SettingsView's AppStorage defaults
             // — UserDefaults.string(forKey:) returns nil for unset keys
             // (unlike @AppStorage which returns the default). Using the
@@ -85,8 +79,6 @@ enum BackupManager {
             tunnelAddress: d.string(forKey: "tunnelAddress") ?? "192.168.102.3/24",
             dnsServers: d.string(forKey: "dnsServers") ?? "1.1.1.1",
             allowedIPs: d.string(forKey: "allowedIPs") ?? "0.0.0.0/0",
-            vkLink: d.string(forKey: "vkLink") ?? "",
-            peerAddress: d.string(forKey: "peerAddress") ?? "",
             // Bool defaults: UserDefaults.bool(forKey:) returns false for
             // unset, but useDTLS defaults to true in @AppStorage. Use
             // object(forKey:) to distinguish "set to false" from "unset".
@@ -98,43 +90,28 @@ enum BackupManager {
             // distinguish "explicitly set false" from "never set" — though
             // for a default of false the difference is invisible, the
             // pattern stays consistent with surrounding code.
-            useWrap: (d.object(forKey: "useWrap") as? Bool) ?? false,
-            wrapKeyHex: d.string(forKey: "wrapKeyHex") ?? ""
+            useWrap: (d.object(forKey: "useWrap") as? Bool) ?? false
         )
 
-        var turnPool: CredCacheFile? = nil
-        if let url = credsPoolURL,
-           let data = try? Data(contentsOf: url),
-           let decoded = try? JSONDecoder().decode(CredCacheFile.self, from: data) {
-            turnPool = decoded
-        }
-
-        // Captured browser profile (vk_profile.json). Optional — fresh
-        // installs without any solved captcha won't have it. Skipped
-        // silently on missing/corrupt file so the rest of the export
-        // still produces a usable backup.
-        let vkProfile = VKProfileCache.load()
-
-        return AppConfig(
+        return SafeBackupConfig(
             version: supportedConfigVersion,
-            type: "full",
+            type: settingsOnlyBackupType,
             exportedAt: Int64(Date().timeIntervalSince1970),
-            settings: settings,
-            turnPool: turnPool,
-            vkProfile: vkProfile
+            settings: settings
         )
+    }
+
+    static func isSettingsOnly(_ config: AppConfig) -> Bool {
+        config.type == settingsOnlyBackupType
     }
 
     // MARK: - Export
 
-    /// Encodes currentConfig() to a pretty-printed JSON file in the temp
+    /// Encodes currentSafeConfig() to a pretty-printed JSON file in the temp
     /// directory and returns its URL. Caller passes the URL to
-    /// UIActivityViewController. The temp file persists until the OS
-    /// cleans /tmp (boot, low storage) — fine for one-shot Share Sheet
-    /// flows since the user either saves it elsewhere immediately or
-    /// dismisses the sheet.
+    /// UIActivityViewController. The temp file contains no plaintext secrets.
     static func exportToTempFile() throws -> URL {
-        let config = currentConfig()
+        let config = currentSafeConfig()
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         let data: Data
@@ -149,7 +126,7 @@ enum BackupManager {
         // on settings and AirDropping each iteration to the Mac.
         let timestamp = ISO8601DateFormatter().string(from: Date())
             .replacingOccurrences(of: ":", with: "-")
-        let filename = "vkturnproxy-backup-\(timestamp).json"
+        let filename = "vkturnproxy-settings-backup-\(timestamp).json"
         let url = FileManager.default.temporaryDirectory.appendingPathComponent(filename)
 
         do {
@@ -157,7 +134,7 @@ enum BackupManager {
         } catch {
             throw BackupError.writeFailed(error.localizedDescription)
         }
-        SharedLogger.shared.log("[AppDebug] Backup: exported \(data.count) bytes to \(url.lastPathComponent)")
+        SharedLogger.shared.log("[AppDebug] Backup: exported settings-only backup (\(data.count) bytes) to \(url.lastPathComponent)")
         return url
     }
 
@@ -186,17 +163,57 @@ enum BackupManager {
             throw BackupError.readFailed(error.localizedDescription)
         }
 
-        let config: AppConfig
+        let decoder = JSONDecoder()
+        let envelope: BackupEnvelope
         do {
-            config = try JSONDecoder().decode(AppConfig.self, from: data)
+            envelope = try decoder.decode(BackupEnvelope.self, from: data)
         } catch {
             throw BackupError.decodeFailed(error.localizedDescription)
         }
 
-        if config.version != supportedConfigVersion {
-            throw BackupError.versionMismatch(config.version)
+        if envelope.version != supportedConfigVersion {
+            throw BackupError.versionMismatch(envelope.version)
         }
-        return config
+
+        switch envelope.type {
+        case settingsOnlyBackupType:
+            let safe: SafeBackupConfig
+            do {
+                safe = try decoder.decode(SafeBackupConfig.self, from: data)
+            } catch {
+                throw BackupError.decodeFailed("Settings backup JSON: \(error.localizedDescription)")
+            }
+            return AppConfig(
+                version: safe.version,
+                type: safe.type,
+                exportedAt: safe.exportedAt,
+                settings: AppSettings(
+                    privateKey: "",
+                    peerPublicKey: "",
+                    presharedKey: "",
+                    tunnelAddress: safe.settings.tunnelAddress,
+                    dnsServers: safe.settings.dnsServers,
+                    allowedIPs: safe.settings.allowedIPs,
+                    vkLink: "",
+                    peerAddress: "",
+                    useDTLS: safe.settings.useDTLS,
+                    numConnections: safe.settings.numConnections,
+                    credPoolCooldownSeconds: safe.settings.credPoolCooldownSeconds,
+                    useWrap: safe.settings.useWrap,
+                    wrapKeyHex: nil
+                ),
+                turnPool: nil,
+                vkProfile: nil
+            )
+        case legacyFullBackupType:
+            do {
+                return try decoder.decode(AppConfig.self, from: data)
+            } catch {
+                throw BackupError.decodeFailed("Legacy full backup JSON: \(error.localizedDescription)")
+            }
+        default:
+            throw BackupError.decodeFailed("Unsupported backup type '\(envelope.type)'")
+        }
     }
 
     /// Applies the AppConfig to UserDefaults + creds-pool.json. Called
@@ -206,14 +223,19 @@ enum BackupManager {
     static func applyConfig(_ config: AppConfig) throws {
         let d = UserDefaults.standard
         let s = config.settings
-        d.set(s.privateKey, forKey: "privateKey")
-        d.set(s.peerPublicKey, forKey: "peerPublicKey")
-        d.set(s.presharedKey, forKey: "presharedKey")
+        let settingsOnly = isSettingsOnly(config)
+
+        if !settingsOnly {
+            d.set(s.privateKey, forKey: "privateKey")
+            d.set(s.peerPublicKey, forKey: "peerPublicKey")
+            d.set(s.presharedKey, forKey: "presharedKey")
+            d.set(s.vkLink, forKey: "vkLink")
+            d.set(s.peerAddress, forKey: "peerAddress")
+        }
+
         d.set(s.tunnelAddress, forKey: "tunnelAddress")
         d.set(s.dnsServers, forKey: "dnsServers")
         d.set(s.allowedIPs, forKey: "allowedIPs")
-        d.set(s.vkLink, forKey: "vkLink")
-        d.set(s.peerAddress, forKey: "peerAddress")
         d.set(s.useDTLS, forKey: "useDTLS")
         d.set(s.numConnections, forKey: "numConnections")
         d.set(s.credPoolCooldownSeconds, forKey: "credPoolCooldownSeconds")
@@ -222,9 +244,15 @@ enum BackupManager {
         // that never had these keys. Non-nil → write through, including
         // false / empty if the user explicitly set them that way.
         if let v = s.useWrap { d.set(v, forKey: "useWrap") }
-        if let v = s.wrapKeyHex { d.set(v, forKey: "wrapKeyHex") }
+        if !settingsOnly, let v = s.wrapKeyHex { d.set(v, forKey: "wrapKeyHex") }
 
-        SharedLogger.shared.log("[AppDebug] Backup: applied settings (numConnections=\(s.numConnections), cooldown=\(s.credPoolCooldownSeconds)s, useDTLS=\(s.useDTLS), useWrap=\(s.useWrap ?? false))")
+        let kind = settingsOnly ? "settings-only" : "legacy full"
+        SharedLogger.shared.log("[AppDebug] Backup: applied \(kind) settings (numConnections=\(s.numConnections), cooldown=\(s.credPoolCooldownSeconds)s, useDTLS=\(s.useDTLS), useWrap=\(s.useWrap ?? false))")
+
+        if settingsOnly {
+            SharedLogger.shared.log("[AppDebug] Backup: settings-only import left keys, links, TURN cache, and captured browser profile unchanged")
+            return
+        }
 
         // creds-pool.json: write only if backup contained one. If the
         // backup has nil turnPool (e.g. user exported on a fresh install

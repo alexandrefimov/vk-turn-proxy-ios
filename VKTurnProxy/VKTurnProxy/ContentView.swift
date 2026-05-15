@@ -232,7 +232,7 @@ struct SettingsView: View {
     @State private var alertMessage: String? = nil
     @State private var alertTitle: String = ""
 
-    // 1-Click Connection Link import. Same flow as Full Backup but with
+    // 1-Click Connection Link import. Same flow as Backup import but with
     // a separate state pair so a user juggling both never gets confusing
     // alert collisions. The inbox observes vkturnproxy:// URL deliveries
     // from App.onOpenURL — see VKTurnProxyApp.swift for the producer side
@@ -294,7 +294,7 @@ struct SettingsView: View {
                 // build 73) means N=50 → 20 slots, N=64 → 26 slots, both
                 // pull more VK API traffic than is practical for typical
                 // single-user setups. Existing values above 50 (legacy
-                // installs, or values applied via Full Backup / Connection
+                // installs, or values applied via Backup / Connection
                 // Link import — both bypass this Stepper) are preserved
                 // by widening the upper bound to max(50, current). Stepper
                 // can only decrease them; once back ≤ 50 the cap holds.
@@ -328,11 +328,11 @@ struct SettingsView: View {
 
             Section {
                 Button(action: handleExport) {
-                    Label("Export Full Backup…", systemImage: "square.and.arrow.up")
+                    Label("Export Safe Backup…", systemImage: "square.and.arrow.up")
                 }
 
                 Button(action: { showImportPicker = true }) {
-                    Label("Import Full Backup…", systemImage: "square.and.arrow.down")
+                    Label("Import Backup…", systemImage: "square.and.arrow.down")
                 }
 
                 // 1-Click connection link. Reads a vkturnproxy://… URL
@@ -355,12 +355,7 @@ struct SettingsView: View {
             } header: {
                 Text("Backup & Restore")
             } footer: {
-                // Make the sensitivity explicit. Settings + WireGuard
-                // private/preshared keys + cached VK TURN credentials
-                // + captured browser profile give whoever holds the file
-                // the same VPN access the user has — there's no
-                // encryption layer.
-                Text("Backup contains all settings, WireGuard keys, TURN credentials, and the captured browser profile. Treat the exported file as a secret.")
+                Text("Safe backup exports non-secret preferences only. WireGuard keys, VK links, WRAP key, TURN credentials, and captured browser profile are excluded.")
             }
         }
         .navigationTitle("Settings")
@@ -415,9 +410,12 @@ struct SettingsView: View {
             let formatter = DateFormatter()
             formatter.dateStyle = .medium
             formatter.timeStyle = .short
+            if BackupManager.isSettingsOnly(config) {
+                return Text("Settings-only backup from \(formatter.string(from: date)). This will restore non-secret preferences and leave keys, links, TURN cache, and captured browser profile unchanged.")
+            }
             let credCount = config.turnPool?.creds.count ?? 0
             let profileMark = (config.vkProfile != nil) ? " + browser profile" : ""
-            return Text("Backup from \(formatter.string(from: date)) with \(credCount) cached TURN cred(s)\(profileMark). This will overwrite all current settings.")
+            return Text("Legacy full backup from \(formatter.string(from: date)) with \(credCount) cached TURN cred(s)\(profileMark). This may overwrite keys, links, and settings.")
         }
         // Connection link confirm — same shape as the full-backup import
         // alert but applies only the deployment definition (WG keys,
@@ -523,6 +521,10 @@ struct SettingsView: View {
             try BackupManager.applyConfig(config)
             pendingImportConfig = nil
             alertTitle = "Import Complete"
+            if BackupManager.isSettingsOnly(config) {
+                alertMessage = "Settings restored. Keys, links, TURN cache, and captured browser profile were left unchanged."
+                return
+            }
             let credCount = config.turnPool?.creds.count ?? 0
             alertMessage = "Settings restored. TURN cache: \(credCount) slot(s)."
         } catch {

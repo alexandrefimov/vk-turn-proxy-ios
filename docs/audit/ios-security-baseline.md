@@ -2,17 +2,18 @@
 
 ## Summary
 
-This repo is buildable in principle as a private iOS Network Extension client, but this environment still cannot validate the iOS build: Go and XcodeGen are installed, but `xcodebuild` reports Command Line Tools instead of full Xcode and the iPhoneOS SDK is unavailable. The highest priority remaining fixes are plaintext backup removal and Keychain secret storage before any public distribution work.
+This repo now passes local static checks, Go package checks, WireGuardBridge XCFramework build, and compile-only Xcode build without signing. The highest priority remaining fixes are Keychain secret storage, import schema validation, and safe/split mode defaults before any public distribution work.
 
 Main risks:
 
-- Critical: WireGuard private key, preshared key, VK link, WRAP key, and TURN credentials are stored in plaintext `@AppStorage` / `UserDefaults` and full backup JSON.
+- Critical: WireGuard private key, preshared key, VK link, and WRAP key are still stored in plaintext `@AppStorage` / `UserDefaults`.
 - Mitigated in `hardening/redacted-logs`: PacketTunnel no longer logs full `proxy_config`, and known app/extension/Go log/export paths are pattern-redacted.
+- Mitigated in `hardening/no-plaintext-backup`: new backup export is settings-only and excludes keys, links, WRAP key, TURN credentials, and captured browser profile.
 - High: full-tunnel mode is enabled silently with `includeAllNetworks = true` and default `allowedIPs = 0.0.0.0/0`.
 - High: import/link parsing has version checks but no explicit payload size limits or full schema/value validation.
 - High: license compatibility is unresolved for public distribution because this repo says MIT while the Go module and README identify GPL-3.0 upstream ancestry through `vk-turn-proxy`.
 
-Recommended next patch: disable plaintext secret backup/export without changing tunnel behavior.
+Recommended next patch: move persistent secrets from `@AppStorage` / `UserDefaults` to Keychain without changing tunnel behavior.
 
 ## Repository map
 
@@ -31,7 +32,7 @@ Recommended next patch: disable plaintext secret backup/export without changing 
 | File | Data | Sensitivity | Recommendation |
 | --- | --- | --- | --- |
 | `VKTurnProxy/VKTurnProxy/ContentView.swift` | `@AppStorage` for `privateKey`, `presharedKey`, `vkLink`, `wrapKeyHex`, `peerAddress`, `allowedIPs`, `dnsServers`, `numConnections`, `credPoolCooldownSeconds` | critical for keys/link/wrap; medium for routes/tuning | Move secrets to Keychain. Leave only UI preferences in `UserDefaults` / `AppStorage`. |
-| `VKTurnProxy/VKTurnProxy/BackupManager.swift` | Reads/writes all secret settings via `UserDefaults.standard`; exports/imports `creds-pool.json`; restores `vk_profile.json` | critical | Disable plaintext secret export or split into non-secret export plus explicit encrypted/local recovery flow. Add size and schema validation before decode/apply. |
+| `VKTurnProxy/VKTurnProxy/BackupManager.swift` | New export writes settings-only backup; legacy full import can still apply plaintext secrets from user-selected files | high | Keep export safe. Add size cap and schema validation before decode/apply. Consider explicit warning for legacy full import. |
 | `VKTurnProxy/VKTurnProxy/AppConfig.swift` | `AppConfig`, `AppSettings`, `ConnectionLink`, `ConnectionSettings` include WireGuard keys, VK link, WRAP key, TURN pool and browser profile | critical | Mark all links/backups as secret. Add validation model separate from persisted model. |
 | `VKTurnProxy/VKTurnProxy/CredCache.swift` | Reads App Group `creds-pool.json` with TURN `address`, `username`, `password` | critical | Keep out of backups by default; consider file protection and Keychain-backed cache later. |
 | `VKTurnProxy/VKTurnProxy/VKProfileCache.swift` | App Group `vk_profile.json`: captured `device`, `browser_fp`, `user_agent` | high | Treat as secret telemetry/fingerprint. Keep out of logs and plaintext backups by default. |
@@ -87,9 +88,10 @@ Findings:
 
 ## Backup/import/export audit
 
-- Full backup export writes pretty JSON to app temp as `vkturnproxy-backup-<timestamp>.json` and sends it to the share sheet.
-- Full backup includes all `AppStorage` settings, optional TURN `turn_pool`, and optional `vk_profile`.
-- The UI warns that backup contains WireGuard keys, TURN credentials, and captured browser profile, but the file is plaintext.
+- Safe backup export writes pretty JSON to app temp as `vkturnproxy-settings-backup-<timestamp>.json` and sends it to the share sheet.
+- Safe backup includes only non-secret preferences: tunnel address, DNS, allowed IPs, DTLS/WRAP toggles, connection count, and cooldown.
+- Safe backup excludes WireGuard private key, preshared key, peer public key, VK link, peer address, WRAP key, TURN `turn_pool`, and `vk_profile`.
+- Legacy full backup import is still accepted for manual recovery, but new exports no longer create that format.
 - Full backup import accepts `.json`, `.text`, `.data`, and `.item`, then reads the selected file fully into memory and decodes as `AppConfig`.
 - Connection links are accepted from `vkturnproxy://import?data=...` or raw clipboard base64.
 - `parseConnectionLinkBase64` normalizes base64 and decodes without explicit input size limit.
@@ -119,7 +121,7 @@ Findings:
 ## Phase 1 hardening plan
 
 1. Done: redacted logging helper for known key names, URLs, TURN credentials, WRAP keys, VK links, browser profile fields, and WireGuard UAPI keys.
-2. Disable plaintext secret export: split export into non-secret settings export, or gate full backup behind an explicit local-only warning until encrypted backup exists.
+2. Done: plaintext secret export removed. New export uses settings-only `SafeBackupConfig`; legacy full import remains for manual recovery.
 3. KeychainStore for secrets: move `privateKey`, `presharedKey`, `vkLink`, `wrapKeyHex`, and possibly `peerAddress` to Keychain. Leave `dnsServers`, UI toggles, and non-sensitive tuning in `AppStorage`.
 4. Safe/split mode default: default to non-full-tunnel routing for fresh installs.
 5. Full-tunnel explicit toggle/warning: require user action before `includeAllNetworks = true` and `allowedIPs = 0.0.0.0/0`.

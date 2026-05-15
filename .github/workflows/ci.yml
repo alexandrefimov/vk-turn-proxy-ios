@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  validate:
+    runs-on: macos-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Tool versions
+        run: |
+          go version
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+
+      - name: Static security checks
+        run: sh scripts/check-tracked-sensitive-files.sh
+
+      - name: Whitespace check
+        run: git diff --check
+
+      - name: Plist lint
+        run: |
+          plutil -lint \
+            VKTurnProxy/VKTurnProxy/Info.plist \
+            VKTurnProxy/PacketTunnel/Info.plist \
+            VKTurnProxy/VKTurnProxy/VKTurnProxy.entitlements \
+            VKTurnProxy/PacketTunnel/PacketTunnel.entitlements
+
+      - name: Go tests
+        run: |
+          export GOCACHE="${RUNNER_TEMP}/go-build"
+          export GOPATH="${RUNNER_TEMP}/go"
+          go test ./...
+          cd WireGuardBridge
+          go test .
+
+      - name: Build WireGuardBridge XCFramework
+        run: |
+          export GOCACHE="${RUNNER_TEMP}/go-build"
+          export GOPATH="${RUNNER_TEMP}/go"
+          make -C WireGuardBridge xcframework
+
+      - name: Xcode compile only
+        run: |
+          xcodebuild \
+            -project VKTurnProxy/VKTurnProxy.xcodeproj \
+            -scheme VKTurnProxy \
+            -configuration Debug \
+            -sdk iphoneos \
+            -derivedDataPath "${RUNNER_TEMP}/vk-turn-derived-data" \
+            CODE_SIGNING_ALLOWED=NO \
+            -quiet \
+            build
