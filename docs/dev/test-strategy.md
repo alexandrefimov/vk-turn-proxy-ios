@@ -12,10 +12,12 @@ CI runs:
 - Go package tests;
 - WireGuardBridge XCFramework build;
 - Xcode compile-only build with signing disabled.
+- Xcode unit tests for backup/import validation and settings-only backup
+  safety.
 
 ## Useful next tests
 
-- Swift unit tests for import validation and redaction helpers.
+- Swift unit tests for redaction helpers.
 - Swift unit tests for safe-mode routing decisions after route logic is moved behind a small pure helper.
 - Golden JSON fixtures for settings-only backup and connection-link import.
 

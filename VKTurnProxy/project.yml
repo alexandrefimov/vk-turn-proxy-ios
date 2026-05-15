@@ -98,6 +98,9 @@ targets:
       # just links the symbols at build time.
       - framework: ../WireGuardBridge/build/WireGuardTURN.xcframework
         embed: false
+    scheme:
+      testTargets:
+        - VKTurnProxyTests
 
   PacketTunnel:
     type: app-extension
@@ -139,3 +142,15 @@ targets:
     dependencies:
       - framework: ../WireGuardBridge/build/WireGuardTURN.xcframework
       - sdk: NetworkExtension.framework
+
+  VKTurnProxyTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: VKTurnProxyTests
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.vkturnproxy.app.tests
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/VKTurnProxy.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/VKTurnProxy"
+    dependencies:
+      - target: VKTurnProxy

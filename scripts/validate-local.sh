@@ -38,6 +38,7 @@ if command -v xcodebuild >/dev/null 2>&1; then
             CODE_SIGNING_ALLOWED=NO \
             -quiet \
             build
+        sh scripts/run-xcode-tests.sh
     else
         echo "Skipping Xcode compile-only build: WireGuardTURN.xcframework is absent"
         echo "Run: GOCACHE=/private/tmp/vk-turn-go-build-cache GOPATH=/private/tmp/vk-turn-go make -C WireGuardBridge xcframework"

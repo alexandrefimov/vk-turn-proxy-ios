@@ -99,6 +99,10 @@ sh scripts/validate-local.sh
 ```
 
 ```bash
+sh scripts/run-xcode-tests.sh
+```
+
+```bash
 xcodebuild -project VKTurnProxy/VKTurnProxy.xcodeproj -scheme VKTurnProxy -configuration Debug -sdk iphoneos -derivedDataPath /private/tmp/vk-turn-derived-data CODE_SIGNING_ALLOWED=NO -quiet build
 ```
 

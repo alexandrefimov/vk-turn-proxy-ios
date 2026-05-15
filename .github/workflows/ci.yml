@@ -61,3 +61,6 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             -quiet \
             build
+
+      - name: Xcode unit tests
+        run: sh scripts/run-xcode-tests.sh

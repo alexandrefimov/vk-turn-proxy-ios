@@ -23,12 +23,20 @@
 		B1B5B221672B08CCCC35BE51 /* PacketTunnelProvider.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4D06132B25271A4E9DA8F0C6 /* PacketTunnelProvider.swift */; };
 		CBF9B6203060C546C778DABA /* AppConfig.swift in Sources */ = {isa = PBXBuildFile; fileRef = AD358E048E7135E1596359E1 /* AppConfig.swift */; };
 		E1250E1BF6D8FBFBCCFB25BF /* VKProfileCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = 48CEB6CB28E1CC064B6D8C79 /* VKProfileCache.swift */; };
+		ED42DF8C0D1FEEDC08FAF641 /* BackupManagerValidationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D37C502F0A37E21EF020224E /* BackupManagerValidationTests.swift */; };
 		F32EA8BA9CCC4E95BD4DFA12 /* NetworkExtension.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 605ED1D89D0F1886A8414767 /* NetworkExtension.framework */; };
 		F5781EB3D4D7E0467DC2A5F5 /* SharedLogger.swift in Sources */ = {isa = PBXBuildFile; fileRef = A648919F90B0D8CBE826BC6E /* SharedLogger.swift */; };
 		FD1864DD0B5915A3945CE086 /* BackupManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4D13B015BF30B930DDDB8BBF /* BackupManager.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
+		5D8241F89FECC978B51030EA /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 5024C6C147B3FDF72E10E537 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 41C7426A4820CE681FCBDC8E;
+			remoteInfo = VKTurnProxy;
+		};
 		DC1BB6D5C784F7552F468357 /* PBXContainerItemProxy */ = {
 			isa = PBXContainerItemProxy;
 			containerPortal = 5024C6C147B3FDF72E10E537 /* Project object */;
@@ -62,6 +70,7 @@
 		4D13B015BF30B930DDDB8BBF /* BackupManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackupManager.swift; sourceTree = "<group>"; };
 		50685ED014984982ABF8CF0C /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		605ED1D89D0F1886A8414767 /* NetworkExtension.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = NetworkExtension.framework; path = System/Library/Frameworks/NetworkExtension.framework; sourceTree = SDKROOT; };
+		65BB30480741B0EAD5B8D80E /* VKTurnProxyTests.xctest */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.cfbundle; path = VKTurnProxyTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		7342F754F29FF238732D4C8A /* VKTurnProxy.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = VKTurnProxy.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		99E2AC40D13D6F8DD598752A /* WireGuardTURN.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; name = WireGuardTURN.xcframework; path = ../WireGuardBridge/build/WireGuardTURN.xcframework; sourceTree = "<group>"; };
 		A01BE3EACAF5D00A44A0D32E /* PacketTunnel.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = PacketTunnel.entitlements; sourceTree = "<group>"; };
@@ -71,6 +80,7 @@
 		AD358E048E7135E1596359E1 /* AppConfig.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppConfig.swift; sourceTree = "<group>"; };
 		B579DDFDDB7800E681CAC9C4 /* OSLogReader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OSLogReader.swift; sourceTree = "<group>"; };
 		B72BF34DDA41B9171843CDA5 /* CredCache.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CredCache.swift; sourceTree = "<group>"; };
+		D37C502F0A37E21EF020224E /* BackupManagerValidationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackupManagerValidationTests.swift; sourceTree = "<group>"; };
 		E28ACD6367F3CDE026C71A36 /* PacketTunnel.appex */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = "wrapper.app-extension"; path = PacketTunnel.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 		E74B178DC212A229BC8565F4 /* TunnelManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TunnelManager.swift; sourceTree = "<group>"; };
 		F16CAECB3D91AC18F93D32C0 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
@@ -115,6 +125,7 @@
 			children = (
 				E28ACD6367F3CDE026C71A36 /* PacketTunnel.appex */,
 				7342F754F29FF238732D4C8A /* VKTurnProxy.app */,
+				65BB30480741B0EAD5B8D80E /* VKTurnProxyTests.xctest */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -124,6 +135,7 @@
 			children = (
 				05D165AC8B5B42686D871C6C /* PacketTunnel */,
 				9C68AA12FFBB168491B35540 /* VKTurnProxy */,
+				D7509E172519A9BB8FD0BB8A /* VKTurnProxyTests */,
 				B6F1BD8B36C56C6FC2673195 /* Frameworks */,
 				150D6D20AA77CA102C2B0119 /* Products */,
 			);
@@ -157,6 +169,14 @@
 				99E2AC40D13D6F8DD598752A /* WireGuardTURN.xcframework */,
 			);
 			name = Frameworks;
+			sourceTree = "<group>";
+		};
+		D7509E172519A9BB8FD0BB8A /* VKTurnProxyTests */ = {
+			isa = PBXGroup;
+			children = (
+				D37C502F0A37E21EF020224E /* BackupManagerValidationTests.swift */,
+			);
+			path = VKTurnProxyTests;
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
@@ -201,6 +221,24 @@
 			productReference = E28ACD6367F3CDE026C71A36 /* PacketTunnel.appex */;
 			productType = "com.apple.product-type.app-extension";
 		};
+		EDECD29E6A323410415E5811 /* VKTurnProxyTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = C55530380547DB2A4E231519 /* Build configuration list for PBXNativeTarget "VKTurnProxyTests" */;
+			buildPhases = (
+				DB42B89F8AF994DA0AD64DE8 /* Sources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				E17A66C522356A8FCB513CB9 /* PBXTargetDependency */,
+			);
+			name = VKTurnProxyTests;
+			packageProductDependencies = (
+			);
+			productName = VKTurnProxyTests;
+			productReference = 65BB30480741B0EAD5B8D80E /* VKTurnProxyTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
 /* End PBXNativeTarget section */
 
 /* Begin PBXProject section */
@@ -215,6 +253,10 @@
 						ProvisioningStyle = Automatic;
 					};
 					DC014AC2B8038EB7433CDED3 = {
+						DevelopmentTeam = CDMQ33VFQC;
+						ProvisioningStyle = Automatic;
+					};
+					EDECD29E6A323410415E5811 = {
 						DevelopmentTeam = CDMQ33VFQC;
 						ProvisioningStyle = Automatic;
 					};
@@ -236,6 +278,7 @@
 			targets = (
 				DC014AC2B8038EB7433CDED3 /* PacketTunnel */,
 				41C7426A4820CE681FCBDC8E /* VKTurnProxy */,
+				EDECD29E6A323410415E5811 /* VKTurnProxyTests */,
 			);
 		};
 /* End PBXProject section */
@@ -259,6 +302,14 @@
 				90CBABBC0C21BE682CF22ACF /* OSLogReader.swift in Sources */,
 				B1B5B221672B08CCCC35BE51 /* PacketTunnelProvider.swift in Sources */,
 				3F33AE79B74735B536FE1D31 /* SharedLogger.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		DB42B89F8AF994DA0AD64DE8 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				ED42DF8C0D1FEEDC08FAF641 /* BackupManagerValidationTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -286,6 +337,11 @@
 			isa = PBXTargetDependency;
 			target = DC014AC2B8038EB7433CDED3 /* PacketTunnel */;
 			targetProxy = DC1BB6D5C784F7552F468357 /* PBXContainerItemProxy */;
+		};
+		E17A66C522356A8FCB513CB9 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 41C7426A4820CE681FCBDC8E /* VKTurnProxy */;
+			targetProxy = 5D8241F89FECC978B51030EA /* PBXContainerItemProxy */;
 		};
 /* End PBXTargetDependency section */
 
@@ -439,6 +495,22 @@
 			};
 			name = Debug;
 		};
+		6EF8051292B2B9CD4F1C74CE /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.vkturnproxy.app.tests;
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/VKTurnProxy.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/VKTurnProxy";
+			};
+			name = Debug;
+		};
 		848A2BACF05A1B10E8306F28 /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
@@ -525,6 +597,22 @@
 			};
 			name = Release;
 		};
+		E52027808CB24C3F9DBFE83F /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.vkturnproxy.app.tests;
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/VKTurnProxy.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/VKTurnProxy";
+			};
+			name = Release;
+		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
@@ -551,6 +639,15 @@
 			buildConfigurations = (
 				6AD31CFB046892E438EE1322 /* Debug */,
 				D8BCE6B26E87112B6AE94007 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		C55530380547DB2A4E231519 /* Build configuration list for PBXNativeTarget "VKTurnProxyTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				6EF8051292B2B9CD4F1C74CE /* Debug */,
+				E52027808CB24C3F9DBFE83F /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Debug;

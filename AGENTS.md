@@ -52,6 +52,7 @@ Private, auditable iOS client for personal testing first. Security hardening bef
 ## Codex escalation notes
 Run these through tool escalation in Codex instead of retrying after sandbox failures:
 - `sh scripts/validate-local.sh`
+- `sh scripts/run-xcode-tests.sh`
 - direct `xcodebuild ...` compile-only builds
 - `xcodegen --spec VKTurnProxy/project.yml --project VKTurnProxy --use-cache` when project regeneration is intentional
 - network commands such as `git fetch upstream`, `git push origin main`, and `gh run ...`
