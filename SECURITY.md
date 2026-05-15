@@ -22,7 +22,13 @@ This fork is intended for private, personal iOS builds first. Do not publish Tes
 Public distribution is blocked until:
 
 - secrets are no longer stored in plaintext `UserDefaults` / `AppStorage`;
-- log export redacts private keys, PSKs, VK links, TURN username/password, WRAP keys, and browser profile material;
 - plaintext full-secret export is removed, encrypted, or explicitly separated behind a local-only recovery flow;
 - full-tunnel mode is no longer a silent default;
 - license compatibility with GPL-3.0 `vk-turn-proxy` is resolved.
+
+## Current hardening status
+
+- Redacted logging is implemented for known app, extension, Go, and log-export paths.
+- Plaintext backup export is still unsafe and blocked as the next hardening target.
+- Keychain migration is still pending.
+- Full-tunnel safe default work is still pending and requires physical-device validation.

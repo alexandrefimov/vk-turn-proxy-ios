@@ -1,6 +1,8 @@
 # VK TURN Proxy — iOS
 
-iOS client for [vk-turn-proxy](https://github.com/cacggghp/vk-turn-proxy) — a WireGuard VPN tunnel that routes traffic through VK's TURN infrastructure.
+Private iOS client fork for [vk-turn-proxy](https://github.com/cacggghp/vk-turn-proxy) — a WireGuard VPN tunnel that routes traffic through VK's TURN infrastructure.
+
+This fork is currently in private hardening mode. Security fixes and reproducible local builds take priority over features and public distribution.
 
 ## Features
 
@@ -22,31 +24,30 @@ pkg/proxy/            # Go proxy: DTLS+TURN tunnel, VK creds, PoW captcha solver
 go.mod, go.sum        # Go module dependencies
 ```
 
-## Installing
+## Distribution status
 
-[TestFlight](https://testflight.apple.com/join/ANm6cmDv)
+Public TestFlight, App Store, and GitHub Release distribution are blocked until the security audit items are closed. Build only for personal testing on a physical iPhone.
 
 ## Building
 
-### Prerequisites
+See [docs/build/ios-local-build.md](docs/build/ios-local-build.md) for the private local-device workflow.
 
-- Xcode 15+
-- Go 1.21+ (via Homebrew: `brew install go`)
-- Apple Developer account with Network Extension entitlement
+Minimum prerequisites:
 
-### Steps
+- Full Xcode 15+ selected with `xcode-select`.
+- Go 1.21+.
+- XcodeGen.
+- Apple Developer Program account with Network Extension capability.
+- App Group configured for the app and PacketTunnel extension.
+- Physical iPhone. Simulator is not sufficient for PacketTunnel validation.
 
-1. Build the Go XCFramework:
-   ```bash
-   cd WireGuardBridge
-   make xcframework
-   ```
+## Documentation
 
-2. Open `VKTurnProxy/VKTurnProxy.xcodeproj` in Xcode.
-
-3. Set your development team and bundle identifiers.
-
-4. Build and run on a physical iOS device (simulator won't work for Network Extension).
+- [Security posture](SECURITY.md)
+- [Baseline iOS security audit](docs/audit/ios-security-baseline.md)
+- [Redaction notes](docs/audit/redaction-notes.md)
+- [Toolchain and environment](docs/dev/toolchain.md)
+- [Private local iPhone build](docs/build/ios-local-build.md)
 
 ## Configuration
 
@@ -62,4 +63,4 @@ Based on [vk-turn-proxy](https://github.com/cacggghp/vk-turn-proxy) by [cacggghp
 
 ## License
 
-MIT
+This repository currently states MIT, but it is based on `vk-turn-proxy`, which is treated as a GPL-3.0 compatibility risk for public distribution. Private local testing can continue while license compatibility is reviewed.

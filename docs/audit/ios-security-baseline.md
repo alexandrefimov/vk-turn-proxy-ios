@@ -2,18 +2,17 @@
 
 ## Summary
 
-This repo is buildable in principle as a private iOS Network Extension client, but this environment cannot validate the iOS build: `go` is not installed, and `xcodebuild` reports Command Line Tools instead of full Xcode. The highest priority fixes are secret handling and log redaction before any public distribution work.
+This repo is buildable in principle as a private iOS Network Extension client, but this environment still cannot validate the iOS build: Go and XcodeGen are installed, but `xcodebuild` reports Command Line Tools instead of full Xcode and the iPhoneOS SDK is unavailable. The highest priority remaining fixes are plaintext backup removal and Keychain secret storage before any public distribution work.
 
 Main risks:
 
 - Critical: WireGuard private key, preshared key, VK link, WRAP key, and TURN credentials are stored in plaintext `@AppStorage` / `UserDefaults` and full backup JSON.
-- Critical: PacketTunnel logs the full `proxy_config`, which includes `vk_link`, `wrap_key_hex`, and seeded TURN username/password.
-- High: log export shares raw combined logs with no redaction.
+- Mitigated in `hardening/redacted-logs`: PacketTunnel no longer logs full `proxy_config`, and known app/extension/Go log/export paths are pattern-redacted.
 - High: full-tunnel mode is enabled silently with `includeAllNetworks = true` and default `allowedIPs = 0.0.0.0/0`.
 - High: import/link parsing has version checks but no explicit payload size limits or full schema/value validation.
 - High: license compatibility is unresolved for public distribution because this repo says MIT while the Go module and README identify GPL-3.0 upstream ancestry through `vk-turn-proxy`.
 
-Recommended first patch: add a redacted logging helper and route all app/extension/Go bridge messages that can contain config or URLs through it. Do not change tunnel behavior in that patch.
+Recommended next patch: disable plaintext secret backup/export without changing tunnel behavior.
 
 ## Repository map
 
@@ -79,12 +78,12 @@ Logging surfaces:
 
 Findings:
 
-- Critical: `PacketTunnelProvider.swift` logs `proxyConfig=\(proxyConfigJSON)`, which can contain `vk_link`, `wrap_key_hex`, and `seeded_turn.password`.
+- Mitigated: `PacketTunnelProvider.swift` logs only redacted `proxyConfig` metadata after `hardening/redacted-logs`.
 - WireGuard UAPI config is not directly logged in the observed Swift path, but Go `IpcSet` error strings could potentially include config context depending on upstream error behavior.
-- Go proxy logs captcha URLs/SIDs, TURN relay addresses, path data, and diagnostic HTTP snippets. It appears to log lengths for captcha answers/tokens rather than full tokens, but a redaction pass is still required.
+- Go proxy logs pass through a pattern redactor before shared file logging and `os_log`. Residual risk remains because the redactor is pattern-based.
 - `applyConnectionLink` comments say vkLink should be truncated, but the actual log includes full `peerAddress` and no vkLink. Peer/server address should still be treated as sensitive for a private fork.
 - `VKProfileCache` logs profile field lengths, not raw profile values.
-- `SharedLogger.exportSnapshotURL` and `LogsView.exportShareableLogURL` export raw log text with no redaction.
+- `SharedLogger.exportSnapshotURL` and `LogsView.exportShareableLogURL` now export redacted text. Older unsafe lines may still exist on disk until logs are cleared, but read/export paths redact them.
 
 ## Backup/import/export audit
 
@@ -119,7 +118,7 @@ Findings:
 
 ## Phase 1 hardening plan
 
-1. Redacted logging helper: add a small Swift redactor plus Go-side equivalent for known key names, URLs, TURN credentials, WRAP keys, VK links, browser profile fields, and WireGuard UAPI keys. Replace the `proxyConfig=` log first.
+1. Done: redacted logging helper for known key names, URLs, TURN credentials, WRAP keys, VK links, browser profile fields, and WireGuard UAPI keys.
 2. Disable plaintext secret export: split export into non-secret settings export, or gate full backup behind an explicit local-only warning until encrypted backup exists.
 3. KeychainStore for secrets: move `privateKey`, `presharedKey`, `vkLink`, `wrapKeyHex`, and possibly `peerAddress` to Keychain. Leave `dnsServers`, UI toggles, and non-sensitive tuning in `AppStorage`.
 4. Safe/split mode default: default to non-full-tunnel routing for fresh installs.
@@ -152,8 +151,9 @@ Validation result:
 
 - Static file inspection completed.
 - `plutil` inspection completed.
-- `go test ./...` did not run because `go` is not installed in this environment.
+- `go test ./...` passes after installing Go and using writable temp Go cache paths.
 - Xcode build did not run because active developer directory is Command Line Tools, not full Xcode.
+- `make -C WireGuardBridge xcframework` fails until full Xcode/iPhoneOS SDK is installed and selected.
 - No device validation was performed.
 
 Local validation required on a Mac with full toolchain:

@@ -38,11 +38,20 @@ Private, auditable iOS client for personal testing first. Security hardening bef
 - upstream should be https://github.com/anton48/vk-turn-proxy-ios.git
 - Use topic branches:
   - audit/baseline
-  - hardening/secrets-keychain
   - hardening/redacted-logs
+  - hardening/no-plaintext-backup
+  - hardening/keychain-secrets
   - hardening/safe-mode
+  - build/local-device
   - integration/import-link
 - Keep commits small and reviewable.
+
+## Tooling notes
+- Prefer `rg` / `rg --files` for repository inspection.
+- Use `GOCACHE` and `GOPATH` under `/private/tmp` when sandboxed Go commands cannot write to `~/Library/Caches` or `~/go`.
+- Go CLI checks are useful, but iOS XCFramework builds require full Xcode with the iPhoneOS SDK selected by `xcode-select`.
+- Do not regenerate or commit Xcode project churn unless the task explicitly requires project generation changes.
+- Do not run `release.sh` during hardening. It is a public TestFlight/GitHub Release pipeline and is blocked until security and license review are done.
 
 ## Validation
 Because Network Extension requires Apple signing and a physical iOS device:
