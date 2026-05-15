@@ -2,18 +2,18 @@
 
 ## Summary
 
-This repo now passes local static checks, Go package checks, WireGuardBridge XCFramework build, and compile-only Xcode build without signing. The highest priority remaining fixes are import schema validation and safe/split mode defaults before any public distribution work.
+This repo now passes local static checks, Go package checks, WireGuardBridge XCFramework build, and compile-only Xcode build without signing. The highest priority remaining fix is safe/split mode defaults before any public distribution work.
 
 Main risks:
 
 - Mitigated in `main`: WireGuard private key, preshared key, VK link, and WRAP key are stored in Keychain and legacy `UserDefaults` values are migrated/cleared.
 - Mitigated in `hardening/redacted-logs`: PacketTunnel no longer logs full `proxy_config`, and known app/extension/Go log/export paths are pattern-redacted.
 - Mitigated in `hardening/no-plaintext-backup`: new backup export is settings-only and excludes keys, links, WRAP key, TURN credentials, and captured browser profile.
+- Mitigated in `main`: backup and connection-link import paths have size caps, schema checks, and value validation before apply.
 - High: full-tunnel mode is enabled silently with `includeAllNetworks = true` and default `allowedIPs = 0.0.0.0/0`.
-- High: import/link parsing has version checks but no explicit payload size limits or full schema/value validation.
 - High: license compatibility is unresolved for public distribution because this repo says MIT while the Go module and README identify GPL-3.0 upstream ancestry through `vk-turn-proxy`.
 
-Recommended next patch: add import payload size caps and schema validation without changing tunnel behavior.
+Recommended next patch: safe/split mode default with an explicit full-tunnel toggle/warning.
 
 ## Repository map
 
@@ -33,7 +33,7 @@ Recommended next patch: add import payload size caps and schema validation witho
 | --- | --- | --- | --- |
 | `VKTurnProxy/VKTurnProxy/ContentView.swift` | `@AppStorage` for non-secret settings; Keychain-backed state for `privateKey`, `presharedKey`, `vkLink`, `wrapKeyHex` | high | Keep secret fields out of `@AppStorage`. Add device validation for Keychain migration path. |
 | `VKTurnProxy/VKTurnProxy/KeychainStore.swift` | Generic-password Keychain items for private key, PSK, VK link, WRAP key | high | Uses `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`; verify on physical iPhone after install/update. |
-| `VKTurnProxy/VKTurnProxy/BackupManager.swift` | New export writes settings-only backup; legacy full import can still apply plaintext secrets into Keychain from user-selected files | high | Keep export safe. Add size cap and schema validation before decode/apply. Consider explicit warning for legacy full import. |
+| `VKTurnProxy/VKTurnProxy/BackupManager.swift` | New export writes settings-only backup; legacy full import can still apply plaintext secrets into Keychain from user-selected files | high | Keep export safe. Size/schema/value validation is in place; consider explicit warning for legacy full import. |
 | `VKTurnProxy/VKTurnProxy/AppConfig.swift` | `AppConfig`, `AppSettings`, `ConnectionLink`, `ConnectionSettings` include WireGuard keys, VK link, WRAP key, TURN pool and browser profile | critical | Mark all links/backups as secret. Add validation model separate from persisted model. |
 | `VKTurnProxy/VKTurnProxy/CredCache.swift` | Reads App Group `creds-pool.json` with TURN `address`, `username`, `password` | critical | Keep out of backups by default; consider file protection and Keychain-backed cache later. |
 | `VKTurnProxy/VKTurnProxy/VKProfileCache.swift` | App Group `vk_profile.json`: captured `device`, `browser_fp`, `user_agent` | high | Treat as secret telemetry/fingerprint. Keep out of logs and plaintext backups by default. |
@@ -94,11 +94,10 @@ Findings:
 - Safe backup includes only non-secret preferences: tunnel address, DNS, allowed IPs, DTLS/WRAP toggles, connection count, and cooldown.
 - Safe backup excludes WireGuard private key, preshared key, peer public key, VK link, peer address, WRAP key, TURN `turn_pool`, and `vk_profile`.
 - Legacy full backup import is still accepted for manual recovery, but new exports no longer create that format.
-- Full backup import accepts `.json`, `.text`, `.data`, and `.item`, then reads the selected file fully into memory and decodes as `AppConfig`.
+- Full backup import accepts `.json`, `.text`, `.data`, and `.item`, then enforces a file-size cap before reading and decoding as `AppConfig`.
 - Connection links are accepted from `vkturnproxy://import?data=...` or raw clipboard base64.
-- `parseConnectionLinkBase64` normalizes base64 and decodes without explicit input size limit.
-- Version and `type == "connection"` checks exist.
-- Missing: explicit schema validation for key lengths, allowed CIDRs, DNS/IP/host formats, `numConnections` bounds, `mtu` bounds, and oversized/malicious payload rejection before decode.
+- Backup and connection-link imports reject oversized payloads before decode/apply.
+- Decoded import payloads validate known schema keys, WireGuard key shape, allowed CIDRs, DNS/IP values, `host:port` fields, WRAP key shape, `numConnections`, cooldowns, TURN cache entry count, and captured profile field lengths.
 
 ## Build/signing audit
 
@@ -127,8 +126,8 @@ Findings:
 3. Done: KeychainStore for `privateKey`, `presharedKey`, `vkLink`, and `wrapKeyHex`; non-sensitive tuning remains in `AppStorage`.
 4. Safe/split mode default: default to non-full-tunnel routing for fresh installs.
 5. Full-tunnel explicit toggle/warning: require user action before `includeAllNetworks = true` and `allowedIPs = 0.0.0.0/0`.
-6. Safer defaults for `numConnections`/MTU: lower initial `numConnections`, validate import bounds, and enforce MTU range.
-7. Import schema validation: cap file/link size, validate keys/base64, CIDRs, DNS, host:port, URL scheme/host, booleans, and numeric bounds before applying.
+6. Safer defaults for `numConnections`/MTU: lower initial `numConnections` and enforce MTU range.
+7. Done: import schema validation caps file/link size and validates JSON version/type/known fields, key lengths, CIDRs, host:port, DNS, WRAP key, and `numConnections` bounds before applying.
 8. Reset all secrets button: clear Keychain secrets, UserDefaults non-sensitive config, TURN cache, browser profile, logs, and Network Extension preferences.
 
 ## Validation commands
