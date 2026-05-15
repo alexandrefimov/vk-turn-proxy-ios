@@ -58,8 +58,14 @@ When Go cannot write to `~/Library/Caches/go-build` or `~/go`, use writable temp
 ```bash
 GOCACHE=/private/tmp/vk-turn-go-build-cache \
 GOPATH=/private/tmp/vk-turn-go \
-go test ./...
+go test .
 ```
+
+Use `go test .` from `WireGuardBridge`. After `make xcframework`, the
+ignored `WireGuardBridge/build/goroot` staging tree sits under the Go module
+directory, so `go test ./...` also walks copied Go runtime test fixtures and is
+not a valid project validation command unless `WireGuardBridge/build/` is
+removed first.
 
 For XCFramework builds in a sandboxed shell:
 

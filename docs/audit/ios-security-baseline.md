@@ -143,7 +143,8 @@ plutil -p VKTurnProxy/VKTurnProxy/VKTurnProxy.entitlements
 plutil -p VKTurnProxy/PacketTunnel/PacketTunnel.entitlements
 plutil -p VKTurnProxy/VKTurnProxy/Info.plist
 plutil -p VKTurnProxy/PacketTunnel/Info.plist
-go test ./...
+cd WireGuardBridge
+GOCACHE=/private/tmp/vk-turn-go-build-cache GOPATH=/private/tmp/vk-turn-go go test .
 xcodebuild -version
 ```
 
@@ -151,18 +152,20 @@ Validation result:
 
 - Static file inspection completed.
 - `plutil` inspection completed.
-- `go test ./...` passes after installing Go and using writable temp Go cache paths.
-- Xcode build did not run because active developer directory is Command Line Tools, not full Xcode.
-- `make -C WireGuardBridge xcframework` fails until full Xcode/iPhoneOS SDK is installed and selected.
+- `go test .` passes for `WireGuardBridge` after installing Go and using writable temp Go cache paths.
+- Do not use `go test ./...` from `WireGuardBridge` after `make xcframework`: the ignored `build/goroot` staging tree is under the module directory and makes Go walk copied runtime test fixtures.
+- Active Xcode is `/Applications/Xcode.app/Contents/Developer`; `xcodebuild -version` reports Xcode 26.4.1.
+- `make -C WireGuardBridge xcframework` completes with the selected full Xcode and iPhoneOS SDK.
+- Compile-only `xcodebuild` for `VKTurnProxy` with `CODE_SIGNING_ALLOWED=NO` completes under `iphoneos`; signed device validation still requires Apple provisioning and a physical iPhone.
 - No device validation was performed.
 
 Local validation required on a Mac with full toolchain:
 
 ```bash
 cd WireGuardBridge
-make xcframework
+GOCACHE=/private/tmp/vk-turn-go-build-cache GOPATH=/private/tmp/vk-turn-go make xcframework
 cd ../VKTurnProxy
-xcodebuild -project VKTurnProxy.xcodeproj -scheme VKTurnProxy -destination 'generic/platform=iOS' -configuration Debug build
+xcodebuild -project VKTurnProxy.xcodeproj -scheme VKTurnProxy -configuration Debug -sdk iphoneos -derivedDataPath /private/tmp/vk-turn-derived-data CODE_SIGNING_ALLOWED=NO build
 ```
 
 For actual Network Extension validation, use Xcode with a physical iOS device, a paid Apple Developer account, matching App Group IDs, and the Network Extension entitlement. Do not claim tunnel validation until the device run confirms connect, disconnect, captcha fallback, log view, WiFi/LTE handoff, and import/export behavior.
