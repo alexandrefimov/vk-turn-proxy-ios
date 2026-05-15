@@ -1258,9 +1258,10 @@ struct CaptchaWKWebView: UIViewRepresentable {
             // to a Mac (useful for live debugging). onLog tunnels the same
             // message through TunnelManager → extension → vpn.log so
             // post-mortem analysis from a vpn.log dump is possible too.
-            os_log("%{public}s", log: captchaLog, type: .default, msg)
-            NSLog("[Captcha] %@", msg)
-            onLog(msg)
+            let safe = LogRedactor.redact(msg)
+            os_log("%{public}s", log: captchaLog, type: .default, safe)
+            NSLog("[Captcha] %@", safe)
+            onLog(safe)
         }
 
         // Called by updateUIView when the captcha URL changes mid-flight
@@ -1601,13 +1602,14 @@ struct LogsView: View {
                     "Reason: \(reason)\n\n" +
                     combined
             }
+            let safeCombined = LogRedactor.redact(combined)
 
             await MainActor.run {
-                fallbackText = combined
+                fallbackText = safeCombined
                 fallbackFetchedAt = Date()
                 fallbackInFlight = false
                 if usingOSLogFallback {
-                    logText = truncated(combined)
+                    logText = truncated(safeCombined)
                 }
             }
         }
@@ -1634,7 +1636,7 @@ struct LogsView: View {
         // temp file so Share has something to attach.
         let tmp = FileManager.default.temporaryDirectory
             .appendingPathComponent("vpn-export-oslog.log")
-        try? logText.write(to: tmp, atomically: true, encoding: .utf8)
+        try? LogRedactor.redact(logText).write(to: tmp, atomically: true, encoding: .utf8)
         return FileManager.default.fileExists(atPath: tmp.path) ? tmp : nil
     }
 }

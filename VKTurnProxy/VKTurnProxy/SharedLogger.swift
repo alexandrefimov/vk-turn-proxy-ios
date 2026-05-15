@@ -1,5 +1,56 @@
 import Foundation
 
+enum LogRedactor {
+    private static func makeRegex(_ pattern: String) -> NSRegularExpression {
+        try! NSRegularExpression(pattern: pattern, options: [.caseInsensitive])
+    }
+
+    private static let sensitiveKeys = [
+        "private_key", "privateKey",
+        "preshared_key", "presharedKey",
+        "vk_link", "vkLink",
+        "wrap_key_hex", "wrapKeyHex",
+        "turn_username", "turn_password",
+        "username", "password", "credential",
+        "browser_fp", "device",
+        "success_token", "access_token", "session_token",
+        "captcha_sid", "captcha_key",
+        "token", "sid", "hash", "key", "auth", "signature", "sign"
+    ]
+
+    private static let rules: [(NSRegularExpression, String)] = {
+        var specs: [(String, String)] = [
+            (#"(vkturnproxy://import\?data=)[A-Za-z0-9_\-+/%=.]+"#, "$1<redacted>"),
+            (#"https?://(?:vk\.me|vk\.com)/(?:join|call/join)/[^\s"'<>)]+"#, "<redacted-vk-link>"),
+            (#"https?://[^\s"'<>)]*(?:captcha|notrobot|not_robot)[^\s"'<>)]*"#, "<redacted-captcha-url>"),
+            (#"\b[0-9a-f]{64}\b"#, "<redacted-64hex>")
+        ]
+
+        for key in sensitiveKeys {
+            let escaped = NSRegularExpression.escapedPattern(for: key)
+            specs.append(("(\"\(escaped)\"\\s*:\\s*\")[^\"]*(\")", "$1<redacted>$2"))
+            specs.append(("(\\b\(escaped)\\b\\s*[=:]\\s*)[^&\\s,\\]\\)}\"]+", "$1<redacted>"))
+            specs.append(("([?&]\(escaped)=)[^&\\s]+", "$1<redacted>"))
+        }
+
+        return specs.map { (makeRegex($0.0), $0.1) }
+    }()
+
+    static func redact(_ text: String) -> String {
+        var out = text
+        for (regex, template) in rules {
+            let range = NSRange(out.startIndex..<out.endIndex, in: out)
+            out = regex.stringByReplacingMatches(
+                in: out,
+                options: [],
+                range: range,
+                withTemplate: template
+            )
+        }
+        return out
+    }
+}
+
 /// Shared file logger for VPN logs.
 /// Both the main app and the Network Extension write to the same file
 /// in the App Group container, so logs can be viewed in-app or exported.
@@ -40,7 +91,7 @@ class SharedLogger {
     func log(_ message: String) {
         guard let url = fileURL else { return }
         let ts = dateFormatter.string(from: Date())
-        let line = "[\(ts)] \(message)\n"
+        let line = "[\(ts)] \(LogRedactor.redact(message))\n"
         queue.async { [self] in
             appendData(line.data(using: .utf8)!, to: url)
         }
@@ -49,8 +100,14 @@ class SharedLogger {
     /// Append raw data (used by Go bridge for already-timestamped log lines).
     func logRaw(_ data: Data) {
         guard let url = fileURL else { return }
+        let safeData: Data
+        if let text = String(data: data, encoding: .utf8) {
+            safeData = LogRedactor.redact(text).data(using: .utf8) ?? data
+        } else {
+            safeData = data
+        }
         queue.async { [self] in
-            appendData(data, to: url)
+            appendData(safeData, to: url)
         }
     }
 
@@ -60,7 +117,7 @@ class SharedLogger {
         guard let url = fileURL else { return "" }
         let archived = (try? String(contentsOf: rotatedURL(for: url), encoding: .utf8)) ?? ""
         let current = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
-        return archived + current
+        return LogRedactor.redact(archived + current)
     }
 
     /// Diagnostic snapshot of the log-file storage state. Used by the
@@ -157,7 +214,7 @@ class SharedLogger {
         let dst = FileManager.default.temporaryDirectory
             .appendingPathComponent("vpn-export.log")
         try? combined.write(to: dst, atomically: true, encoding: .utf8)
-        return FileManager.default.fileExists(atPath: dst.path) ? dst : url
+        return FileManager.default.fileExists(atPath: dst.path) ? dst : nil
     }
 
     // MARK: - Private

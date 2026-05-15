@@ -26,9 +26,10 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     private var currentWiFiSSID: String?
 
     private func logMsg(_ msg: String) {
-        os_log("%{public}s", log: log, type: .default, msg)
-        NSLog("[PacketTunnel] %@", msg)
-        SharedLogger.shared.log("[Tunnel] \(msg)")
+        let safe = LogRedactor.redact(msg)
+        os_log("%{public}s", log: log, type: .default, safe)
+        NSLog("[PacketTunnel] %@", safe)
+        SharedLogger.shared.log("[Tunnel] \(safe)")
     }
 
     // Shared-state key for the TURN server IP the Go proxy is currently
@@ -106,7 +107,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         let mtu = config["mtu"] as? String ?? "1280"
 
         logMsg("tunnelAddress=\(tunnelAddress) dns=\(dnsServers) mtu=\(mtu)")
-        logMsg("proxyConfig=\(proxyConfigJSON)")
+        logMsg("proxyConfig=<redacted> bytes=\(proxyConfigJSON.utf8.count)")
 
         // ------------------------------------------------------------------
         // Deferred-setTunnelNetworkSettings bootstrap flow (Step 4 of the

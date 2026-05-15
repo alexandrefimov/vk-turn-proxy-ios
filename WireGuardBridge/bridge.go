@@ -52,6 +52,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime/debug"
 	"strings"
 	"sync"
@@ -866,7 +867,7 @@ type clogWriter struct {
 }
 
 func (w *clogWriter) Write(p []byte) (int, error) {
-	msg := C.CString(string(p))
+	msg := C.CString(redactLogSecrets(string(p)))
 	defer C.free(unsafe.Pointer(msg))
 	C.callLogger(w.fn, 0, msg)
 	return len(p), nil
@@ -929,9 +930,31 @@ func wgSetLogFilePath(path *C.char) {
 // AND queues it to the async file writer (zero blocking on caller).
 type osLogWriter struct{}
 
+var logRedactionRules = []struct {
+	re   *regexp.Regexp
+	repl string
+}{
+	{regexp.MustCompile(`(?i)(vkturnproxy://import\?data=)[A-Za-z0-9_\-+/%=\.]+`), `${1}<redacted>`},
+	{regexp.MustCompile(`(?i)https?://(?:vk\.me|vk\.com)/(?:join|call/join)/[^\s"'<>)]*`), `<redacted-vk-link>`},
+	{regexp.MustCompile(`(?i)https?://[^\s"'<>)]*(?:captcha|notrobot|not_robot)[^\s"'<>)]*`), `<redacted-captcha-url>`},
+	{regexp.MustCompile(`(?i)("(?:private_key|privateKey|preshared_key|presharedKey|vk_link|vkLink|wrap_key_hex|wrapKeyHex|turn_username|turn_password|username|password|credential|browser_fp|device|success_token|access_token|session_token|captcha_sid|captcha_key|token|sid|hash|key|auth|signature|sign)"\s*:\s*")[^"]*(")`), `${1}<redacted>${2}`},
+	{regexp.MustCompile(`(?i)(\b(?:private_key|privateKey|preshared_key|presharedKey|vk_link|vkLink|wrap_key_hex|wrapKeyHex|turn_username|turn_password|username|password|credential|browser_fp|device|success_token|access_token|session_token|captcha_sid|captcha_key|token|sid|hash|key|auth|signature|sign)\b\s*[=:]\s*)[^&\s,\]\)}"]+`), `${1}<redacted>`},
+	{regexp.MustCompile(`(?i)([?&](?:token|sid|hash|key|auth|signature|sign|access_token|success_token|session_token|captcha_sid|captcha_key)=)[^&\s]+`), `${1}<redacted>`},
+	{regexp.MustCompile(`(?i)\b[0-9a-f]{64}\b`), `<redacted-64hex>`},
+}
+
+func redactLogSecrets(s string) string {
+	out := s
+	for _, rule := range logRedactionRules {
+		out = rule.re.ReplaceAllString(out, rule.repl)
+	}
+	return out
+}
+
 func (osLogWriter) Write(p []byte) (int, error) {
 	s := strings.TrimRight(string(p), "\n")
-	msg := C.CString(s)
+	safe := redactLogSecrets(s)
+	msg := C.CString(safe)
 	defer C.free(unsafe.Pointer(msg))
 	C.go_os_log(msg)
 	// Build timestamped line using local timezone (set via wgSetTimezoneOffset)
@@ -940,7 +963,7 @@ func (osLogWriter) Write(p []byte) (int, error) {
 		now = now.In(goTZ)
 	}
 	ts := now.Format("15:04:05.000000")
-	line := fmt.Sprintf("[Go] %s %s\n", ts, s)
+	line := fmt.Sprintf("[Go] %s %s\n", ts, safe)
 	// Non-blocking send to async writer; drop if buffer full (never block caller)
 	select {
 	case logChan <- line:
