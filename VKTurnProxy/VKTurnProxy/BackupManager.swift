@@ -216,7 +216,7 @@ enum BackupManager {
         }
     }
 
-    /// Applies the AppConfig to UserDefaults + creds-pool.json. Called
+    /// Applies the AppConfig to Keychain, UserDefaults, and creds-pool.json. Called
     /// after the user confirms the import in the alert dialog. Logs both
     /// success and per-step failures so post-mortem analysis from vpn.log
     /// can pinpoint what landed and what didn't.
@@ -226,10 +226,10 @@ enum BackupManager {
         let settingsOnly = isSettingsOnly(config)
 
         if !settingsOnly {
-            d.set(s.privateKey, forKey: "privateKey")
+            try KeychainStore.set(s.privateKey, for: .privateKey)
+            try KeychainStore.set(s.presharedKey, for: .presharedKey)
+            try KeychainStore.set(s.vkLink, for: .vkLink)
             d.set(s.peerPublicKey, forKey: "peerPublicKey")
-            d.set(s.presharedKey, forKey: "presharedKey")
-            d.set(s.vkLink, forKey: "vkLink")
             d.set(s.peerAddress, forKey: "peerAddress")
         }
 
@@ -244,7 +244,10 @@ enum BackupManager {
         // that never had these keys. Non-nil → write through, including
         // false / empty if the user explicitly set them that way.
         if let v = s.useWrap { d.set(v, forKey: "useWrap") }
-        if !settingsOnly, let v = s.wrapKeyHex { d.set(v, forKey: "wrapKeyHex") }
+        if !settingsOnly, let v = s.wrapKeyHex {
+            try KeychainStore.set(v, for: .wrapKeyHex)
+        }
+        KeychainStore.clearLegacyUserDefaultsSecrets()
 
         let kind = settingsOnly ? "settings-only" : "legacy full"
         SharedLogger.shared.log("[AppDebug] Backup: applied \(kind) settings (numConnections=\(s.numConnections), cooldown=\(s.credPoolCooldownSeconds)s, useDTLS=\(s.useDTLS), useWrap=\(s.useWrap ?? false))")
@@ -411,31 +414,32 @@ enum BackupManager {
         return link
     }
 
-    /// Applies the ConnectionLink to UserDefaults. Does NOT touch
+    /// Applies the ConnectionLink to Keychain + UserDefaults. Does NOT touch
     /// creds-pool.json or vk_profile.json — those belong to the
     /// receiving device and rebuild themselves on first connect after
     /// the new settings take effect. Optional fields (dnsServers,
     /// numConnections) only overwrite when present in the link;
     /// absent values preserve whatever the device already had.
-    static func applyConnectionLink(_ link: ConnectionLink) {
+    static func applyConnectionLink(_ link: ConnectionLink) throws {
         let d = UserDefaults.standard
         let s = link.settings
-        d.set(s.privateKey, forKey: "privateKey")
+        try KeychainStore.set(s.privateKey, for: .privateKey)
+        try KeychainStore.set(s.presharedKey, for: .presharedKey)
+        try KeychainStore.set(s.vkLink, for: .vkLink)
+        try KeychainStore.set(s.wrapKeyHex, for: .wrapKeyHex)
         d.set(s.peerPublicKey, forKey: "peerPublicKey")
-        d.set(s.presharedKey, forKey: "presharedKey")
         d.set(s.tunnelAddress, forKey: "tunnelAddress")
         d.set(s.allowedIPs, forKey: "allowedIPs")
-        d.set(s.vkLink, forKey: "vkLink")
         d.set(s.peerAddress, forKey: "peerAddress")
         d.set(s.useDTLS, forKey: "useDTLS")
         d.set(s.useWrap, forKey: "useWrap")
-        d.set(s.wrapKeyHex, forKey: "wrapKeyHex")
         if let v = s.dnsServers { d.set(v, forKey: "dnsServers") }
         if let v = s.numConnections { d.set(v, forKey: "numConnections") }
-        // Truncate vkLink and peerAddress in the log so we don't dump
-        // long token URLs into a file the user might share for triage.
+        KeychainStore.clearLegacyUserDefaultsSecrets()
+        // Do not log vkLink, keys, WRAP key, or peerAddress here: connection
+        // links are secret-bearing import payloads.
         let nc = s.numConnections.map(String.init) ?? "(kept default)"
         let dn = s.dnsServers ?? "(kept default)"
-        SharedLogger.shared.log("[AppDebug] Backup: applied connection link (peer=\(s.peerAddress), useDTLS=\(s.useDTLS), useWrap=\(s.useWrap), numConnections=\(nc), dnsServers=\(dn))")
+        SharedLogger.shared.log("[AppDebug] Backup: applied connection link (peer=<redacted>, useDTLS=\(s.useDTLS), useWrap=\(s.useWrap), numConnections=\(nc), dnsServers=\(dn))")
     }
 }

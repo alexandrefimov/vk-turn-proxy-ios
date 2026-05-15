@@ -10,18 +10,15 @@ private let captchaLog = OSLog(subsystem: "com.vkturnproxy.app", category: "Capt
 struct ContentView: View {
     @StateObject private var tunnel = TunnelManager()
 
-    // All config stored in AppStorage, edited on SettingsView
-    @AppStorage("privateKey") private var privateKey = ""
+    // Non-secret config stays in AppStorage. Secrets are read from Keychain
+    // at connect time so they are not mirrored into UserDefaults.
     @AppStorage("peerPublicKey") private var peerPublicKey = ""
-    @AppStorage("presharedKey") private var presharedKey = ""
     @AppStorage("tunnelAddress") private var tunnelAddress = "192.168.102.3/24"
     @AppStorage("dnsServers") private var dnsServers = "1.1.1.1"
     @AppStorage("allowedIPs") private var allowedIPs = "0.0.0.0/0"
-    @AppStorage("vkLink") private var vkLink = ""
     @AppStorage("peerAddress") private var peerAddress = ""
     @AppStorage("useDTLS") private var useDTLS = true
     @AppStorage("useWrap") private var useWrap = false
-    @AppStorage("wrapKeyHex") private var wrapKeyHex = ""
     @AppStorage("numConnections") private var numConnections = 30
     @AppStorage("credPoolCooldownSeconds") private var credPoolCooldownSeconds = 150
 
@@ -76,6 +73,21 @@ struct ContentView: View {
                         } else {
                             NSLog("[UI] user pressed Connect button (status=\(tunnel.status.rawValue))")
                             SharedLogger.shared.log("[UI] user pressed Connect button (status=\(tunnel.status.rawValue))")
+                            KeychainStore.migrateLegacySecretsFromUserDefaults()
+                            let privateKey: String
+                            let presharedKey: String
+                            let vkLink: String
+                            let wrapKeyHex: String
+                            do {
+                                privateKey = try KeychainStore.string(for: .privateKey)
+                                presharedKey = try KeychainStore.string(for: .presharedKey)
+                                vkLink = try KeychainStore.string(for: .vkLink)
+                                wrapKeyHex = try KeychainStore.string(for: .wrapKeyHex)
+                            } catch {
+                                tunnel.errorMessage = "Failed to read secrets from Keychain: \(error.localizedDescription)"
+                                SharedLogger.shared.log("[AppDebug] Connect: failed to read Keychain secrets: \(error.localizedDescription)")
+                                return
+                            }
                             let config = TunnelConfig(
                                 privateKey: privateKey,
                                 peerPublicKey: peerPublicKey,
@@ -147,6 +159,9 @@ struct ContentView: View {
                     )
                 }
             }
+            .onAppear {
+                KeychainStore.migrateLegacySecretsFromUserDefaults()
+            }
         }
     }
 
@@ -198,19 +213,20 @@ struct ContentView: View {
 // MARK: - Settings Screen
 
 struct SettingsView: View {
-    @AppStorage("privateKey") private var privateKey = ""
     @AppStorage("peerPublicKey") private var peerPublicKey = ""
-    @AppStorage("presharedKey") private var presharedKey = ""
     @AppStorage("tunnelAddress") private var tunnelAddress = "192.168.102.3/24"
     @AppStorage("dnsServers") private var dnsServers = "1.1.1.1"
     @AppStorage("allowedIPs") private var allowedIPs = "0.0.0.0/0"
-    @AppStorage("vkLink") private var vkLink = ""
     @AppStorage("peerAddress") private var peerAddress = ""
     @AppStorage("useDTLS") private var useDTLS = true
     @AppStorage("useWrap") private var useWrap = false
-    @AppStorage("wrapKeyHex") private var wrapKeyHex = ""
     @AppStorage("numConnections") private var numConnections = 30
     @AppStorage("credPoolCooldownSeconds") private var credPoolCooldownSeconds = 150
+
+    @State private var privateKey = ""
+    @State private var presharedKey = ""
+    @State private var vkLink = ""
+    @State private var wrapKeyHex = ""
 
     // Backup & Restore state. exportURL drives the share sheet; the
     // sheet only appears when this is non-nil so the URL is guaranteed
@@ -229,6 +245,7 @@ struct SettingsView: View {
     @State private var showImportConfirm = false
     @State private var showResetConfirm = false
     @State private var showResetProfileConfirm = false
+    @State private var showResetSecretsConfirm = false
     @State private var alertMessage: String? = nil
     @State private var alertTitle: String = ""
 
@@ -248,6 +265,7 @@ struct SettingsView: View {
                     .textContentType(.URL)
                     .autocapitalization(.none)
                     .disableAutocorrection(true)
+                    .onChange(of: vkLink) { saveSecret($0, for: .vkLink) }
 
                 TextField("Proxy Server (host:port)", text: $peerAddress)
                     .autocapitalization(.none)
@@ -286,6 +304,8 @@ struct SettingsView: View {
                             let cleaned = newValue.filter { !$0.isWhitespace }
                             if cleaned != newValue {
                                 wrapKeyHex = cleaned
+                            } else {
+                                saveSecret(cleaned, for: .wrapKeyHex)
                             }
                         }
                 }
@@ -307,6 +327,7 @@ struct SettingsView: View {
                 SecureField("Private Key (base64)", text: $privateKey)
                     .autocapitalization(.none)
                     .disableAutocorrection(true)
+                    .onChange(of: privateKey) { saveSecret($0, for: .privateKey) }
 
                 TextField("Peer Public Key (base64)", text: $peerPublicKey)
                     .autocapitalization(.none)
@@ -315,6 +336,7 @@ struct SettingsView: View {
                 SecureField("Preshared Key (base64)", text: $presharedKey)
                     .autocapitalization(.none)
                     .disableAutocorrection(true)
+                    .onChange(of: presharedKey) { saveSecret($0, for: .presharedKey) }
 
                 TextField("Tunnel Address", text: $tunnelAddress)
                     .autocapitalization(.none)
@@ -351,6 +373,10 @@ struct SettingsView: View {
 
                 Button(role: .destructive, action: { showResetProfileConfirm = true }) {
                     Label("Reset Captured Browser Profile", systemImage: "trash")
+                }
+
+                Button(role: .destructive, action: { showResetSecretsConfirm = true }) {
+                    Label("Reset Keychain Secrets", systemImage: "trash")
                 }
             } header: {
                 Text("Backup & Restore")
@@ -459,6 +485,14 @@ struct SettingsView: View {
         } message: {
             Text("Deletes the captured browser fingerprint used by the auto-PoW captcha solver. Until the next manual captcha solve, the solver will use generated values which VK detects as bot far more often.")
         }
+        .alert("Reset Keychain Secrets?", isPresented: $showResetSecretsConfirm) {
+            Button("Reset", role: .destructive) {
+                handleResetSecrets()
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Deletes WireGuard private key, preshared key, VK link, and WRAP key from Keychain. Non-secret settings remain unchanged.")
+        }
         // Result alert — shared across export/import/reset success and
         // error paths since the message is what differs, not the
         // presentation. Dismiss is just OK.
@@ -480,6 +514,7 @@ struct SettingsView: View {
         // Both paths consume (set pendingURL = nil) so re-entering
         // SettingsView doesn't replay an already-handled URL.
         .onAppear {
+            loadSecretsFromKeychain()
             if let url = connectionLinkInbox.pendingURL {
                 handleConnectionLinkURL(url)
                 connectionLinkInbox.pendingURL = nil
@@ -494,6 +529,29 @@ struct SettingsView: View {
     }
 
     // MARK: - Backup actions
+
+    private func loadSecretsFromKeychain() {
+        KeychainStore.migrateLegacySecretsFromUserDefaults()
+        do {
+            privateKey = try KeychainStore.string(for: .privateKey)
+            presharedKey = try KeychainStore.string(for: .presharedKey)
+            vkLink = try KeychainStore.string(for: .vkLink)
+            wrapKeyHex = try KeychainStore.string(for: .wrapKeyHex)
+        } catch {
+            alertTitle = "Keychain Error"
+            alertMessage = error.localizedDescription
+        }
+    }
+
+    private func saveSecret(_ value: String, for secret: KeychainSecret) {
+        do {
+            try KeychainStore.set(value, for: secret)
+            KeychainStore.clearLegacyUserDefaultsSecrets()
+        } catch {
+            alertTitle = "Keychain Error"
+            alertMessage = error.localizedDescription
+        }
+    }
 
     private func handleExport() {
         do {
@@ -519,6 +577,7 @@ struct SettingsView: View {
     private func applyPendingImport(_ config: AppConfig) {
         do {
             try BackupManager.applyConfig(config)
+            loadSecretsFromKeychain()
             pendingImportConfig = nil
             alertTitle = "Import Complete"
             if BackupManager.isSettingsOnly(config) {
@@ -575,10 +634,16 @@ struct SettingsView: View {
     /// or vk_profile (those are device-specific state); the user's
     /// existing TURN cache and browser profile, if any, stay in place.
     private func applyPendingConnectionLink(_ link: ConnectionLink) {
-        BackupManager.applyConnectionLink(link)
-        pendingConnectionLink = nil
-        alertTitle = "Connection Link Imported"
-        alertMessage = "Settings applied. Reconnect to use them."
+        do {
+            try BackupManager.applyConnectionLink(link)
+            loadSecretsFromKeychain()
+            pendingConnectionLink = nil
+            alertTitle = "Connection Link Imported"
+            alertMessage = "Settings applied. Reconnect to use them."
+        } catch {
+            alertTitle = "Connection Link Import Failed"
+            alertMessage = error.localizedDescription
+        }
     }
 
     // MARK: - Reset actions
@@ -599,6 +664,21 @@ struct SettingsView: View {
             try BackupManager.resetCapturedProfile()
             alertTitle = "Captured Browser Profile Cleared"
             alertMessage = "vk_profile.json deleted. The auto-PoW solver will use generated values until the next manual captcha solve re-captures fresh ones."
+        } catch {
+            alertTitle = "Reset Failed"
+            alertMessage = error.localizedDescription
+        }
+    }
+
+    private func handleResetSecrets() {
+        do {
+            try KeychainStore.deleteAllSecrets()
+            privateKey = ""
+            presharedKey = ""
+            vkLink = ""
+            wrapKeyHex = ""
+            alertTitle = "Keychain Secrets Cleared"
+            alertMessage = "WireGuard private key, preshared key, VK link, and WRAP key were deleted."
         } catch {
             alertTitle = "Reset Failed"
             alertMessage = error.localizedDescription

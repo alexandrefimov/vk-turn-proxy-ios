@@ -110,11 +110,26 @@ Do not claim WiFi/LTE handoff validation until tested on a physical iPhone with 
 
 ## Current blocker from this machine
 
-On 2026-05-15 this environment has Go and XcodeGen, but not full Xcode:
+On 2026-05-15 this environment has Go, XcodeGen, full Xcode, and the iPhoneOS SDK:
 
 ```text
 xcode-select -p
-/Library/Developer/CommandLineTools
+/Applications/Xcode.app/Contents/Developer
 ```
 
-`make -C WireGuardBridge xcframework` fails because `xcrun` cannot locate the `iphoneos` SDK. Install/select full Xcode before local iPhone build validation.
+`make -C WireGuardBridge xcframework` and compile-only `xcodebuild` with `CODE_SIGNING_ALLOWED=NO` pass locally. Actual PacketTunnel validation is still blocked until a physical iPhone is connected and both targets are signed with a paid Apple Developer account, matching App Group, and Network Extension entitlement.
+
+When running under Codex, use escalation for:
+
+```bash
+sh scripts/validate-local.sh
+```
+
+```bash
+xcodebuild -project VKTurnProxy/VKTurnProxy.xcodeproj -scheme VKTurnProxy -configuration Debug -sdk iphoneos -derivedDataPath /private/tmp/vk-turn-derived-data CODE_SIGNING_ALLOWED=NO -quiet build
+```
+
+```bash
+git push origin main
+gh run watch <run-id> --repo alexandrefimov/vk-turn-proxy-ios --exit-status
+```

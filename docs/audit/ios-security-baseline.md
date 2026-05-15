@@ -2,18 +2,18 @@
 
 ## Summary
 
-This repo now passes local static checks, Go package checks, WireGuardBridge XCFramework build, and compile-only Xcode build without signing. The highest priority remaining fixes are Keychain secret storage, import schema validation, and safe/split mode defaults before any public distribution work.
+This repo now passes local static checks, Go package checks, WireGuardBridge XCFramework build, and compile-only Xcode build without signing. The highest priority remaining fixes are import schema validation and safe/split mode defaults before any public distribution work.
 
 Main risks:
 
-- Critical: WireGuard private key, preshared key, VK link, and WRAP key are still stored in plaintext `@AppStorage` / `UserDefaults`.
+- Mitigated in `main`: WireGuard private key, preshared key, VK link, and WRAP key are stored in Keychain and legacy `UserDefaults` values are migrated/cleared.
 - Mitigated in `hardening/redacted-logs`: PacketTunnel no longer logs full `proxy_config`, and known app/extension/Go log/export paths are pattern-redacted.
 - Mitigated in `hardening/no-plaintext-backup`: new backup export is settings-only and excludes keys, links, WRAP key, TURN credentials, and captured browser profile.
 - High: full-tunnel mode is enabled silently with `includeAllNetworks = true` and default `allowedIPs = 0.0.0.0/0`.
 - High: import/link parsing has version checks but no explicit payload size limits or full schema/value validation.
 - High: license compatibility is unresolved for public distribution because this repo says MIT while the Go module and README identify GPL-3.0 upstream ancestry through `vk-turn-proxy`.
 
-Recommended next patch: move persistent secrets from `@AppStorage` / `UserDefaults` to Keychain without changing tunnel behavior.
+Recommended next patch: add import payload size caps and schema validation without changing tunnel behavior.
 
 ## Repository map
 
@@ -31,18 +31,20 @@ Recommended next patch: move persistent secrets from `@AppStorage` / `UserDefaul
 
 | File | Data | Sensitivity | Recommendation |
 | --- | --- | --- | --- |
-| `VKTurnProxy/VKTurnProxy/ContentView.swift` | `@AppStorage` for `privateKey`, `presharedKey`, `vkLink`, `wrapKeyHex`, `peerAddress`, `allowedIPs`, `dnsServers`, `numConnections`, `credPoolCooldownSeconds` | critical for keys/link/wrap; medium for routes/tuning | Move secrets to Keychain. Leave only UI preferences in `UserDefaults` / `AppStorage`. |
-| `VKTurnProxy/VKTurnProxy/BackupManager.swift` | New export writes settings-only backup; legacy full import can still apply plaintext secrets from user-selected files | high | Keep export safe. Add size cap and schema validation before decode/apply. Consider explicit warning for legacy full import. |
+| `VKTurnProxy/VKTurnProxy/ContentView.swift` | `@AppStorage` for non-secret settings; Keychain-backed state for `privateKey`, `presharedKey`, `vkLink`, `wrapKeyHex` | high | Keep secret fields out of `@AppStorage`. Add device validation for Keychain migration path. |
+| `VKTurnProxy/VKTurnProxy/KeychainStore.swift` | Generic-password Keychain items for private key, PSK, VK link, WRAP key | high | Uses `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`; verify on physical iPhone after install/update. |
+| `VKTurnProxy/VKTurnProxy/BackupManager.swift` | New export writes settings-only backup; legacy full import can still apply plaintext secrets into Keychain from user-selected files | high | Keep export safe. Add size cap and schema validation before decode/apply. Consider explicit warning for legacy full import. |
 | `VKTurnProxy/VKTurnProxy/AppConfig.swift` | `AppConfig`, `AppSettings`, `ConnectionLink`, `ConnectionSettings` include WireGuard keys, VK link, WRAP key, TURN pool and browser profile | critical | Mark all links/backups as secret. Add validation model separate from persisted model. |
 | `VKTurnProxy/VKTurnProxy/CredCache.swift` | Reads App Group `creds-pool.json` with TURN `address`, `username`, `password` | critical | Keep out of backups by default; consider file protection and Keychain-backed cache later. |
 | `VKTurnProxy/VKTurnProxy/VKProfileCache.swift` | App Group `vk_profile.json`: captured `device`, `browser_fp`, `user_agent` | high | Treat as secret telemetry/fingerprint. Keep out of logs and plaintext backups by default. |
-| `VKTurnProxy/VKTurnProxy/SharedLogger.swift` | App Group `vpn.log` and `vpn.log.1`, temp `vpn-export.log` | high | Add central redaction before write and before export. Consider file protection. |
-| `VKTurnProxy/VKTurnProxy/OSLogReader.swift` | Reads recent app/extension `os_log` fallback | high | Redact fallback output before display/export. |
+| `VKTurnProxy/VKTurnProxy/SharedLogger.swift` | App Group `vpn.log` and `vpn.log.1`, temp `vpn-export.log` | high | Keep central redaction before write and before export. Consider file protection. |
+| `VKTurnProxy/VKTurnProxy/OSLogReader.swift` | Reads recent app/extension `os_log` fallback | high | Keep fallback output redacted before display/export. |
 | `VKTurnProxy/VKTurnProxy/ContentView.swift` | `UIPasteboard.general.string` import of connection link | critical | Treat clipboard payload as secret; add length limit and validation before base64 decode. |
-| `VKTurnProxy/VKTurnProxy/ContentView.swift` | Logs UI share sheet exports raw log file/fallback | high | Export only redacted snapshot. Add warning that logs can contain secrets until fixed. |
+| `VKTurnProxy/VKTurnProxy/ContentView.swift` | Logs UI share sheet exports log file/fallback | high | Keep export path using a redacted snapshot. |
 | `VKTurnProxy/VKTurnProxy/TunnelManager.swift` | Builds WireGuard UAPI config containing `private_key` and optional `preshared_key` | critical | Never log UAPI config. Keep generation local to connect path. |
 | `VKTurnProxy/VKTurnProxy/TunnelManager.swift` | Builds `proxy_config` with `vk_link`, `wrap_key_hex`, seeded TURN username/password | critical | Do not log full JSON. Redact before any diagnostic output. |
-| `VKTurnProxy/PacketTunnel/PacketTunnelProvider.swift` | Reads provider `wg_config` and `proxy_config` | critical | Do not log full configs. Replace current `proxyConfig=` log. |
+| `VKTurnProxy/VKTurnProxy/TunnelManager.swift` | Passes generated `wg_config` and `proxy_config` through `NETunnelProviderProtocol.providerConfiguration` for PacketTunnel startup | critical | Treat Network Extension preferences as secret-bearing until a safer extension handoff is designed and physical-device tested. |
+| `VKTurnProxy/PacketTunnel/PacketTunnelProvider.swift` | Reads provider `wg_config` and `proxy_config` | critical | Do not log full configs; keep provider-config logs structural/status-only. |
 | `WireGuardBridge/bridge.go` | Parses `ProxyConfig`, `SeededTURN`, `WrapKeyHex`; logs errors and addresses | high | Avoid logging secret JSON/errors that echo values. Keep logging lengths/status only. |
 | `pkg/proxy/creds.go` | Hardcoded VK app client IDs/secrets and runtime TURN credentials | medium/high | Do not print secret values. Confirm whether embedded VK client secrets are acceptable for private build. |
 | `pkg/proxy/creds.go` | Logs captcha URLs, captcha SID, TURN relay addresses, VK identity UA/name | high | Redact captcha URLs/SIDs and minimize identity/fingerprint logging. |
@@ -50,7 +52,7 @@ Recommended next patch: move persistent secrets from `@AppStorage` / `UserDefaul
 | `quick_link.py` | Generates links containing private key, PSK, VK link, peer address, WRAP key | critical | Do not store generated JSON/link in repo. Consider reading from password manager/local ignored file only. |
 | `VKTurnProxy/ExportOptions*.plist` | Tracked export options with team ID and distribution mode | low/medium | Keep future local variants ignored. Consider templating tracked files later if public fork hygiene matters. |
 
-No Keychain usage was found.
+Keychain is now used for `privateKey`, `presharedKey`, `vkLink`, and `wrapKeyHex`.
 
 ## Network Extension behavior
 
@@ -122,7 +124,7 @@ Findings:
 
 1. Done: redacted logging helper for known key names, URLs, TURN credentials, WRAP keys, VK links, browser profile fields, and WireGuard UAPI keys.
 2. Done: plaintext secret export removed. New export uses settings-only `SafeBackupConfig`; legacy full import remains for manual recovery.
-3. KeychainStore for secrets: move `privateKey`, `presharedKey`, `vkLink`, `wrapKeyHex`, and possibly `peerAddress` to Keychain. Leave `dnsServers`, UI toggles, and non-sensitive tuning in `AppStorage`.
+3. Done: KeychainStore for `privateKey`, `presharedKey`, `vkLink`, and `wrapKeyHex`; non-sensitive tuning remains in `AppStorage`.
 4. Safe/split mode default: default to non-full-tunnel routing for fresh installs.
 5. Full-tunnel explicit toggle/warning: require user action before `includeAllNetworks = true` and `allowedIPs = 0.0.0.0/0`.
 6. Safer defaults for `numConnections`/MTU: lower initial `numConnections`, validate import bounds, and enforce MTU range.

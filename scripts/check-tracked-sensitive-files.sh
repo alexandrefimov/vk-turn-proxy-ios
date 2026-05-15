@@ -33,6 +33,13 @@ if git grep -nE -- "$scan_pattern" -- . >/tmp/vk-turn-sensitive-grep.txt 2>/dev/
 fi
 rm -f /tmp/vk-turn-sensitive-grep.txt
 
+if git grep -nE -- '@AppStorage\("(privateKey|presharedKey|vkLink|wrapKeyHex)"' -- 'VKTurnProxy/**/*.swift' >/tmp/vk-turn-secret-appstorage.txt 2>/dev/null; then
+    echo "Secret-bearing fields must not use @AppStorage/UserDefaults-backed storage:" >&2
+    cat /tmp/vk-turn-secret-appstorage.txt >&2
+    failed=1
+fi
+rm -f /tmp/vk-turn-secret-appstorage.txt
+
 safe_export_body=$(
     awk '/static func currentSafeConfig\(\)/,/^    }/' VKTurnProxy/VKTurnProxy/BackupManager.swift
 )

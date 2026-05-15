@@ -49,6 +49,18 @@ Private, auditable iOS client for personal testing first. Security hardening bef
 - Do not regenerate or commit Xcode project churn unless the task explicitly requires project generation changes.
 - Do not run `release.sh` during hardening. It is a public TestFlight/GitHub Release pipeline and is blocked until security and license review are done.
 
+## Codex escalation notes
+Run these through tool escalation in Codex instead of retrying after sandbox failures:
+- `sh scripts/validate-local.sh`
+- direct `xcodebuild ...` compile-only builds
+- `xcodegen --spec VKTurnProxy/project.yml --project VKTurnProxy --use-cache` when project regeneration is intentional
+- network commands such as `git fetch upstream`, `git push origin main`, and `gh run ...`
+
+These usually do not need escalation:
+- `rg`, `sed`, `plutil`, `git diff`, `git status`, `git log`
+- `sh scripts/check-tracked-sensitive-files.sh`
+- Go checks with `GOCACHE=/private/tmp/vk-turn-go-build-cache GOPATH=/private/tmp/vk-turn-go`
+
 ## Validation
 Because Network Extension requires Apple signing and a physical iOS device:
 - run static checks where possible
