@@ -36,14 +36,10 @@ Private, auditable iOS client for personal testing first. Security hardening bef
 ## Git workflow
 - origin should be our fork.
 - upstream should be https://github.com/anton48/vk-turn-proxy-ios.git
-- Use topic branches:
-  - audit/baseline
-  - hardening/redacted-logs
-  - hardening/no-plaintext-backup
-  - hardening/keychain-secrets
-  - hardening/safe-mode
-  - build/local-device
-  - integration/import-link
+- Default integration branch: `main`.
+- Work directly on `main` when there is a single active agent and the change is small, reviewed locally, and validated before push.
+- Use short-lived topic branches only when the work needs isolation, is risky, or multiple agents may run in parallel.
+- Merge completed topic branches back into `main` promptly and delete them after push.
 - Keep commits small and reviewable.
 
 ## Tooling notes
