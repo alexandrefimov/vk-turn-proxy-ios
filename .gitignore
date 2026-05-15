@@ -17,6 +17,15 @@ build/
 *.ipa
 *.dSYM.zip
 *.dSYM
+*.xcarchive
+
+# Apple signing / export secrets
+*.p12
+*.mobileprovision
+*.provisionprofile
+ExportOptions*.plist
+.env
+.env.*
 
 # macOS
 .DS_Store
